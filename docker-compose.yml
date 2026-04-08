@@ -7,7 +7,7 @@ services:
     container_name: my-gcli2api
     restart: unless-stopped
     ports:
-      - "7862:7861"
+      - "7861:7861"
     environment:
       # Password configuration (choose one)
       # Option 1: Use common password
@@ -19,7 +19,6 @@ services:
       # Server configuration
       - PORT=${PORT:-7861}
       - HOST=${HOST:-0.0.0.0}
-
       # Optional: Google credentials from environment
       # - GOOGLE_CREDENTIALS=${GOOGLE_CREDENTIALS}
 
