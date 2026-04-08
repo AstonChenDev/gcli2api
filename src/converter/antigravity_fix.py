@@ -565,11 +565,20 @@ def prepare_image_generation_request(
         if image_size:
             image_config["imageSize"] = image_size
 
-    request_body["model"] = "gemini-3.1-flash-image"  # 统一使用基础模型名
-    request_body["generationConfig"] = {
-        "candidateCount": 1,
-        "imageConfig": image_config
-    }
+    clean_model = model
+    for suffix in (
+        "-21x9", "-16x9", "-9x16", "-4x3", "-3x4", "-1x1",
+        "-4k", "-2k",
+    ):
+        clean_model = clean_model.replace(suffix, "").replace(suffix.upper(), "")
+    request_body["model"] = clean_model
+
+    # Preserve client generation settings, including an explicitly supplied imageConfig.
+    generation_config = (request_body.get("generationConfig") or {}).copy()
+    generation_config["candidateCount"] = 1
+    if "imageConfig" not in generation_config:
+        generation_config["imageConfig"] = image_config
+    request_body["generationConfig"] = generation_config
 
     # 移除不需要的字段
     for key in ("systemInstruction", "tools", "toolConfig"):

@@ -270,6 +270,10 @@ def main():
         config.errorlog = "-"
         config.loglevel = "INFO"
 
+        # 设置连接超时
+        config.keep_alive_timeout = 1800  # 30分钟
+        config.read_timeout = 1800  # 30分钟读取超时
+
         await serve(app, config)
 
     if workers == 1:
@@ -293,6 +297,8 @@ def main():
         config.loglevel = "INFO"
         config.workers = workers
         config.application_path = "web:app"
+        config.keep_alive_timeout = 1800  # 30分钟
+        config.read_timeout = 1800  # 30分钟读取超时
 
         run(config)
 
