@@ -255,12 +255,7 @@ function createCredsManager(type) {
             const selectedCount = this.selectedFiles.size;
             document.getElementById(this.getElementId('SelectedCount')).textContent = `已选择 ${selectedCount} 项`;
 
-            const batchBtnNames = ['Enable', 'Disable', 'Delete', 'Verify', 'Preview'];
-            if (this.type === 'antigravity') {
-                batchBtnNames.push('EnableCredit');
-                batchBtnNames.push('DisableCredit');
-            }
-            const batchBtns = batchBtnNames.map(action =>
+            const batchBtns = ['Enable', 'Disable', 'Delete', 'Verify', 'Preview', 'EnableCredit', 'DisableCredit'].map(action =>
                 document.getElementById(this.getElementId(`Batch${action}Btn`))
             );
             batchBtns.forEach(btn => btn && (btn.disabled = selectedCount === 0));
@@ -318,13 +313,7 @@ function createCredsManager(type) {
                 return;
             }
 
-            const actionNames = {
-                enable: '启用',
-                disable: '禁用',
-                delete: '删除',
-                enable_credit: '开启积分',
-                disable_credit: '关闭积分'
-            };
+            const actionNames = { enable: '启用', disable: '禁用', delete: '删除', enable_credit: '开启积分', disable_credit: '关闭积分' };
             const actionLabel = actionNames[action] || action;
             const confirmMsg = action === 'delete'
                 ? `确定要删除选中的 ${selectedFiles.length} 个文件吗？\n注意：此操作不可恢复！`
@@ -676,6 +665,8 @@ function createCredCard(credInfo, manager) {
         } else {
             statusBadges += '<span class="status-badge" style="background-color: #616161; color: white;" title="当前已关闭Credit模式">Credit: OFF</span>';
         }
+        // 积分额度 badge（检验后动态更新）
+        statusBadges += `<span class="status-badge credit-amount-badge" data-credit-filename="${filename}" style="background-color: #37474f; color: white;" title="点击检验按钮获取积分信息">积分: 未检测</span>`;
     }
 
     // 模型级冷却状态
@@ -1535,6 +1526,22 @@ function clearAntigravityFiles() { AppState.antigravityUploadFiles.clearFiles();
 function uploadAntigravityFiles() { AppState.antigravityUploadFiles.upload(); }
 
 // 邮箱相关
+// 辅助函数：根据文件名更新卡片中的积分 badge
+function updateCreditBadge(filename, creditAmount) {
+    const badge = document.querySelector(`.credit-amount-badge[data-credit-filename="${filename}"]`);
+    if (!badge) return;
+
+    if (creditAmount !== undefined && creditAmount !== null) {
+        badge.textContent = `积分: ${creditAmount}`;
+        badge.style.backgroundColor = creditAmount > 0 ? '#1565c0' : '#e65100';
+        badge.title = `积分余额: ${creditAmount}`;
+    } else {
+        badge.textContent = '无积分权限';
+        badge.style.backgroundColor = '#b71c1c';
+        badge.title = '该凭证无积分权限';
+    }
+}
+
 // 辅助函数：根据文件名更新卡片中的邮箱显示
 function updateEmailDisplay(filename, email, managerType = 'normal') {
     // 查找对应的凭证卡片
@@ -1662,11 +1669,17 @@ async function verifyAntigravityProjectId(filename) {
             showMessageModal('检验成功', `✅ Antigravity检验成功！\n\n文件: ${filename}\nProject ID: ${data.project_id}${tierLine}${creditLine}\n\n${data.message}`, 'success');
 
             await AppState.antigravityCreds.refresh();
+
+            // 更新卡片上的积分 badge（必须在 refresh 之后，否则会被重绘覆盖）
+            updateCreditBadge(filename, data.credit_amount);
         } else {
             // 失败时显示红色错误消息
             const errorMsg = data.message || '检验失败';
             showStatus(`❌ ${errorMsg}`, 'error');
             showMessageModal('检验失败', `❌ 检验失败\n\n${errorMsg}`, 'error');
+
+            // 检验失败也更新 badge 为无积分权限
+            updateCreditBadge(filename, null);
         }
     } catch (error) {
         const errorMsg = `检验失败: ${error.message}`;
@@ -2247,6 +2260,15 @@ async function batchVerifyAntigravityProjectIds() {
     });
 
     await AppState.antigravityCreds.refresh();
+
+    // 更新每个凭证的积分 badge（必须在 refresh 之后）
+    results.forEach(result => {
+        if (result.success) {
+            updateCreditBadge(result.filename, result.creditAmount);
+        } else {
+            updateCreditBadge(result.filename, null);
+        }
+    });
 
     const summary = `Antigravity批量检验完成！\n\n成功: ${successCount} 个\n失败: ${failCount} 个\n总计: ${selectedFiles.length} 个\n\n详细结果:\n${resultMessages.join('\n')}`;
 
