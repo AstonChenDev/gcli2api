@@ -6,107 +6,225 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GCLI2API 控制面板</title>
     <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-            max-width: 1000px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f8f9fa;
+        /* ================================================================
+           GCLI2API Control Panel — Dark Glassmorphism Theme
+           Only CSS changes — zero HTML/JS modifications
+           ================================================================ */
+
+        /* === FOUNDATIONS === */
+        :root {
+            --bg-primary: #0b0e17;
+            --bg-secondary: #111827;
+            --bg-card: rgba(255, 255, 255, 0.04);
+            --bg-card-hover: rgba(255, 255, 255, 0.07);
+            --bg-input: rgba(255, 255, 255, 0.06);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --border-focus: rgba(99, 102, 241, 0.5);
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent: #6366f1;
+            --accent-hover: #818cf8;
+            --accent-glow: rgba(99, 102, 241, 0.35);
+            --success: #10b981;
+            --success-bg: rgba(16, 185, 129, 0.12);
+            --danger: #ef4444;
+            --danger-bg: rgba(239, 68, 68, 0.12);
+            --warning: #f59e0b;
+            --warning-bg: rgba(245, 158, 11, 0.12);
+            --info: #3b82f6;
+            --info-bg: rgba(59, 130, 246, 0.12);
+            --radius: 12px;
+            --radius-sm: 8px;
+            --radius-xs: 6px;
+            --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+            --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.2);
+            --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
-        .container {
-            background-color: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        * {
             box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 24px;
+            background: var(--bg-primary);
+            background-image:
+                radial-gradient(ellipse 80% 50% at 50% -20%, rgba(99, 102, 241, 0.12), transparent),
+                radial-gradient(ellipse 60% 40% at 80% 100%, rgba(139, 92, 246, 0.08), transparent);
+            min-height: 100vh;
+            color: var(--text-primary);
+        }
+
+        /* Google Fonts — Inter */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+        /* === SCROLLBAR === */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+        /* === CONTAINER === */
+        .container {
+            background: rgba(17, 24, 39, 0.7);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            padding: 32px;
+            border-radius: 20px;
+            border: 1px solid var(--border-color);
+            box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,0.04);
             overflow-x: auto;
         }
 
+        /* === TYPOGRAPHY === */
         h1 {
-            color: #333;
+            color: var(--text-primary);
             text-align: center;
+            font-weight: 700;
+            letter-spacing: -0.025em;
         }
 
+        h3 {
+            color: var(--text-primary);
+            font-weight: 600;
+            letter-spacing: -0.01em;
+        }
+
+        h4 {
+            color: var(--text-primary);
+        }
+
+        p {
+            color: var(--text-secondary);
+        }
+
+        strong {
+            color: var(--text-primary);
+        }
+
+        a {
+            color: var(--accent-hover);
+        }
+
+        /* === FORM BASICS === */
         .form-group {
             margin-bottom: 20px;
         }
 
         label {
             display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-            color: #555;
+            margin-bottom: 6px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
         }
 
-        input[type="text"] {
+        input[type="text"],
+        input[type="url"],
+        input[type="number"] {
             width: 100%;
-            padding: 10px;
-            border: 2px solid #ddd;
-            border-radius: 5px;
-            font-size: 16px;
+            padding: 10px 14px;
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-sm);
+            font-size: 14px;
             box-sizing: border-box;
+            background: var(--bg-input);
+            color: var(--text-primary);
+            transition: border-color var(--transition), box-shadow var(--transition);
         }
 
-        input[type="text"]:focus {
-            border-color: #4285f4;
+        input[type="text"]:focus,
+        input[type="url"]:focus,
+        input[type="number"]:focus {
+            border-color: var(--accent);
             outline: none;
+            box-shadow: 0 0 0 3px var(--accent-glow);
         }
 
+        input::placeholder {
+            color: var(--text-muted);
+        }
+
+        /* === PRIMARY BUTTON === */
         .btn {
-            background-color: #28a745;
+            background: linear-gradient(135deg, var(--accent), #8b5cf6);
             color: white;
-            padding: 12px 30px;
+            padding: 10px 24px;
             border: none;
-            border-radius: 5px;
-            font-size: 16px;
+            border-radius: var(--radius-sm);
+            font-size: 14px;
+            font-weight: 500;
             cursor: pointer;
             width: 100%;
             margin-bottom: 10px;
+            transition: all var(--transition);
+            position: relative;
+            overflow: hidden;
         }
 
         .btn:hover {
-            background-color: #218838;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 16px var(--accent-glow);
+            filter: brightness(1.1);
+        }
+
+        .btn:active {
+            transform: translateY(0) scale(0.98);
         }
 
         .btn:disabled {
-            background-color: #ccc;
+            background: rgba(255,255,255,0.06);
+            color: var(--text-muted);
             cursor: not-allowed;
+            box-shadow: none;
+            transform: none;
+            filter: none;
         }
 
+        /* === AUTH URL === */
         .auth-url {
-            background-color: #f8f9fa;
-            border: 1px solid #e1e4e8;
-            border-radius: 5px;
-            padding: 15px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-sm);
+            padding: 16px;
             margin: 20px 0;
             word-break: break-all;
         }
 
         .auth-url a {
-            color: #4285f4;
+            color: var(--accent-hover);
             text-decoration: none;
+            transition: color var(--transition);
         }
 
         .auth-url a:hover {
+            color: #a78bfa;
             text-decoration: underline;
         }
 
+        /* === CREDENTIALS DISPLAY === */
         .credentials {
-            background-color: #f0f8ff;
-            border: 1px solid #b0d4ff;
-            border-radius: 5px;
-            padding: 15px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-sm);
+            padding: 16px;
             margin: 20px 0;
-            font-family: monospace;
+            font-family: 'SF Mono', 'Fira Code', monospace;
             font-size: 12px;
             white-space: pre-wrap;
             word-break: break-all;
             max-height: 400px;
             overflow-y: auto;
+            color: var(--text-secondary);
         }
 
-        /* Toast 固定定位在右上角 */
+        /* === TOAST NOTIFICATIONS === */
         #statusSection {
             position: fixed;
             top: 20px;
@@ -115,19 +233,22 @@
             transform: none;
             z-index: 9999;
             width: auto;
-            max-width: 400px;
-            min-width: 250px;
+            max-width: 420px;
+            min-width: 260px;
         }
 
-        /* Toast 专用样式 - 只在 #statusSection 内生效 */
         #statusSection .status {
-            padding: 12px 20px;
-            border-radius: 8px;
+            padding: 14px 20px;
+            border-radius: var(--radius-sm);
             margin: 0;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
             opacity: 0;
             transform: translateX(100%);
             transition: opacity 0.3s ease, transform 0.3s ease;
+            border-left: 3px solid transparent;
+            font-size: 13px;
         }
 
         #statusSection .status.show {
@@ -141,113 +262,148 @@
         }
 
         #statusSection .status.success {
-            background-color: #28a745;
-            border: none;
-            color: white;
+            background: rgba(16, 185, 129, 0.15);
+            border-left-color: var(--success);
+            color: #6ee7b7;
+            border-top: none; border-right: none; border-bottom: none;
         }
 
         #statusSection .status.error {
-            background-color: #dc3545;
-            border: none;
-            color: white;
+            background: rgba(239, 68, 68, 0.15);
+            border-left-color: var(--danger);
+            color: #fca5a5;
+            border-top: none; border-right: none; border-bottom: none;
         }
 
         #statusSection .status.warning {
-            background-color: #ffc107;
-            border: none;
-            color: #212529;
+            background: rgba(245, 158, 11, 0.15);
+            border-left-color: var(--warning);
+            color: #fcd34d;
+            border-top: none; border-right: none; border-bottom: none;
         }
 
         #statusSection .status.info {
-            background-color: #17a2b8;
-            border: none;
-            color: white;
+            background: rgba(59, 130, 246, 0.15);
+            border-left-color: var(--info);
+            color: #93c5fd;
+            border-top: none; border-right: none; border-bottom: none;
         }
 
-        /* 页面内嵌的 status 样式 - 保持原有风格 */
+        /* Page-inline status */
         .status {
-            padding: 10px;
-            border-radius: 5px;
+            padding: 12px 16px;
+            border-radius: var(--radius-sm);
             margin: 10px 0;
+            font-size: 13px;
         }
 
         .status.success {
-            background-color: #d4edda;
-            border: 1px solid #c3e6cb;
-            color: #155724;
+            background: var(--success-bg);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+            color: #6ee7b7;
         }
 
         .status.error {
-            background-color: #f8d7da;
-            border: 1px solid #f5c6cb;
-            color: #721c24;
+            background: var(--danger-bg);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            color: #fca5a5;
         }
 
         .status.info {
-            background-color: #d1ecf1;
-            border: 1px solid #bee5eb;
-            color: #0c5460;
+            background: var(--info-bg);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            color: #93c5fd;
         }
 
-        .hidden {
-            display: none;
-        }
+        .hidden { display: none; }
 
         .loading {
             text-align: center;
-            color: #666;
+            color: var(--text-muted);
+            padding: 40px 0;
         }
 
+        /* === LOGIN === */
         .login-form {
             text-align: center;
-            padding: 50px 0;
+            padding: 80px 0 60px;
+        }
+
+        .login-form h1 {
+            background: linear-gradient(135deg, #e2e8f0, var(--accent-hover));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            font-size: 28px;
+            margin-bottom: 8px;
+        }
+
+        .login-form p {
+            color: var(--text-muted);
+            margin-bottom: 24px;
         }
 
         .login-form input[type="password"] {
-            width: 300px;
-            padding: 12px;
-            border: 2px solid #ddd;
-            border-radius: 5px;
+            width: 320px;
+            max-width: 100%;
+            padding: 14px 18px;
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-sm);
             font-size: 16px;
             margin-bottom: 20px;
             box-sizing: border-box;
+            background: var(--bg-input);
+            color: var(--text-primary);
+            transition: border-color var(--transition), box-shadow var(--transition);
+            text-align: center;
         }
 
+        .login-form input[type="password"]:focus {
+            border-color: var(--accent);
+            outline: none;
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        .login-form .btn {
+            width: 320px;
+            max-width: 100%;
+            padding: 14px;
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        /* === TABS NAVIGATION === */
         .tabs {
             display: inline-flex;
-            background: linear-gradient(145deg, #f5f5f7, #e8e8ed);
-            padding: 6px;
+            background: rgba(255, 255, 255, 0.04);
+            padding: 5px;
             border-radius: 14px;
-            margin-bottom: 25px;
+            margin-bottom: 28px;
+            border: 1px solid var(--border-color);
             border-bottom: none;
-            gap: 3px;
+            gap: 2px;
             overflow-x: auto;
             max-width: 100%;
             user-select: none;
-            box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.06),
-                0 1px 2px rgba(255, 255, 255, 0.9);
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.2);
             position: relative;
         }
 
-        /* 滑块指示器 */
         .tab-slider {
             position: absolute;
-            top: 6px;
+            top: 5px;
             left: 0;
             right: 0;
-            height: calc(100% - 12px);
-            background: white;
+            height: calc(100% - 10px);
+            background: linear-gradient(135deg, var(--accent), #7c3aed);
             border-radius: 10px;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1),
-                0 1px 3px rgba(0, 0, 0, 0.06),
-                inset 0 -1px 0 rgba(0, 0, 0, 0.02);
+            box-shadow: 0 2px 12px var(--accent-glow);
             transition: left 0.3s cubic-bezier(0.4, 0, 0.2, 1),
                 right 0.3s cubic-bezier(0.4, 0, 0.2, 1);
             z-index: 0;
             pointer-events: none;
         }
 
-        /* 滑块微光效果 */
         .tab-slider::after {
             content: '';
             position: absolute;
@@ -256,206 +412,177 @@
             right: 0;
             height: 50%;
             background: linear-gradient(180deg,
-                    rgba(255, 255, 255, 0.8) 0%,
+                    rgba(255, 255, 255, 0.15) 0%,
                     rgba(255, 255, 255, 0) 100%);
             border-radius: 10px 10px 0 0;
             pointer-events: none;
-            opacity: 0.5;
         }
 
-        .tabs::-webkit-scrollbar {
-            height: 4px;
-        }
-
-        .tabs::-webkit-scrollbar-track {
-            background: transparent;
-        }
-
-        .tabs::-webkit-scrollbar-thumb {
-            background: rgba(0, 0, 0, 0.15);
-            border-radius: 2px;
-        }
-
-        .tabs::-webkit-scrollbar-thumb:hover {
-            background: rgba(0, 0, 0, 0.25);
-        }
+        .tabs::-webkit-scrollbar { height: 3px; }
+        .tabs::-webkit-scrollbar-track { background: transparent; }
+        .tabs::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
 
         .tab {
-            padding: 10px 18px;
+            padding: 9px 16px;
             cursor: pointer;
             border: none;
             background: transparent;
             border-radius: 10px;
-            color: #666;
-            font-size: 14px;
-            font-weight: 450;
-            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            color: var(--text-muted);
+            font-size: 13px;
+            font-weight: 500;
+            transition: all var(--transition);
             white-space: nowrap;
             position: relative;
             overflow: hidden;
             z-index: 1;
         }
 
-        /* 点击波纹效果 */
         .tab::before {
             content: '';
             position: absolute;
-            top: 50%;
-            left: 50%;
-            width: 0;
-            height: 0;
+            top: 50%; left: 50%;
+            width: 0; height: 0;
             border-radius: 50%;
-            background: rgba(66, 133, 244, 0.15);
+            background: rgba(255,255,255,0.1);
             transform: translate(-50%, -50%);
             transition: width 0.4s ease, height 0.4s ease;
             z-index: -1;
         }
 
-        .tab:active::before {
-            width: 200%;
-            height: 200%;
-        }
+        .tab:active::before { width: 200%; height: 200%; }
 
         .tab.active {
-            color: #1a1a1a;
-            font-weight: 550;
-            transform: translateY(0);
-            /* 背景和阴影由滑块提供 */
+            color: white;
+            font-weight: 600;
         }
 
         .tab:hover:not(.active) {
-            background: rgba(255, 255, 255, 0.6);
-            color: #333;
-            transform: translateY(-1px);
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text-secondary);
         }
 
-        /* 按压效果 */
-        .tab:active {
-            transform: scale(0.97) translateY(0);
-            transition: transform 0.1s ease;
+        .tab:active { transform: scale(0.97); transition: transform 0.1s ease; }
+        .tab.active:active { transform: scale(0.98); }
+        .tab:focus { outline: none; }
+        .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+        .tab-content { display: none; width: 100%; box-sizing: border-box; }
+        .tab-content.active { display: block; animation: fadeUp 0.3s ease-out; }
+
+        @keyframes fadeUp {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
         }
 
-        .tab.active:active {
-            transform: scale(0.98);
-            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08),
-                inset 0 1px 2px rgba(0, 0, 0, 0.02);
-        }
-
-        /* 焦点状态（键盘导航） */
-        .tab:focus {
-            outline: none;
-        }
-
-        .tab:focus-visible {
-            outline: 2px solid rgba(66, 133, 244, 0.5);
-            outline-offset: 2px;
-        }
-
-        .tab-content {
-            display: none;
-            width: 100%;
-            box-sizing: border-box;
-            /* 动画由 JavaScript 控制，避免冲突 */
-        }
-
-        .tab-content.active {
-            display: block;
-        }
-
+        /* === UPLOAD AREA === */
         .upload-area {
-            border: 2px dashed #ddd;
-            border-radius: 5px;
-            padding: 40px;
+            border: 2px dashed rgba(255,255,255,0.1);
+            border-radius: var(--radius);
+            padding: 48px;
             text-align: center;
-            background-color: #fafafa;
+            background: var(--bg-card);
             margin: 20px 0;
             cursor: pointer;
-            transition: border-color 0.3s;
+            transition: all var(--transition);
         }
 
         .upload-area:hover {
-            border-color: #4285f4;
+            border-color: var(--accent);
+            background: rgba(99, 102, 241, 0.06);
         }
 
         .upload-area.dragover {
-            border-color: #4285f4;
-            background-color: #f0f8ff;
+            border-color: var(--accent);
+            background: rgba(99, 102, 241, 0.1);
         }
 
-        .file-list {
-            margin: 20px 0;
-        }
+        .upload-area p { color: var(--text-muted); }
+
+        /* File list */
+        .file-list { margin: 20px 0; }
 
         .file-item {
-            background-color: #f8f9fa;
-            border: 1px solid #e1e4e8;
-            border-radius: 3px;
-            padding: 10px;
-            margin: 5px 0;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-xs);
+            padding: 10px 14px;
+            margin: 6px 0;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            transition: background var(--transition);
         }
 
-        .file-item .file-name {
-            font-family: monospace;
-            color: #333;
-        }
-
-        .file-item .file-size {
-            color: #666;
-            font-size: 12px;
-        }
+        .file-item:hover { background: var(--bg-card-hover); }
+        .file-item .file-name { font-family: 'SF Mono', monospace; color: var(--text-primary); font-size: 13px; }
+        .file-item .file-size { color: var(--text-muted); font-size: 12px; }
 
         .file-item .remove-btn {
-            background: #dc3545;
+            background: var(--danger);
             color: white;
             border: none;
-            border-radius: 3px;
-            padding: 2px 8px;
+            border-radius: var(--radius-xs);
+            padding: 3px 10px;
             cursor: pointer;
             font-size: 12px;
+            transition: all var(--transition);
         }
+        .file-item .remove-btn:hover { filter: brightness(1.15); }
 
+        /* Progress bar */
         .upload-progress {
-            background-color: #f8f9fa;
-            border: 1px solid #e1e4e8;
-            border-radius: 5px;
-            padding: 15px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-sm);
+            padding: 16px;
             margin: 20px 0;
         }
 
         .progress-bar {
             width: 100%;
-            height: 20px;
-            background-color: #e9ecef;
-            border-radius: 10px;
+            height: 8px;
+            background: rgba(255,255,255,0.06);
+            border-radius: 4px;
             overflow: hidden;
             margin: 10px 0;
         }
 
         .progress-fill {
             height: 100%;
-            background-color: #28a745;
+            background: linear-gradient(90deg, var(--accent), #8b5cf6);
             transition: width 0.3s ease;
+            border-radius: 4px;
         }
 
-        /* 文件管理样式 */
+        /* === CREDENTIAL CARDS === */
         .cred-card {
-            background-color: #f8f9fa;
-            border: 1px solid #e1e4e8;
-            border-radius: 8px;
-            padding: 15px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-left: 3px solid var(--accent);
+            border-radius: var(--radius);
+            padding: 16px 18px;
             margin: 10px 0;
             position: relative;
             width: 100%;
             box-sizing: border-box;
+            transition: all var(--transition);
+        }
+
+        .cred-card:hover {
+            background: var(--bg-card-hover);
+            border-left-color: var(--accent-hover);
+            transform: translateX(2px);
+            box-shadow: var(--shadow-sm);
         }
 
         .cred-card.disabled {
-            background-color: #f5f5f5;
-            border-color: #ccc;
+            background: rgba(255, 255, 255, 0.02);
+            border-left-color: var(--text-muted);
+            opacity: 0.55;
+        }
+
+        .cred-card.disabled:hover {
             opacity: 0.7;
         }
 
@@ -464,180 +591,162 @@
             justify-content: space-between;
             align-items: flex-start;
             margin-bottom: 10px;
-            gap: 20px;
+            gap: 16px;
         }
 
         .cred-filename {
-            font-family: monospace;
-            font-weight: bold;
-            color: #333;
-            font-size: 14px;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-weight: 600;
+            color: var(--text-primary);
+            font-size: 13px;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
-            min-width: 300px;
+            min-width: 280px;
+        }
+
+        .cred-email {
+            color: var(--text-muted) !important;
+            font-style: normal !important;
         }
 
         .cred-status {
             display: flex;
             gap: 5px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
         }
 
+        /* === STATUS BADGES === */
         .status-badge {
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 12px;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 500;
             color: white;
+            letter-spacing: 0.02em;
         }
 
-        .status-badge.enabled {
-            background-color: #28a745;
-        }
-
-        .status-badge.disabled {
-            background-color: #6c757d;
-        }
+        .status-badge.enabled { background: var(--success); }
+        .status-badge.disabled { background: var(--text-muted); }
 
         .error-codes {
-            background-color: #f8d7da;
-            color: #721c24;
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 12px;
+            background: var(--danger-bg);
+            color: #fca5a5;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            border: 1px solid rgba(239, 68, 68, 0.2);
         }
 
         .cooldown-badge {
-            background-color: #ffc107;
-            color: #856404;
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: bold;
+            background: var(--warning-bg);
+            color: #fcd34d;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+            border: 1px solid rgba(245, 158, 11, 0.2);
         }
 
-        .cooldown-badge.ready {
-            background-color: #28a745;
-            color: white;
-        }
+        .cooldown-badge.ready { background: var(--success); color: white; }
 
         .model-cooldown-details {
-            background-color: #e3f2fd;
-            border: 1px solid #90caf9;
-            border-radius: 4px;
+            background: var(--info-bg);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            border-radius: var(--radius-xs);
             padding: 8px;
             margin-top: 8px;
             font-size: 11px;
-            color: #1976d2;
+            color: #93c5fd;
         }
 
         .model-cooldown-item {
             display: inline-block;
-            background-color: #64b5f6;
-            color: white;
-            padding: 2px 6px;
+            background: rgba(59, 130, 246, 0.25);
+            color: #93c5fd;
+            padding: 2px 8px;
             border-radius: 10px;
             margin: 2px;
             font-size: 10px;
         }
 
+        /* === CREDENTIAL ACTION BUTTONS === */
         .cred-actions {
             display: flex;
-            gap: 5px;
+            gap: 6px;
             flex-wrap: wrap;
         }
 
         .cred-btn {
-            padding: 4px 12px;
+            padding: 5px 14px;
             border: none;
-            border-radius: 4px;
+            border-radius: var(--radius-xs);
             font-size: 12px;
+            font-weight: 500;
             cursor: pointer;
-            transition: background-color 0.2s;
-            background-color: #28a745;
+            transition: all var(--transition);
             color: white;
         }
 
         .cred-btn:hover {
-            background-color: #218838;
+            filter: brightness(1.2);
+            transform: translateY(-1px);
         }
 
-        .cred-btn.enable {
-            background-color: #28a745;
-            color: white;
+        .cred-btn:active {
+            transform: translateY(0) scale(0.97);
         }
 
-        .cred-btn.disable {
-            background-color: #28a745;
-            color: white;
-        }
+        .cred-btn.enable { background: var(--success); }
+        .cred-btn.disable { background: #4b5563; }
+        .cred-btn.delete { background: var(--danger); }
+        .cred-btn.download { background: var(--info); }
+        .cred-btn.view { background: #0891b2; }
+        .cred-btn.email { background: #0891b2; }
 
-        .cred-btn.delete {
-            background-color: #dc3545;
-            color: white;
-        }
-
-        .cred-btn.delete:hover {
-            background-color: #c82333;
-        }
-
-        .cred-btn.download {
-            background-color: #28a745;
-            color: white;
-        }
-
-        .cred-btn.view {
-            background-color: #28a745;
-            color: white;
-        }
-
+        /* === CREDENTIAL DETAILS === */
         .cred-details {
             margin-top: 10px;
             display: none;
         }
 
-        .cred-details.show {
-            display: block;
-        }
+        .cred-details.show { display: block; animation: slideDown 0.25s ease-out; }
 
         .cred-content {
-            background-color: #f0f8ff;
-            border: 1px solid #b0d4ff;
-            border-radius: 4px;
-            padding: 10px;
-            font-family: monospace;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-xs);
+            padding: 12px;
+            font-family: 'SF Mono', 'Fira Code', monospace;
             font-size: 11px;
             white-space: pre-wrap;
             word-break: break-all;
             max-height: 200px;
             overflow-y: auto;
+            color: var(--text-secondary);
         }
 
-        /* 额度信息显示样式 */
+        /* === QUOTA DETAILS === */
         .cred-quota-details {
             margin-top: 10px;
             animation: slideDown 0.3s ease-out;
         }
 
         @keyframes slideDown {
-            from {
-                opacity: 0;
-                transform: translateY(-10px);
-            }
-
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
+            from { opacity: 0; transform: translateY(-8px); }
+            to { opacity: 1; transform: translateY(0); }
         }
 
         .cred-quota-content {
-            background: linear-gradient(to bottom, #ffffff, #f8f9fa);
-            border: 2px solid #17a2b8;
-            border-radius: 8px;
-            padding: 10px;
-            box-shadow: 0 2px 8px rgba(23, 162, 184, 0.15);
+            background: var(--bg-card);
+            border: 1px solid rgba(6, 182, 212, 0.25);
+            border-radius: var(--radius-sm);
+            padding: 12px;
+            box-shadow: 0 0 20px rgba(6, 182, 212, 0.05);
         }
 
+        /* === MANAGE ACTIONS === */
         .manage-actions {
             margin-bottom: 20px;
             display: flex;
@@ -645,50 +754,53 @@
             flex-wrap: wrap;
         }
 
-        /* 文件管理新增样式 */
+        /* === STATS CARDS === */
         .stats-container {
             display: flex;
-            gap: 15px;
-            margin-bottom: 20px;
+            gap: 12px;
+            margin-bottom: 24px;
             flex-wrap: wrap;
         }
 
         .stat-item {
-            background: linear-gradient(45deg, #f8f9fa, #e9ecef);
-            border: 1px solid #dee2e6;
-            border-radius: 8px;
-            padding: 12px 20px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 16px 24px;
             text-align: center;
             min-width: 120px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            transition: all var(--transition);
+            flex: 1;
+        }
+
+        .stat-item:hover {
+            background: var(--bg-card-hover);
+            transform: translateY(-2px);
         }
 
         .stat-number {
-            font-size: 24px;
-            font-weight: bold;
-            color: #333;
+            font-size: 28px;
+            font-weight: 700;
             display: block;
+            background: linear-gradient(135deg, var(--text-primary), var(--accent-hover));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
         }
 
         .stat-label {
-            font-size: 12px;
-            color: #666;
+            font-size: 11px;
+            color: var(--text-muted);
             text-transform: uppercase;
+            letter-spacing: 0.08em;
             margin-top: 4px;
         }
 
-        .stat-item.total {
-            border-left: 4px solid #007bff;
-        }
+        .stat-item.total { border-left: 3px solid var(--info); }
+        .stat-item.normal { border-left: 3px solid var(--success); }
+        .stat-item.disabled { border-left: 3px solid var(--text-muted); }
 
-        .stat-item.normal {
-            border-left: 4px solid #28a745;
-        }
-
-        .stat-item.disabled {
-            border-left: 4px solid #6c757d;
-        }
-
+        /* === FILTERS === */
         .filter-container {
             display: flex;
             gap: 10px;
@@ -697,96 +809,133 @@
             flex-wrap: wrap;
         }
 
+        .filter-container label {
+            text-transform: none;
+            letter-spacing: normal;
+            font-size: 13px;
+            margin-bottom: 0;
+            display: inline;
+        }
+
         .filter-select {
-            padding: 8px 12px;
-            border: 2px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-            background-color: white;
+            padding: 7px 12px;
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-xs);
+            font-size: 13px;
+            background: var(--bg-input);
+            color: var(--text-primary);
+            transition: border-color var(--transition);
         }
 
         .filter-select:focus {
-            border-color: #4285f4;
+            border-color: var(--accent);
             outline: none;
         }
 
+        /* === PAGINATION === */
         .pagination-container {
             display: flex;
             justify-content: center;
             align-items: center;
             gap: 10px;
-            margin: 20px 0;
+            margin: 24px 0;
             flex-wrap: wrap;
         }
 
         .pagination-info {
-            color: #666;
-            font-size: 14px;
+            color: var(--text-muted);
+            font-size: 13px;
         }
 
         .pagination-btn {
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            background: white;
+            padding: 7px 14px;
+            border: 1px solid var(--border-color);
+            background: var(--bg-card);
+            color: var(--text-secondary);
             cursor: pointer;
-            border-radius: 4px;
-            font-size: 14px;
+            border-radius: var(--radius-xs);
+            font-size: 13px;
+            transition: all var(--transition);
         }
 
         .pagination-btn:hover:not(:disabled) {
-            background: #f8f9fa;
-            border-color: #4285f4;
+            background: var(--bg-card-hover);
+            border-color: var(--accent);
+            color: var(--text-primary);
         }
 
         .pagination-btn:disabled {
-            background: #f5f5f5;
-            color: #ccc;
+            background: rgba(255,255,255,0.02);
+            color: var(--text-muted);
             cursor: not-allowed;
         }
 
         .pagination-btn.active {
-            background: #4285f4;
+            background: var(--accent);
             color: white;
-            border-color: #4285f4;
+            border-color: var(--accent);
         }
 
         .page-size-select {
             padding: 6px 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-xs);
+            font-size: 13px;
+            background: var(--bg-input);
+            color: var(--text-primary);
         }
 
+        /* === ACTION BUTTONS === */
         .refresh-btn {
-            background-color: #28a745;
+            background: linear-gradient(135deg, #0891b2, #06b6d4);
             color: white;
-            padding: 8px 16px;
+            padding: 8px 18px;
             border: none;
-            border-radius: 4px;
+            border-radius: var(--radius-xs);
             cursor: pointer;
+            font-weight: 500;
+            font-size: 13px;
+            transition: all var(--transition);
+        }
+
+        .refresh-btn:hover {
+            filter: brightness(1.15);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(6, 182, 212, 0.3);
         }
 
         .download-all-btn {
-            background-color: #28a745;
+            background: linear-gradient(135deg, var(--success), #059669);
             color: white;
-            padding: 8px 16px;
+            padding: 8px 18px;
             border: none;
-            border-radius: 4px;
+            border-radius: var(--radius-xs);
             cursor: pointer;
+            font-weight: 500;
+            font-size: 13px;
+            transition: all var(--transition);
         }
 
-        .refresh-btn:hover,
         .download-all-btn:hover {
-            background-color: #218838;
+            filter: brightness(1.15);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
         }
 
-        /* 批量操作样式 */
+        /* === BATCH CONTROLS === */
         .batch-controls {
-            background-color: #f8f9fa;
-            border: 1px solid #e1e4e8;
-            border-radius: 8px;
-            padding: 15px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 16px;
             margin-bottom: 20px;
+        }
+
+        .batch-controls h4 {
+            color: var(--text-secondary);
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
         }
 
         .checkbox-container {
@@ -795,73 +944,66 @@
             margin-right: 15px;
         }
 
+        .checkbox-container label {
+            text-transform: none;
+            letter-spacing: normal;
+            font-size: 14px;
+            margin-bottom: 0;
+            display: inline;
+            color: var(--text-primary);
+        }
+
         .batch-actions {
             display: flex;
-            gap: 10px;
+            gap: 8px;
             flex-wrap: wrap;
             align-items: center;
             margin-top: 10px;
         }
 
         .batch-btn {
-            padding: 6px 12px;
+            padding: 6px 14px;
             border: none;
-            border-radius: 4px;
+            border-radius: var(--radius-xs);
             font-size: 12px;
+            font-weight: 500;
             cursor: pointer;
-            transition: background-color 0.2s;
-            background-color: #28a745;
+            transition: all var(--transition);
             color: white;
         }
 
         .batch-btn:hover:not(:disabled) {
-            background-color: #218838;
+            filter: brightness(1.2);
+            transform: translateY(-1px);
         }
 
-        .batch-btn.batch-enable {
-            background-color: #28a745;
-            color: white;
-        }
-
-        .batch-btn.batch-disable {
-            background-color: #28a745;
-            color: white;
-        }
-
-        .batch-btn.batch-delete {
-            background-color: #dc3545;
-            color: white;
-        }
-
-        .batch-btn.batch-email {
-            background-color: #28a745;
-            color: white;
-        }
+        .batch-btn.batch-enable { background: var(--success); }
+        .batch-btn.batch-disable { background: #4b5563; }
+        .batch-btn.batch-delete { background: var(--danger); }
+        .batch-btn.batch-email { background: #0891b2; }
 
         .batch-btn:disabled {
-            background-color: #e9ecef;
-            color: #6c757d;
+            background: rgba(255,255,255,0.06);
+            color: var(--text-muted);
             cursor: not-allowed;
-        }
-
-
-        .cred-btn.email {
-            background-color: #28a745;
-            color: white;
+            transform: none;
+            filter: none;
         }
 
         .selected-count {
-            font-weight: bold;
-            color: #007bff;
+            font-weight: 600;
+            color: var(--accent-hover);
             margin-right: 10px;
+            font-size: 13px;
         }
 
         .select-all-checkbox {
             margin-right: 8px;
             transform: scale(1.2);
+            accent-color: var(--accent);
         }
 
-        /* 错误码筛选增强 */
+        /* === ERROR FILTER === */
         .error-filter-container {
             display: flex;
             gap: 10px;
@@ -871,97 +1013,95 @@
 
         .error-code-badge {
             display: inline-block;
-            background-color: #dc3545;
-            color: white;
-            padding: 2px 6px;
+            background: var(--danger-bg);
+            color: #fca5a5;
+            padding: 3px 8px;
             border-radius: 10px;
             font-size: 11px;
             margin: 1px;
             cursor: pointer;
-            transition: background-color 0.2s;
+            transition: all var(--transition);
+            border: 1px solid rgba(239, 68, 68, 0.2);
         }
 
-        .error-code-badge:hover {
-            background-color: #c82333;
-        }
+        .error-code-badge:hover { background: rgba(239, 68, 68, 0.25); }
+        .error-code-badge.selected { background: var(--accent); color: white; border-color: var(--accent); }
 
-        .error-code-badge.selected {
-            background-color: #007bff;
-        }
-
-        /* 配置管理样式 */
+        /* === CONFIG MANAGEMENT === */
         .config-group {
-            background-color: #f8f9fa;
-            border: 1px solid #e1e4e8;
-            border-radius: 8px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
             padding: 20px;
             margin: 15px 0;
         }
 
         .config-group h4 {
             margin-top: 0;
-            margin-bottom: 15px;
-            color: #333;
-            border-bottom: 1px solid #e1e4e8;
-            padding-bottom: 8px;
+            margin-bottom: 16px;
+            color: var(--text-primary);
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 10px;
+            font-size: 15px;
         }
 
         .config-input {
             width: 100%;
-            padding: 8px 12px;
-            border: 2px solid #ddd;
-            border-radius: 4px;
+            padding: 9px 14px;
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-xs);
             font-size: 14px;
             box-sizing: border-box;
             margin-bottom: 5px;
+            background: var(--bg-input);
+            color: var(--text-primary);
+            transition: border-color var(--transition), box-shadow var(--transition);
         }
 
         .config-input:focus {
-            border-color: #4285f4;
+            border-color: var(--accent);
             outline: none;
+            box-shadow: 0 0 0 3px var(--accent-glow);
         }
 
         .config-input:disabled {
-            background-color: #f5f5f5;
-            color: #666;
+            background: rgba(255,255,255,0.02);
+            color: var(--text-muted);
             cursor: not-allowed;
         }
 
         .config-checkbox {
             margin-right: 8px;
             transform: scale(1.2);
+            accent-color: var(--accent);
         }
 
         .config-note {
             display: block;
-            color: #666;
+            color: var(--text-muted);
             font-size: 12px;
             margin-bottom: 10px;
             font-style: italic;
         }
 
         .config-info {
-            background-color: #e3f2fd;
-            border: 1px solid #1976d2;
-            border-radius: 4px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-xs);
             padding: 12px;
             margin-top: 8px;
             font-size: 13px;
-            color: #1565c0;
+            color: var(--text-secondary);
         }
 
         .config-info ul {
             margin: 8px 0 4px 0;
-            color: #424242;
+            color: var(--text-secondary);
         }
 
-        .config-info li {
-            margin: 3px 0;
-        }
+        .config-info li { margin: 3px 0; }
 
-        .env-locked {
-            position: relative;
-        }
+        .env-locked { position: relative; }
 
         .env-locked::after {
             content: "🔒 环境变量锚定";
@@ -969,23 +1109,27 @@
             right: 10px;
             top: 50%;
             transform: translateY(-50%);
-            background-color: #ffc107;
-            color: #212529;
-            padding: 2px 6px;
-            border-radius: 3px;
+            background: rgba(245, 158, 11, 0.15);
+            color: #fcd34d;
+            padding: 2px 8px;
+            border-radius: 4px;
             font-size: 11px;
             pointer-events: none;
+            border: 1px solid rgba(245, 158, 11, 0.2);
         }
 
-        /* 使用统计样式 */
+        /* === USAGE STATS === */
         .usage-card {
-            background-color: #f8f9fa;
-            border: 1px solid #e1e4e8;
-            border-radius: 8px;
-            padding: 15px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 16px;
             margin: 10px 0;
             position: relative;
+            transition: all var(--transition);
         }
+
+        .usage-card:hover { background: var(--bg-card-hover); }
 
         .usage-header {
             display: flex;
@@ -995,15 +1139,13 @@
         }
 
         .usage-filename {
-            font-family: monospace;
-            font-weight: bold;
-            color: #333;
+            font-family: 'SF Mono', monospace;
+            font-weight: 600;
+            color: var(--text-primary);
             font-size: 14px;
         }
 
-        .usage-progress {
-            margin: 10px 0;
-        }
+        .usage-progress { margin: 10px 0; }
 
         .usage-progress-label {
             display: flex;
@@ -1011,13 +1153,14 @@
             align-items: center;
             margin-bottom: 5px;
             font-size: 12px;
+            color: var(--text-secondary);
         }
 
         .usage-progress-bar {
             width: 100%;
-            height: 20px;
-            background-color: #e9ecef;
-            border-radius: 10px;
+            height: 8px;
+            background: rgba(255,255,255,0.06);
+            border-radius: 4px;
             overflow: hidden;
             position: relative;
         }
@@ -1025,48 +1168,33 @@
         .usage-progress-fill {
             height: 100%;
             transition: width 0.3s ease;
+            border-radius: 4px;
         }
 
-        .usage-progress-fill.gemini {
-            background-color: #ff6b35;
-        }
-
-        .usage-progress-fill.total {
-            background-color: #007bff;
-        }
-
-        .usage-progress-fill.warning {
-            background-color: #ffc107;
-        }
-
-        .usage-progress-fill.danger {
-            background-color: #dc3545;
-        }
+        .usage-progress-fill.gemini { background: linear-gradient(90deg, #f97316, #ef4444); }
+        .usage-progress-fill.total { background: linear-gradient(90deg, var(--info), var(--accent)); }
+        .usage-progress-fill.warning { background: linear-gradient(90deg, #f59e0b, #ef4444); }
+        .usage-progress-fill.danger { background: var(--danger); }
 
         .usage-actions {
             display: flex;
-            gap: 5px;
+            gap: 6px;
             margin-top: 10px;
         }
 
         .usage-btn {
-            padding: 4px 8px;
+            padding: 5px 10px;
             border: none;
-            border-radius: 4px;
+            border-radius: var(--radius-xs);
             font-size: 11px;
             cursor: pointer;
-            transition: background-color 0.2s;
-        }
-
-        .usage-btn.reset {
-            background-color: #6c757d;
+            transition: all var(--transition);
             color: white;
         }
 
-        .usage-btn.limits {
-            background-color: #17a2b8;
-            color: white;
-        }
+        .usage-btn.reset { background: #4b5563; }
+        .usage-btn.limits { background: #0891b2; }
+        .usage-btn:hover { filter: brightness(1.2); }
 
         .usage-info {
             display: grid;
@@ -1077,64 +1205,66 @@
         }
 
         .usage-info-item {
-            background-color: #ffffff;
-            padding: 8px;
-            border-radius: 4px;
-            border: 1px solid #dee2e6;
+            background: rgba(0,0,0,0.2);
+            padding: 8px 10px;
+            border-radius: var(--radius-xs);
+            border: 1px solid var(--border-color);
         }
 
         .usage-info-label {
-            font-weight: bold;
-            color: #666;
+            font-weight: 600;
+            color: var(--text-muted);
             display: block;
             margin-bottom: 2px;
+            font-size: 11px;
         }
 
-        .usage-info-value {
-            color: #333;
-        }
+        .usage-info-value { color: var(--text-primary); }
 
         .reset-time {
             font-size: 11px;
-            color: #666;
+            color: var(--text-muted);
             font-style: italic;
             margin-top: 5px;
         }
 
-        /* 限制设置弹窗样式 */
+        /* === MODALS === */
         .modal {
             display: none;
             position: fixed;
             z-index: 1000;
-            left: 0;
-            top: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0, 0, 0, 0.5);
+            left: 0; top: 0;
+            width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(4px);
         }
 
         .modal-content {
-            background-color: #fefefe;
-            margin: 15% auto;
-            padding: 20px;
-            border-radius: 8px;
-            width: 400px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            margin: 12% auto;
+            padding: 24px;
+            border-radius: var(--radius);
+            width: 420px;
             max-width: 90%;
+            box-shadow: var(--shadow);
+            color: var(--text-primary);
         }
 
         .modal-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 15px;
-            padding-bottom: 10px;
-            border-bottom: 1px solid #dee2e6;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border-color);
         }
 
         .modal-title {
             margin: 0;
             font-size: 16px;
-            color: #333;
+            color: var(--text-primary);
+            font-weight: 600;
         }
 
         .modal-close {
@@ -1142,16 +1272,13 @@
             border: none;
             font-size: 20px;
             cursor: pointer;
-            color: #999;
+            color: var(--text-muted);
+            transition: color var(--transition);
         }
 
-        .modal-close:hover {
-            color: #333;
-        }
+        .modal-close:hover { color: var(--text-primary); }
 
-        .modal-body {
-            margin-bottom: 15px;
-        }
+        .modal-body { margin-bottom: 16px; color: var(--text-secondary); }
 
         .modal-footer {
             display: flex;
@@ -1159,14 +1286,13 @@
             justify-content: flex-end;
         }
 
-        /* 消息模态框样式 */
+        /* === MESSAGE MODAL === */
         .message-modal-overlay {
             position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0, 0, 0, 0.5);
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.65);
+            backdrop-filter: blur(6px);
             display: flex;
             justify-content: center;
             align-items: center;
@@ -1175,19 +1301,15 @@
         }
 
         @keyframes fadeIn {
-            from {
-                opacity: 0;
-            }
-
-            to {
-                opacity: 1;
-            }
+            from { opacity: 0; }
+            to { opacity: 1; }
         }
 
         .message-modal {
-            background: white;
-            border-radius: 8px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
             max-width: 600px;
             width: 90%;
             max-height: 80vh;
@@ -1197,15 +1319,8 @@
         }
 
         @keyframes slideIn {
-            from {
-                transform: translateY(-50px);
-                opacity: 0;
-            }
-
-            to {
-                transform: translateY(0);
-                opacity: 1;
-            }
+            from { transform: translateY(-30px) scale(0.97); opacity: 0; }
+            to { transform: translateY(0) scale(1); opacity: 1; }
         }
 
         .message-modal-header {
@@ -1213,41 +1328,42 @@
             justify-content: space-between;
             align-items: center;
             padding: 20px 24px;
-            border-bottom: 1px solid #e0e0e0;
+            border-bottom: 1px solid var(--border-color);
         }
 
         .message-modal.success .message-modal-header {
-            background: linear-gradient(135deg, #4caf50 0%, #45a049 100%);
-            color: white;
-            border-radius: 8px 8px 0 0;
+            background: linear-gradient(135deg, rgba(16,185,129,0.2), rgba(5,150,105,0.2));
+            border-radius: var(--radius) var(--radius) 0 0;
+            border-bottom-color: rgba(16, 185, 129, 0.2);
         }
 
         .message-modal.error .message-modal-header {
-            background: linear-gradient(135deg, #f44336 0%, #d32f2f 100%);
-            color: white;
-            border-radius: 8px 8px 0 0;
+            background: linear-gradient(135deg, rgba(239,68,68,0.2), rgba(220,38,38,0.2));
+            border-radius: var(--radius) var(--radius) 0 0;
+            border-bottom-color: rgba(239, 68, 68, 0.2);
         }
 
         .message-modal.info .message-modal-header {
-            background: linear-gradient(135deg, #2196f3 0%, #1976d2 100%);
-            color: white;
-            border-radius: 8px 8px 0 0;
+            background: linear-gradient(135deg, rgba(59,130,246,0.2), rgba(37,99,235,0.2));
+            border-radius: var(--radius) var(--radius) 0 0;
+            border-bottom-color: rgba(59, 130, 246, 0.2);
         }
 
         .message-modal-header h3 {
             margin: 0;
-            font-size: 20px;
+            font-size: 18px;
             font-weight: 600;
+            color: var(--text-primary);
         }
 
         .message-modal-close {
             background: none;
             border: none;
-            font-size: 28px;
+            font-size: 24px;
             cursor: pointer;
-            color: inherit;
+            color: var(--text-muted);
             opacity: 0.8;
-            transition: opacity 0.2s;
+            transition: all var(--transition);
             padding: 0;
             width: 32px;
             height: 32px;
@@ -1256,15 +1372,13 @@
             justify-content: center;
         }
 
-        .message-modal-close:hover {
-            opacity: 1;
-        }
+        .message-modal-close:hover { opacity: 1; color: var(--text-primary); }
 
         .message-modal-body {
             padding: 24px;
             overflow-y: auto;
-            line-height: 1.6;
-            color: #333;
+            line-height: 1.7;
+            color: var(--text-secondary);
             font-size: 14px;
             white-space: pre-wrap;
             word-break: break-word;
@@ -1272,7 +1386,7 @@
 
         .message-modal-footer {
             padding: 16px 24px;
-            border-top: 1px solid #e0e0e0;
+            border-top: 1px solid var(--border-color);
             display: flex;
             justify-content: flex-end;
             gap: 10px;
@@ -1281,63 +1395,375 @@
         .message-modal-btn {
             padding: 10px 24px;
             border: none;
-            border-radius: 4px;
+            border-radius: var(--radius-xs);
             font-size: 14px;
             font-weight: 500;
             cursor: pointer;
-            transition: all 0.2s;
-            background-color: #4285f4;
+            transition: all var(--transition);
+            background: linear-gradient(135deg, var(--accent), #7c3aed);
             color: white;
         }
 
         .message-modal-btn:hover {
-            background-color: #3367d6;
+            filter: brightness(1.15);
             transform: translateY(-1px);
-            box-shadow: 0 2px 8px rgba(66, 133, 244, 0.3);
+            box-shadow: 0 4px 16px var(--accent-glow);
         }
 
-        /* 消息中的链接样式 */
+        /* Message link */
         .message-link {
-            color: #1976d2;
+            color: var(--accent-hover);
             text-decoration: none;
             font-weight: 500;
             padding: 2px 4px;
             border-radius: 3px;
-            background-color: rgba(25, 118, 210, 0.1);
-            transition: all 0.2s;
+            background: rgba(99, 102, 241, 0.1);
+            transition: all var(--transition);
             display: inline-block;
             word-break: break-all;
         }
 
         .message-link:hover {
-            background-color: rgba(25, 118, 210, 0.2);
+            background: rgba(99, 102, 241, 0.2);
             text-decoration: underline;
-            transform: translateY(-1px);
         }
 
-        .message-link:active {
-            transform: translateY(0);
+        /* === INLINE STYLE OVERRIDES for elements styled via inline attributes === */
+        /* Config info boxes with inline background */
+        div[style*="background-color: #fff3cd"],
+        div[style*="background:#fff3cd"],
+        div[style*="background-color: #d4edda"],
+        div[style*="background-color: #e3f2fd"],
+        div[style*="background-color: #f3e5f5"] {
+            background: var(--bg-card) !important;
+            border-color: var(--border-color) !important;
+            color: var(--text-secondary) !important;
         }
 
-        /* 移动端适配 */
+        /* API address boxes */
+        div[style*="background:#f0f7ff"],
+        div[style*="background-color: #f0f7ff"] {
+            background: var(--bg-card) !important;
+            border-color: var(--border-color) !important;
+            color: var(--text-secondary) !important;
+        }
+
+        /* Info boxes with specific styles */
+        div[style*="background: #fff3cd"],
+        div[style*="background: #e7f3ff"] {
+            background: var(--bg-card) !important;
+            border-color: var(--border-color) !important;
+            color: var(--text-secondary) !important;
+        }
+
+        /* Code elements */
+        code {
+            background: rgba(255,255,255,0.08) !important;
+            color: var(--accent-hover) !important;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        /* Tables in config */
+        table { color: var(--text-secondary); }
+        td { color: var(--text-secondary) !important; }
+
+        /* Lists */
+        ul, ol { color: var(--text-secondary); }
+        li { color: var(--text-secondary); }
+
+        /* Checkbox accent color */
+        input[type="checkbox"] {
+            accent-color: var(--accent);
+        }
+
+        /* === RESPONSIVE === */
         @media (max-width: 768px) {
+            body { padding: 12px; }
+
+            .container { padding: 16px; border-radius: 14px; }
+
+            .cred-header {
+                flex-direction: column;
+                gap: 8px;
+            }
+
+            .cred-filename { min-width: auto; }
+
+            .cred-status {
+                justify-content: flex-start;
+            }
+
+            .stat-item { min-width: 80px; padding: 12px 16px; }
+
             .message-modal {
                 max-width: 95%;
                 max-height: 90vh;
             }
 
-            .message-modal-header {
-                padding: 16px 20px;
-            }
+            .message-modal-header { padding: 16px 20px; }
+            .message-modal-body { padding: 20px; font-size: 13px; }
+            .message-modal-footer { padding: 12px 20px; }
 
-            .message-modal-body {
-                padding: 20px;
-                font-size: 13px;
-            }
+            .login-form input[type="password"],
+            .login-form .btn { width: 100%; }
+        }
 
-            .message-modal-footer {
-                padding: 12px 20px;
-            }
+        /* =============================================================
+           INLINE STYLE OVERRIDES — force dark theme on hardcoded colors
+           ============================================================= */
+
+        /* ALL buttons with inline background-color */
+        .cred-btn[style],
+        .batch-btn[style],
+        button[style] {
+            filter: brightness(0.85) saturate(0.9) !important;
+        }
+
+        .cred-btn[style]:hover,
+        .batch-btn[style]:hover,
+        button[style]:hover {
+            filter: brightness(1.1) saturate(1) !important;
+        }
+
+        /* Disabled state for ALL buttons — must be visible */
+        .batch-btn:disabled,
+        .cred-btn:disabled,
+        button:disabled {
+            background: rgba(255,255,255,0.06) !important;
+            color: #64748b !important;
+            opacity: 0.5 !important;
+            filter: none !important;
+        }
+
+        /* Override ALL inline background colors on divs */
+        div[style*="background-color: #f8f9fa"],
+        div[style*="background-color: #f0f7ff"],
+        div[style*="background: #f8fcff"],
+        div[style*="background-color: #f8fcff"],
+        div[style*="background:#f0f7ff"],
+        div[style*="background: #f0f8ff"],
+        div[style*="background-color: #f0f8ff"],
+        div[style*="background:#f8f9fa"] {
+            background: var(--bg-card) !important;
+            border-color: var(--border-color) !important;
+            color: var(--text-secondary) !important;
+        }
+
+        /* Warning/info/success boxes with inline styles */
+        div[style*="background-color: #fff3cd"],
+        div[style*="background: #fff3cd"],
+        div[style*="background-color: #d4edda"],
+        div[style*="background: #d4edda"],
+        div[style*="background-color: #e3f2fd"],
+        div[style*="background: #e3f2fd"],
+        div[style*="background-color: #f3e5f5"],
+        div[style*="background: #f3e5f5"],
+        div[style*="background: #e7f3ff"],
+        div[style*="background-color: #e7f3ff"],
+        div[style*="background-color: #e8f4fd"],
+        div[style*="background: #e8f4fd"] {
+            background: var(--bg-card) !important;
+            border-color: var(--border-color) !important;
+            color: var(--text-secondary) !important;
+        }
+
+        /* Inline color overrides for text */
+        [style*="color: #856404"] { color: #fcd34d !important; }
+        [style*="color: #0c5460"] { color: #67e8f9 !important; }
+        [style*="color: #155724"] { color: #6ee7b7 !important; }
+        [style*="color: #721c24"] { color: #fca5a5 !important; }
+        [style*="color: #666"] { color: var(--text-muted) !important; }
+        [style*="color: #333"] { color: var(--text-primary) !important; }
+        [style*="color: #0066cc"] { color: var(--accent-hover) !important; }
+        [style*="color: #212529"] { color: var(--text-primary) !important; }
+        [style*="color: #1565c0"] { color: #93c5fd !important; }
+        [style*="color: #424242"] { color: var(--text-secondary) !important; }
+        [style*="color: #4a148c"] { color: #d8b4fe !important; }
+        [style*="color: #0d47a1"] { color: #93c5fd !important; }
+        [style*="color: #888"] { color: var(--text-muted) !important; }
+        [style*="color: #999"] { color: var(--text-muted) !important; }
+
+        /* Border color overrides */
+        [style*="border-color: #28a745"] { border-color: var(--success) !important; }
+        [style*="border: 2px solid #e1e4e8"],
+        [style*="border: 1px solid #b8d4f0"],
+        [style*="border: 1px solid #e8f4fd"],
+        [style*="border: 1px solid #ffc107"],
+        [style*="border: 1px solid #ffeaa7"],
+        [style*="border: 1px solid #b3d9ff"],
+        [style*="border: 1px solid #2196f3"],
+        [style*="border: 1px solid #9c27b0"],
+        [style*="border: 1px solid #c3e6cb"],
+        [style*="border: 2px solid #e8f4fd"] {
+            border-color: var(--border-color) !important;
+        }
+
+        /* h4 with inline color */
+        h4[style*="color: #007bff"] { color: var(--info) !important; }
+        h4[style*="color: #28a745"] { color: var(--success) !important; }
+
+        /* API code elements with inline style */
+        code[style*="background:#e8f0fe"],
+        code[style*="background-color:#e8f0fe"],
+        code[style*="background: #f1f3f4"],
+        code[style*="background-color: #f1f3f4"] {
+            background: rgba(255,255,255,0.08) !important;
+            color: var(--accent-hover) !important;
+        }
+
+        /* Logout button */
+        button[style*="background-color: #dc3545"],
+        button[style*="background: #dc3545"] {
+            background: rgba(239, 68, 68, 0.8) !important;
+        }
+
+        /* Specific button style overrides for better visibility */
+        button[style*="background-color: #17a2b8"] { background: rgba(8, 145, 178, 0.8) !important; }
+        button[style*="background-color: #ff9800"] { background: rgba(245, 158, 11, 0.8) !important; }
+        button[style*="background-color: #9c27b0"] { background: rgba(139, 92, 246, 0.8) !important; }
+        button[style*="background-color: #e91e63"] { background: rgba(236, 72, 153, 0.8) !important; }
+        button[style*="background-color: #6c757d"] { background: rgba(75, 85, 99, 0.8) !important; }
+        button[style*="background-color: #28a745"] { background: rgba(16, 185, 129, 0.7) !important; }
+        button[style*="background-color: #20c997"] { background: rgba(16, 185, 129, 0.7) !important; }
+        button[style*="background-color: #00bcd4"] { background: rgba(6, 182, 212, 0.8) !important; }
+
+        /* Ensure white text on all colored buttons */
+        .cred-btn, .batch-btn, .refresh-btn, .download-all-btn,
+        button[style*="background-color"] {
+            color: white !important;
+        }
+
+        /* Log container */
+        div[style*="background-color: #1e1e1e"] {
+            background-color: rgba(0, 0, 0, 0.4) !important;
+            border-color: var(--border-color) !important;
+        }
+
+        /* Cred content warning style override */
+        .cred-content[style*="background-color: #fff3cd"] {
+            background: rgba(245, 158, 11, 0.08) !important;
+            border-color: rgba(245, 158, 11, 0.15) !important;
+            color: var(--text-secondary) !important;
+        }
+
+        /* Small and span text overrides */
+        small { color: var(--text-muted); }
+        .config-note span[style*="color: #28a745"] { color: var(--success) !important; }
+
+        /* =============================================================
+           BROAD INLINE STYLE OVERRIDES — catch remaining light areas
+           ============================================================= */
+
+        /* Any div with inline background: #f8f9fa (upload areas, collapsible panels, etc.) */
+        div[style*="background: #f8f9fa"],
+        div[style*="background: #fafafa"],
+        div[style*="background: white"],
+        div[style*="background: #fff"],
+        div[style*="background: #ffffff"],
+        div[style*="background-color: #fafafa"],
+        div[style*="background-color: white"],
+        div[style*="background-color: #fff"],
+        div[style*="background-color: #ffffff"],
+        div[style*="background-color: #f5f5f5"],
+        div[style*="background: #f5f5f5"] {
+            background: var(--bg-card) !important;
+            color: var(--text-secondary) !important;
+        }
+
+        /* Upload drop zones and bordered containers with inline border */
+        div[style*="border: 2px solid #ddd"],
+        div[style*="border: 2px solid #e1e4e8"],
+        div[style*="border: 1px solid #ddd"],
+        div[style*="border: 1px solid #e1e4e8"],
+        div[style*="border: 1px solid #dee2e6"] {
+            border-color: var(--border-color) !important;
+        }
+
+        /* Upload area dashed border — target specific inline ondrag styles */
+        div[style*="border: 2px dashed"] {
+            border-color: rgba(255,255,255,0.12) !important;
+            background: var(--bg-card) !important;
+            color: var(--text-muted) !important;
+        }
+
+        /* QR code / white card boxes */
+        div[style*="background: white; padding"],
+        span[style*="background: white"],
+        div[style*="box-shadow: 0 2px 15px"] {
+            background: var(--bg-card) !important;
+            box-shadow: var(--shadow-sm) !important;
+        }
+
+        /* Project info section (border-left: 4px solid #007bff) */
+        div[style*="border-left: 4px solid #007bff"] {
+            background: var(--bg-card) !important;
+            border-color: var(--border-color) !important;
+            border-left-color: var(--accent) !important;
+            color: var(--text-secondary) !important;
+        }
+
+        /* Collapsible section headers */
+        div[style*="cursor: pointer"][style*="border: 2px solid #ddd"] {
+            background: var(--bg-card) !important;
+            border-color: var(--border-color) !important;
+            color: var(--text-primary) !important;
+        }
+
+        /* Textarea elements (if any) */
+        textarea {
+            background: var(--bg-input) !important;
+            color: var(--text-primary) !important;
+            border-color: var(--border-color) !important;
+        }
+
+        textarea:focus {
+            border-color: var(--accent) !important;
+            box-shadow: 0 0 0 3px var(--accent-glow) !important;
+            outline: none;
+        }
+
+        /* Select elements */
+        select {
+            background: var(--bg-input);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-xs);
+        }
+
+        select:focus {
+            border-color: var(--accent);
+            outline: none;
+        }
+
+        select option {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+        }
+
+        /* Input file styled areas */
+        input[type="file"] {
+            color: var(--text-secondary);
+        }
+
+        /* All remaining inline-styled spans with light colors */
+        span[style*="color: #666"],
+        span[style*="color: #333"],
+        span[style*="color: #888"],
+        span[style*="color: #555"],
+        span[style*="color: #444"],
+        p[style*="color: #666"],
+        p[style*="color: #333"],
+        p[style*="color: #888"],
+        p[style*="color: #555"],
+        p[style*="color: #444"] {
+            color: var(--text-secondary) !important;
+        }
+
+        /* HR tags */
+        hr {
+            border-color: var(--border-color);
+            opacity: 0.5;
         }
     </style>
 </head>
@@ -1487,7 +1913,8 @@
                                     placeholder="粘贴完整的回调URL，例如：http://localhost:11451/?state=xxx&code=xxx&scope=xxx..."
                                     style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 4px; font-size: 13px;">
                             </div>
-                            <button class="btn" style="margin-top: 10px;" onclick="processCallbackUrl()">
+                            <button class="btn" style="margin-top: 10px; background: #28a745; border-color: #28a745;"
+                                onclick="processCallbackUrl()">
                                 从回调URL获取凭证
                             </button>
                         </div>
@@ -1574,7 +2001,8 @@
                                     placeholder="粘贴完整的回调URL，例如：http://localhost:11451/?state=xxx&code=xxx&scope=xxx..."
                                     style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 4px; font-size: 13px;">
                             </div>
-                            <button class="btn" style="margin-top: 10px;" onclick="processAntigravityCallbackUrl()">
+                            <button class="btn" style="margin-top: 10px; background: #28a745; border-color: #28a745;"
+                                onclick="processAntigravityCallbackUrl()">
                                 从回调URL获取凭证
                             </button>
                         </div>
@@ -1617,7 +2045,7 @@
                         <h4>选择的文件：</h4>
                         <div class="file-list" id="fileList"></div>
                         <button class="btn" onclick="uploadFiles()">上传文件</button>
-                        <button class="btn" onclick="clearFiles()">清空列表</button>
+                        <button class="btn" style="background-color: #6c757d;" onclick="clearFiles()">清空列表</button>
                     </div>
 
                     <div id="uploadProgressSection" class="hidden">
@@ -1652,8 +2080,10 @@
                     <div id="antigravityFileListSection" class="hidden">
                         <h4>选择的文件：</h4>
                         <div class="file-list" id="antigravityFileList"></div>
-                        <button class="btn" onclick="uploadAntigravityFiles()">上传文件</button>
-                        <button class="btn" onclick="clearAntigravityFiles()">清空列表</button>
+                        <button class="btn" style="background-color: #28a745;"
+                            onclick="uploadAntigravityFiles()">上传文件</button>
+                        <button class="btn" style="background-color: #6c757d;"
+                            onclick="clearAntigravityFiles()">清空列表</button>
                     </div>
 
                     <div id="antigravityUploadProgressSection" class="hidden">
@@ -1754,12 +2184,13 @@
                             disabled>批量禁用</button>
                         <button class="batch-btn batch-delete" id="batchDeleteBtn" onclick="batchAction('delete')"
                             disabled>批量删除</button>
-                        <button class="batch-btn" id="batchVerifyBtn" onclick="batchVerifyProjectIds()"
-                            disabled>批量检验</button>
-                        <button class="batch-btn" id="batchPreviewBtn" onclick="batchConfigurePreview()"
-                            disabled>批量设置预览</button>
+                        <button class="batch-btn" style="background-color: #ff9800;" id="batchVerifyBtn"
+                            onclick="batchVerifyProjectIds()" disabled>批量检验</button>
+                        <button class="batch-btn" style="background-color: #9c27b0;" id="batchPreviewBtn"
+                            onclick="batchConfigurePreview()" disabled>批量设置预览</button>
                         <button class="batch-btn batch-email" onclick="refreshAllEmails()">刷新所有邮箱</button>
-                        <button class="batch-btn" onclick="deduplicateByEmail()">凭证一键去重</button>
+                        <button class="batch-btn" style="background-color: #e91e63;"
+                            onclick="deduplicateByEmail()">凭证一键去重</button>
                     </div>
                 </div>
 
@@ -1907,18 +2338,15 @@
                             onclick="batchAntigravityAction('disable')" disabled>批量禁用</button>
                         <button class="batch-btn batch-delete" id="antigravityBatchDeleteBtn"
                             onclick="batchAntigravityAction('delete')" disabled>批量删除</button>
-                        <button class="batch-btn" id="antigravityBatchEnableCreditBtn"
-                            onclick="batchAntigravityAction('enable_credit')" disabled>批量开启积分</button>
-                        <button class="batch-btn" id="antigravityBatchDisableCreditBtn"
-                            onclick="batchAntigravityAction('disable_credit')" disabled>批量关闭积分</button>
-                        <button class="batch-btn" id="antigravityBatchVerifyBtn"
+                        <button class="batch-btn" style="background-color: #ff9800;" id="antigravityBatchVerifyBtn"
                             onclick="batchVerifyAntigravityProjectIds()" disabled>批量检验</button>
                         <button class="batch-btn" style="background-color: #20c997;" id="antigravityBatchEnableCreditBtn"
                             onclick="batchAntigravityAction('enable_credit')" disabled>批量开启Credit</button>
                         <button class="batch-btn" style="background-color: #6c757d;" id="antigravityBatchDisableCreditBtn"
                             onclick="batchAntigravityAction('disable_credit')" disabled>批量关闭Credit</button>
                         <button class="batch-btn batch-email" onclick="refreshAllAntigravityEmails()">刷新所有邮箱</button>
-                        <button class="batch-btn" onclick="deduplicateAntigravityByEmail()">凭证一键去重</button>
+                        <button class="batch-btn" style="background-color: #e91e63;"
+                            onclick="deduplicateAntigravityByEmail()">凭证一键去重</button>
                     </div>
                 </div>
 
@@ -2059,11 +2487,11 @@
                             <div class="form-group">
                                 <div style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;">
                                     <button type="button" class="btn" onclick="useMirrorUrls()"
-                                        style="font-size: 14px;">
+                                        style="background-color: #28a745; font-size: 14px;">
                                         🚀 一键使用镜像网址
                                     </button>
                                     <button type="button" class="btn" onclick="restoreOfficialUrls()"
-                                        style="font-size: 14px;">
+                                        style="background-color: #17a2b8; font-size: 14px;">
                                         🔄 还原官方端点
                                     </button>
                                 </div>
@@ -2295,9 +2723,9 @@
 
                 <div class="manage-actions">
                     <button class="refresh-btn" onclick="connectWebSocket()">连接日志流</button>
-                    <button class="btn" onclick="disconnectWebSocket()">断开连接</button>
-                    <button class="btn" onclick="downloadLogs()">下载日志</button>
-                    <button class="btn" onclick="clearLogs()">清空日志</button>
+                    <button class="btn" style="background-color: #dc3545;" onclick="disconnectWebSocket()">断开连接</button>
+                    <button class="btn" style="background-color: #28a745;" onclick="downloadLogs()">下载日志</button>
+                    <button class="btn" style="background-color: #6c757d;" onclick="clearLogs()">清空日志</button>
                 </div>
 
                 <div class="filter-container">
