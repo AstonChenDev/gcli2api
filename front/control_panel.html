@@ -680,6 +680,7 @@
             cursor: pointer;
             transition: all var(--transition);
             color: white;
+            background: #6366f1;
         }
 
         .cred-btn:hover {
@@ -696,7 +697,16 @@
         .cred-btn.delete { background: var(--danger); }
         .cred-btn.download { background: var(--info); }
         .cred-btn.view { background: #0891b2; }
-        .cred-btn.email { background: #0891b2; }
+        .cred-btn.email { background: #7c3aed; }
+
+        /* Per-function colors for buttons without modifier classes */
+        .cred-btn[data-action="enable_credit"] { background: #059669; }
+        .cred-btn[data-action="disable_credit"] { background: #6b7280; }
+        .cred-btn[onclick*="configurePreview"] { background: #7c3aed; }
+        .cred-btn[onclick*="verify"] { background: #d97706; }
+        .cred-btn[onclick*="test"] { background: #0891b2; }
+        .cred-btn[onclick*="ErrorDetails"] { background: #e11d48; }
+        .cred-btn[onclick*="QuotaDetails"] { background: #0284c7; }
 
         /* === CREDENTIAL DETAILS === */
         .cred-details {
