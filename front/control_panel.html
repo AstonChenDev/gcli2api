@@ -7,38 +7,38 @@
     <title>GCLI2API 控制面板</title>
     <style>
         /* ================================================================
-           GCLI2API Control Panel — Dark Glassmorphism Theme
+           GCLI2API Control Panel — Modern Light Theme
            Only CSS changes — zero HTML/JS modifications
            ================================================================ */
 
         /* === FOUNDATIONS === */
         :root {
-            --bg-primary: #0b0e17;
-            --bg-secondary: #111827;
-            --bg-card: rgba(255, 255, 255, 0.04);
-            --bg-card-hover: rgba(255, 255, 255, 0.07);
-            --bg-input: rgba(255, 255, 255, 0.06);
-            --border-color: rgba(255, 255, 255, 0.08);
-            --border-focus: rgba(99, 102, 241, 0.5);
-            --text-primary: #e2e8f0;
-            --text-secondary: #94a3b8;
-            --text-muted: #64748b;
+            --bg-primary: #f0f2f5;
+            --bg-secondary: #ffffff;
+            --bg-card: #ffffff;
+            --bg-card-hover: #f8f9fb;
+            --bg-input: #f5f7fa;
+            --border-color: #e2e8f0;
+            --border-focus: rgba(99, 102, 241, 0.4);
+            --text-primary: #1e293b;
+            --text-secondary: #475569;
+            --text-muted: #94a3b8;
             --accent: #6366f1;
-            --accent-hover: #818cf8;
-            --accent-glow: rgba(99, 102, 241, 0.35);
+            --accent-hover: #4f46e5;
+            --accent-glow: rgba(99, 102, 241, 0.2);
             --success: #10b981;
-            --success-bg: rgba(16, 185, 129, 0.12);
+            --success-bg: #ecfdf5;
             --danger: #ef4444;
-            --danger-bg: rgba(239, 68, 68, 0.12);
+            --danger-bg: #fef2f2;
             --warning: #f59e0b;
-            --warning-bg: rgba(245, 158, 11, 0.12);
+            --warning-bg: #fffbeb;
             --info: #3b82f6;
-            --info-bg: rgba(59, 130, 246, 0.12);
+            --info-bg: #eff6ff;
             --radius: 12px;
             --radius-sm: 8px;
             --radius-xs: 6px;
-            --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
-            --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.2);
+            --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 4px 16px rgba(0,0,0,0.06);
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
             --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
@@ -52,9 +52,6 @@
             margin: 0 auto;
             padding: 24px;
             background: var(--bg-primary);
-            background-image:
-                radial-gradient(ellipse 80% 50% at 50% -20%, rgba(99, 102, 241, 0.12), transparent),
-                radial-gradient(ellipse 60% 40% at 80% 100%, rgba(139, 92, 246, 0.08), transparent);
             min-height: 100vh;
             color: var(--text-primary);
         }
@@ -65,18 +62,16 @@
         /* === SCROLLBAR === */
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+        ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.2); }
 
         /* === CONTAINER === */
         .container {
-            background: rgba(17, 24, 39, 0.7);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
+            background: var(--bg-secondary);
             padding: 32px;
             border-radius: 20px;
             border: 1px solid var(--border-color);
-            box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,0.04);
+            box-shadow: var(--shadow);
             overflow-x: auto;
         }
 
@@ -179,7 +174,7 @@
         }
 
         .btn:disabled {
-            background: rgba(255,255,255,0.06);
+            background: #e2e8f0;
             color: var(--text-muted);
             cursor: not-allowed;
             box-shadow: none;
@@ -241,9 +236,7 @@
             padding: 14px 20px;
             border-radius: var(--radius-sm);
             margin: 0;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
             opacity: 0;
             transform: translateX(100%);
             transition: opacity 0.3s ease, transform 0.3s ease;
@@ -262,30 +255,30 @@
         }
 
         #statusSection .status.success {
-            background: rgba(16, 185, 129, 0.15);
+            background: #ecfdf5;
             border-left-color: var(--success);
-            color: #6ee7b7;
+            color: #065f46;
             border-top: none; border-right: none; border-bottom: none;
         }
 
         #statusSection .status.error {
-            background: rgba(239, 68, 68, 0.15);
+            background: #fef2f2;
             border-left-color: var(--danger);
-            color: #fca5a5;
+            color: #991b1b;
             border-top: none; border-right: none; border-bottom: none;
         }
 
         #statusSection .status.warning {
-            background: rgba(245, 158, 11, 0.15);
+            background: #fffbeb;
             border-left-color: var(--warning);
-            color: #fcd34d;
+            color: #92400e;
             border-top: none; border-right: none; border-bottom: none;
         }
 
         #statusSection .status.info {
-            background: rgba(59, 130, 246, 0.15);
+            background: #eff6ff;
             border-left-color: var(--info);
-            color: #93c5fd;
+            color: #1e40af;
             border-top: none; border-right: none; border-bottom: none;
         }
 
@@ -299,20 +292,20 @@
 
         .status.success {
             background: var(--success-bg);
-            border: 1px solid rgba(16, 185, 129, 0.2);
-            color: #6ee7b7;
+            border: 1px solid #a7f3d0;
+            color: #065f46;
         }
 
         .status.error {
             background: var(--danger-bg);
-            border: 1px solid rgba(239, 68, 68, 0.2);
-            color: #fca5a5;
+            border: 1px solid #fecaca;
+            color: #991b1b;
         }
 
         .status.info {
             background: var(--info-bg);
-            border: 1px solid rgba(59, 130, 246, 0.2);
-            color: #93c5fd;
+            border: 1px solid #bfdbfe;
+            color: #1e40af;
         }
 
         .hidden { display: none; }
@@ -330,7 +323,7 @@
         }
 
         .login-form h1 {
-            background: linear-gradient(135deg, #e2e8f0, var(--accent-hover));
+            background: linear-gradient(135deg, #1e293b, var(--accent));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
@@ -375,7 +368,7 @@
         /* === TABS NAVIGATION === */
         .tabs {
             display: inline-flex;
-            background: rgba(255, 255, 255, 0.04);
+            background: #f1f5f9;
             padding: 5px;
             border-radius: 14px;
             margin-bottom: 28px;
@@ -385,7 +378,7 @@
             overflow-x: auto;
             max-width: 100%;
             user-select: none;
-            box-shadow: inset 0 1px 2px rgba(0,0,0,0.2);
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.04);
             position: relative;
         }
 
@@ -420,7 +413,7 @@
 
         .tabs::-webkit-scrollbar { height: 3px; }
         .tabs::-webkit-scrollbar-track { background: transparent; }
-        .tabs::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+        .tabs::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 2px; }
 
         .tab {
             padding: 9px 16px;
@@ -444,7 +437,7 @@
             top: 50%; left: 50%;
             width: 0; height: 0;
             border-radius: 50%;
-            background: rgba(255,255,255,0.1);
+            background: rgba(99,102,241,0.08);
             transform: translate(-50%, -50%);
             transition: width 0.4s ease, height 0.4s ease;
             z-index: -1;
@@ -458,7 +451,7 @@
         }
 
         .tab:hover:not(.active) {
-            background: rgba(255, 255, 255, 0.06);
+            background: rgba(99,102,241,0.06);
             color: var(--text-secondary);
         }
 
@@ -577,9 +570,9 @@
         }
 
         .cred-card.disabled {
-            background: rgba(255, 255, 255, 0.02);
+            background: #f8fafc;
             border-left-color: var(--text-muted);
-            opacity: 0.55;
+            opacity: 0.6;
         }
 
         .cred-card.disabled:hover {
@@ -632,39 +625,39 @@
 
         .error-codes {
             background: var(--danger-bg);
-            color: #fca5a5;
+            color: #991b1b;
             padding: 3px 10px;
             border-radius: 20px;
             font-size: 11px;
-            border: 1px solid rgba(239, 68, 68, 0.2);
+            border: 1px solid #fecaca;
         }
 
         .cooldown-badge {
             background: var(--warning-bg);
-            color: #fcd34d;
+            color: #92400e;
             padding: 3px 10px;
             border-radius: 20px;
             font-size: 11px;
             font-weight: 600;
-            border: 1px solid rgba(245, 158, 11, 0.2);
+            border: 1px solid #fde68a;
         }
 
         .cooldown-badge.ready { background: var(--success); color: white; }
 
         .model-cooldown-details {
             background: var(--info-bg);
-            border: 1px solid rgba(59, 130, 246, 0.2);
+            border: 1px solid #bfdbfe;
             border-radius: var(--radius-xs);
             padding: 8px;
             margin-top: 8px;
             font-size: 11px;
-            color: #93c5fd;
+            color: #1e40af;
         }
 
         .model-cooldown-item {
             display: inline-block;
-            background: rgba(59, 130, 246, 0.25);
-            color: #93c5fd;
+            background: #dbeafe;
+            color: #1e40af;
             padding: 2px 8px;
             border-radius: 10px;
             margin: 2px;
@@ -699,7 +692,7 @@
         }
 
         .cred-btn.enable { background: var(--success); }
-        .cred-btn.disable { background: #4b5563; }
+        .cred-btn.disable { background: #6b7280; }
         .cred-btn.delete { background: var(--danger); }
         .cred-btn.download { background: var(--info); }
         .cred-btn.view { background: #0891b2; }
@@ -714,7 +707,7 @@
         .cred-details.show { display: block; animation: slideDown 0.25s ease-out; }
 
         .cred-content {
-            background: rgba(0, 0, 0, 0.3);
+            background: #f8fafc;
             border: 1px solid var(--border-color);
             border-radius: var(--radius-xs);
             padding: 12px;
@@ -865,7 +858,7 @@
         }
 
         .pagination-btn:disabled {
-            background: rgba(255,255,255,0.02);
+            background: #f1f5f9;
             color: var(--text-muted);
             cursor: not-allowed;
         }
@@ -978,12 +971,12 @@
         }
 
         .batch-btn.batch-enable { background: var(--success); }
-        .batch-btn.batch-disable { background: #4b5563; }
+        .batch-btn.batch-disable { background: #6b7280; }
         .batch-btn.batch-delete { background: var(--danger); }
         .batch-btn.batch-email { background: #0891b2; }
 
         .batch-btn:disabled {
-            background: rgba(255,255,255,0.06);
+            background: #e2e8f0;
             color: var(--text-muted);
             cursor: not-allowed;
             transform: none;
@@ -1014,17 +1007,17 @@
         .error-code-badge {
             display: inline-block;
             background: var(--danger-bg);
-            color: #fca5a5;
+            color: #991b1b;
             padding: 3px 8px;
             border-radius: 10px;
             font-size: 11px;
             margin: 1px;
             cursor: pointer;
             transition: all var(--transition);
-            border: 1px solid rgba(239, 68, 68, 0.2);
+            border: 1px solid #fecaca;
         }
 
-        .error-code-badge:hover { background: rgba(239, 68, 68, 0.25); }
+        .error-code-badge:hover { background: #fee2e2; }
         .error-code-badge.selected { background: var(--accent); color: white; border-color: var(--accent); }
 
         /* === CONFIG MANAGEMENT === */
@@ -1065,7 +1058,7 @@
         }
 
         .config-input:disabled {
-            background: rgba(255,255,255,0.02);
+            background: #f1f5f9;
             color: var(--text-muted);
             cursor: not-allowed;
         }
@@ -1109,13 +1102,13 @@
             right: 10px;
             top: 50%;
             transform: translateY(-50%);
-            background: rgba(245, 158, 11, 0.15);
-            color: #fcd34d;
+            background: var(--warning-bg);
+            color: #92400e;
             padding: 2px 8px;
             border-radius: 4px;
             font-size: 11px;
             pointer-events: none;
-            border: 1px solid rgba(245, 158, 11, 0.2);
+            border: 1px solid #fde68a;
         }
 
         /* === USAGE STATS === */
@@ -1159,7 +1152,7 @@
         .usage-progress-bar {
             width: 100%;
             height: 8px;
-            background: rgba(255,255,255,0.06);
+            background: #e2e8f0;
             border-radius: 4px;
             overflow: hidden;
             position: relative;
@@ -1192,7 +1185,7 @@
             color: white;
         }
 
-        .usage-btn.reset { background: #4b5563; }
+        .usage-btn.reset { background: #6b7280; }
         .usage-btn.limits { background: #0891b2; }
         .usage-btn:hover { filter: brightness(1.2); }
 
@@ -1205,7 +1198,7 @@
         }
 
         .usage-info-item {
-            background: rgba(0,0,0,0.2);
+            background: #f8fafc;
             padding: 8px 10px;
             border-radius: var(--radius-xs);
             border: 1px solid var(--border-color);
@@ -1235,7 +1228,7 @@
             z-index: 1000;
             left: 0; top: 0;
             width: 100%; height: 100%;
-            background: rgba(0, 0, 0, 0.6);
+            background: rgba(0, 0, 0, 0.4);
             backdrop-filter: blur(4px);
         }
 
@@ -1428,55 +1421,6 @@
             text-decoration: underline;
         }
 
-        /* === INLINE STYLE OVERRIDES for elements styled via inline attributes === */
-        /* Config info boxes with inline background */
-        div[style*="background-color: #fff3cd"],
-        div[style*="background:#fff3cd"],
-        div[style*="background-color: #d4edda"],
-        div[style*="background-color: #e3f2fd"],
-        div[style*="background-color: #f3e5f5"] {
-            background: var(--bg-card) !important;
-            border-color: var(--border-color) !important;
-            color: var(--text-secondary) !important;
-        }
-
-        /* API address boxes */
-        div[style*="background:#f0f7ff"],
-        div[style*="background-color: #f0f7ff"] {
-            background: var(--bg-card) !important;
-            border-color: var(--border-color) !important;
-            color: var(--text-secondary) !important;
-        }
-
-        /* Info boxes with specific styles */
-        div[style*="background: #fff3cd"],
-        div[style*="background: #e7f3ff"] {
-            background: var(--bg-card) !important;
-            border-color: var(--border-color) !important;
-            color: var(--text-secondary) !important;
-        }
-
-        /* Code elements */
-        code {
-            background: rgba(255,255,255,0.08) !important;
-            color: var(--accent-hover) !important;
-            padding: 2px 6px;
-            border-radius: 4px;
-        }
-
-        /* Tables in config */
-        table { color: var(--text-secondary); }
-        td { color: var(--text-secondary) !important; }
-
-        /* Lists */
-        ul, ol { color: var(--text-secondary); }
-        li { color: var(--text-secondary); }
-
-        /* Checkbox accent color */
-        input[type="checkbox"] {
-            accent-color: var(--accent);
-        }
-
         /* === RESPONSIVE === */
         @media (max-width: 768px) {
             body { padding: 12px; }
@@ -1510,81 +1454,26 @@
         }
 
         /* =============================================================
-           INLINE STYLE OVERRIDES — force dark theme on hardcoded colors
+           INLINE STYLE OVERRIDES — ensure visual consistency
            ============================================================= */
 
-        /* ALL buttons with inline background-color */
-        .cred-btn[style],
-        .batch-btn[style],
-        button[style] {
-            filter: brightness(0.85) saturate(0.9) !important;
-        }
-
-        .cred-btn[style]:hover,
-        .batch-btn[style]:hover,
-        button[style]:hover {
-            filter: brightness(1.1) saturate(1) !important;
-        }
-
-        /* Disabled state for ALL buttons — must be visible */
+        /* Disabled state for ALL buttons — clear visibility */
         .batch-btn:disabled,
         .cred-btn:disabled,
         button:disabled {
-            background: rgba(255,255,255,0.06) !important;
-            color: #64748b !important;
-            opacity: 0.5 !important;
+            background: #e2e8f0 !important;
+            color: #94a3b8 !important;
+            opacity: 0.7 !important;
             filter: none !important;
         }
 
-        /* Override ALL inline background colors on divs */
-        div[style*="background-color: #f8f9fa"],
-        div[style*="background-color: #f0f7ff"],
-        div[style*="background: #f8fcff"],
-        div[style*="background-color: #f8fcff"],
-        div[style*="background:#f0f7ff"],
-        div[style*="background: #f0f8ff"],
-        div[style*="background-color: #f0f8ff"],
-        div[style*="background:#f8f9fa"] {
-            background: var(--bg-card) !important;
-            border-color: var(--border-color) !important;
-            color: var(--text-secondary) !important;
+        /* Ensure white text on all colored buttons */
+        .cred-btn, .batch-btn, .refresh-btn, .download-all-btn,
+        button[style*="background-color"] {
+            color: white !important;
         }
 
-        /* Warning/info/success boxes with inline styles */
-        div[style*="background-color: #fff3cd"],
-        div[style*="background: #fff3cd"],
-        div[style*="background-color: #d4edda"],
-        div[style*="background: #d4edda"],
-        div[style*="background-color: #e3f2fd"],
-        div[style*="background: #e3f2fd"],
-        div[style*="background-color: #f3e5f5"],
-        div[style*="background: #f3e5f5"],
-        div[style*="background: #e7f3ff"],
-        div[style*="background-color: #e7f3ff"],
-        div[style*="background-color: #e8f4fd"],
-        div[style*="background: #e8f4fd"] {
-            background: var(--bg-card) !important;
-            border-color: var(--border-color) !important;
-            color: var(--text-secondary) !important;
-        }
-
-        /* Inline color overrides for text */
-        [style*="color: #856404"] { color: #fcd34d !important; }
-        [style*="color: #0c5460"] { color: #67e8f9 !important; }
-        [style*="color: #155724"] { color: #6ee7b7 !important; }
-        [style*="color: #721c24"] { color: #fca5a5 !important; }
-        [style*="color: #666"] { color: var(--text-muted) !important; }
-        [style*="color: #333"] { color: var(--text-primary) !important; }
-        [style*="color: #0066cc"] { color: var(--accent-hover) !important; }
-        [style*="color: #212529"] { color: var(--text-primary) !important; }
-        [style*="color: #1565c0"] { color: #93c5fd !important; }
-        [style*="color: #424242"] { color: var(--text-secondary) !important; }
-        [style*="color: #4a148c"] { color: #d8b4fe !important; }
-        [style*="color: #0d47a1"] { color: #93c5fd !important; }
-        [style*="color: #888"] { color: var(--text-muted) !important; }
-        [style*="color: #999"] { color: var(--text-muted) !important; }
-
-        /* Border color overrides */
+        /* Border overrides for inline-styled elements */
         [style*="border-color: #28a745"] { border-color: var(--success) !important; }
         [style*="border: 2px solid #e1e4e8"],
         [style*="border: 1px solid #b8d4f0"],
@@ -1599,79 +1488,6 @@
             border-color: var(--border-color) !important;
         }
 
-        /* h4 with inline color */
-        h4[style*="color: #007bff"] { color: var(--info) !important; }
-        h4[style*="color: #28a745"] { color: var(--success) !important; }
-
-        /* API code elements with inline style */
-        code[style*="background:#e8f0fe"],
-        code[style*="background-color:#e8f0fe"],
-        code[style*="background: #f1f3f4"],
-        code[style*="background-color: #f1f3f4"] {
-            background: rgba(255,255,255,0.08) !important;
-            color: var(--accent-hover) !important;
-        }
-
-        /* Logout button */
-        button[style*="background-color: #dc3545"],
-        button[style*="background: #dc3545"] {
-            background: rgba(239, 68, 68, 0.8) !important;
-        }
-
-        /* Specific button style overrides for better visibility */
-        button[style*="background-color: #17a2b8"] { background: rgba(8, 145, 178, 0.8) !important; }
-        button[style*="background-color: #ff9800"] { background: rgba(245, 158, 11, 0.8) !important; }
-        button[style*="background-color: #9c27b0"] { background: rgba(139, 92, 246, 0.8) !important; }
-        button[style*="background-color: #e91e63"] { background: rgba(236, 72, 153, 0.8) !important; }
-        button[style*="background-color: #6c757d"] { background: rgba(75, 85, 99, 0.8) !important; }
-        button[style*="background-color: #28a745"] { background: rgba(16, 185, 129, 0.7) !important; }
-        button[style*="background-color: #20c997"] { background: rgba(16, 185, 129, 0.7) !important; }
-        button[style*="background-color: #00bcd4"] { background: rgba(6, 182, 212, 0.8) !important; }
-
-        /* Ensure white text on all colored buttons */
-        .cred-btn, .batch-btn, .refresh-btn, .download-all-btn,
-        button[style*="background-color"] {
-            color: white !important;
-        }
-
-        /* Log container */
-        div[style*="background-color: #1e1e1e"] {
-            background-color: rgba(0, 0, 0, 0.4) !important;
-            border-color: var(--border-color) !important;
-        }
-
-        /* Cred content warning style override */
-        .cred-content[style*="background-color: #fff3cd"] {
-            background: rgba(245, 158, 11, 0.08) !important;
-            border-color: rgba(245, 158, 11, 0.15) !important;
-            color: var(--text-secondary) !important;
-        }
-
-        /* Small and span text overrides */
-        small { color: var(--text-muted); }
-        .config-note span[style*="color: #28a745"] { color: var(--success) !important; }
-
-        /* =============================================================
-           BROAD INLINE STYLE OVERRIDES — catch remaining light areas
-           ============================================================= */
-
-        /* Any div with inline background: #f8f9fa (upload areas, collapsible panels, etc.) */
-        div[style*="background: #f8f9fa"],
-        div[style*="background: #fafafa"],
-        div[style*="background: white"],
-        div[style*="background: #fff"],
-        div[style*="background: #ffffff"],
-        div[style*="background-color: #fafafa"],
-        div[style*="background-color: white"],
-        div[style*="background-color: #fff"],
-        div[style*="background-color: #ffffff"],
-        div[style*="background-color: #f5f5f5"],
-        div[style*="background: #f5f5f5"] {
-            background: var(--bg-card) !important;
-            color: var(--text-secondary) !important;
-        }
-
-        /* Upload drop zones and bordered containers with inline border */
         div[style*="border: 2px solid #ddd"],
         div[style*="border: 2px solid #e1e4e8"],
         div[style*="border: 1px solid #ddd"],
@@ -1680,47 +1496,59 @@
             border-color: var(--border-color) !important;
         }
 
-        /* Upload area dashed border — target specific inline ondrag styles */
+        /* Upload area dashed border */
         div[style*="border: 2px dashed"] {
-            border-color: rgba(255,255,255,0.12) !important;
-            background: var(--bg-card) !important;
-            color: var(--text-muted) !important;
+            border-color: #cbd5e1 !important;
         }
 
-        /* QR code / white card boxes */
-        div[style*="background: white; padding"],
-        span[style*="background: white"],
-        div[style*="box-shadow: 0 2px 15px"] {
-            background: var(--bg-card) !important;
-            box-shadow: var(--shadow-sm) !important;
+        /* h4 with inline color */
+        h4[style*="color: #007bff"] { color: var(--info) !important; }
+        h4[style*="color: #28a745"] { color: var(--success) !important; }
+
+        /* Code elements */
+        code {
+            background: #f1f5f9 !important;
+            color: var(--accent) !important;
+            padding: 2px 6px;
+            border-radius: 4px;
         }
 
-        /* Project info section (border-left: 4px solid #007bff) */
-        div[style*="border-left: 4px solid #007bff"] {
-            background: var(--bg-card) !important;
+        code[style*="background:#e8f0fe"],
+        code[style*="background-color:#e8f0fe"],
+        code[style*="background: #f1f3f4"],
+        code[style*="background-color: #f1f3f4"] {
+            background: #f1f5f9 !important;
+            color: var(--accent) !important;
+        }
+
+        /* Log container */
+        div[style*="background-color: #1e1e1e"] {
+            background-color: #1e293b !important;
             border-color: var(--border-color) !important;
-            border-left-color: var(--accent) !important;
+        }
+
+        /* Cred content warning style override */
+        .cred-content[style*="background-color: #fff3cd"] {
+            background: var(--warning-bg) !important;
+            border-color: #fde68a !important;
             color: var(--text-secondary) !important;
         }
 
-        /* Collapsible section headers */
-        div[style*="cursor: pointer"][style*="border: 2px solid #ddd"] {
-            background: var(--bg-card) !important;
-            border-color: var(--border-color) !important;
-            color: var(--text-primary) !important;
-        }
+        /* Small and span text overrides */
+        small { color: var(--text-muted); }
+        .config-note span[style*="color: #28a745"] { color: var(--success) !important; }
 
-        /* Textarea elements (if any) */
-        textarea {
-            background: var(--bg-input) !important;
-            color: var(--text-primary) !important;
-            border-color: var(--border-color) !important;
-        }
+        /* Tables in config */
+        table { color: var(--text-secondary); }
+        td { color: var(--text-secondary) !important; }
 
-        textarea:focus {
-            border-color: var(--accent) !important;
-            box-shadow: 0 0 0 3px var(--accent-glow) !important;
-            outline: none;
+        /* Lists */
+        ul, ol { color: var(--text-secondary); }
+        li { color: var(--text-secondary); }
+
+        /* Checkbox accent color */
+        input[type="checkbox"] {
+            accent-color: var(--accent);
         }
 
         /* Select elements */
@@ -1741,23 +1569,22 @@
             color: var(--text-primary);
         }
 
-        /* Input file styled areas */
-        input[type="file"] {
-            color: var(--text-secondary);
+        /* Textarea elements */
+        textarea {
+            background: var(--bg-input) !important;
+            color: var(--text-primary) !important;
+            border-color: var(--border-color) !important;
         }
 
-        /* All remaining inline-styled spans with light colors */
-        span[style*="color: #666"],
-        span[style*="color: #333"],
-        span[style*="color: #888"],
-        span[style*="color: #555"],
-        span[style*="color: #444"],
-        p[style*="color: #666"],
-        p[style*="color: #333"],
-        p[style*="color: #888"],
-        p[style*="color: #555"],
-        p[style*="color: #444"] {
-            color: var(--text-secondary) !important;
+        textarea:focus {
+            border-color: var(--accent) !important;
+            box-shadow: 0 0 0 3px var(--accent-glow) !important;
+            outline: none;
+        }
+
+        /* Input file */
+        input[type="file"] {
+            color: var(--text-secondary);
         }
 
         /* HR tags */
