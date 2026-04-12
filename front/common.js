@@ -255,7 +255,7 @@ function createCredsManager(type) {
             const selectedCount = this.selectedFiles.size;
             document.getElementById(this.getElementId('SelectedCount')).textContent = `已选择 ${selectedCount} 项`;
 
-            const batchBtns = ['Enable', 'Disable', 'Delete', 'Verify', 'Preview', 'EnableCredit', 'DisableCredit'].map(action =>
+            const batchBtns = ['Enable', 'Disable', 'Delete', 'Verify', 'Preview', 'EnableCredit', 'DisableCredit', 'ClearCooldown'].map(action =>
                 document.getElementById(this.getElementId(`Batch${action}Btn`))
             );
             batchBtns.forEach(btn => btn && (btn.disabled = selectedCount === 0));
@@ -313,7 +313,7 @@ function createCredsManager(type) {
                 return;
             }
 
-            const actionNames = { enable: '启用', disable: '禁用', delete: '删除', enable_credit: '开启积分', disable_credit: '关闭积分' };
+            const actionNames = { enable: '启用', disable: '禁用', delete: '删除', enable_credit: '开启积分', disable_credit: '关闭积分', clear_cooldown: '清除冷却' };
             const actionLabel = actionNames[action] || action;
             const confirmMsg = action === 'delete'
                 ? `确定要删除选中的 ${selectedFiles.length} 个文件吗？\n注意：此操作不可恢复！`
@@ -718,6 +718,7 @@ function createCredCard(credInfo, manager) {
         <button class="cred-btn" onclick="verify${managerType === 'antigravity' ? 'Antigravity' : ''}ProjectId('${filename}')" title="重新获取Project ID，可恢复403错误">检验</button>
         <button class="cred-btn" onclick="test${managerType === 'antigravity' ? 'Antigravity' : ''}Credential('${filename}')" title="测试凭证是否可用">消息测试</button>
         <button class="cred-btn" onclick="toggle${managerType === 'antigravity' ? 'Antigravity' : ''}ErrorDetails('${pathId}')" title="查看该凭证的详细报错信息">查看报错</button>
+        <button class="cred-btn" data-filename="${filename}" data-action="clear_cooldown" title="清除该凭证的所有模型冷却时间">清除冷却</button>
         <button class="cred-btn delete" data-filename="${filename}" data-action="delete">删除</button>
     `;
 

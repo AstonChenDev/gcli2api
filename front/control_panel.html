@@ -707,6 +707,7 @@
         .cred-btn[onclick*="test"] { background: #0891b2; }
         .cred-btn[onclick*="ErrorDetails"] { background: #e11d48; }
         .cred-btn[onclick*="QuotaDetails"] { background: #0284c7; }
+        .cred-btn[data-action="clear_cooldown"] { background: #ea580c; }
 
         /* === CREDENTIAL DETAILS === */
         .cred-details {
@@ -2025,6 +2026,8 @@
                             onclick="batchVerifyProjectIds()" disabled>批量检验</button>
                         <button class="batch-btn" style="background-color: #9c27b0;" id="batchPreviewBtn"
                             onclick="batchConfigurePreview()" disabled>批量设置预览</button>
+                        <button class="batch-btn" style="background-color: #ea580c;" id="batchClearCooldownBtn"
+                            onclick="batchAction('clear_cooldown')" disabled>批量清除冷却</button>
                         <button class="batch-btn batch-email" onclick="refreshAllEmails()">刷新所有邮箱</button>
                         <button class="batch-btn" style="background-color: #e91e63;"
                             onclick="deduplicateByEmail()">凭证一键去重</button>
@@ -2181,6 +2184,8 @@
                             onclick="batchAntigravityAction('enable_credit')" disabled>批量开启Credit</button>
                         <button class="batch-btn" style="background-color: #6c757d;" id="antigravityBatchDisableCreditBtn"
                             onclick="batchAntigravityAction('disable_credit')" disabled>批量关闭Credit</button>
+                        <button class="batch-btn" style="background-color: #ea580c;" id="antigravityBatchClearCooldownBtn"
+                            onclick="batchAntigravityAction('clear_cooldown')" disabled>批量清除冷却</button>
                         <button class="batch-btn batch-email" onclick="refreshAllAntigravityEmails()">刷新所有邮箱</button>
                         <button class="batch-btn" style="background-color: #e91e63;"
                             onclick="deduplicateAntigravityByEmail()">凭证一键去重</button>
