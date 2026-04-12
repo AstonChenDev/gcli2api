@@ -508,3 +508,110 @@ def parse_quota_reset_timestamp(error_response: dict, mode: str = "geminicli") -
 
     except Exception:
         return None
+
+
+# ==================== 异步冷却时间精化（Antigravity 专用）====================
+
+async def refine_cooldown_from_quota(
+    credential_manager: CredentialManager,
+    credential_name: str,
+    access_token: str,
+    model_name: str,
+):
+    """
+    异步查询额度接口获取精确的冷却重置时间，覆盖默认的4小时冷却。
+    此函数以 fire-and-forget 方式被 asyncio.create_task 调用，不阻塞主请求流程。
+
+    Args:
+        credential_manager: 凭证管理器实例
+        credential_name: 凭证文件名
+        access_token: Antigravity 访问令牌
+        model_name: 触发冷却的模型名称
+    """
+    try:
+        from src.api.antigravity import fetch_quota_info
+
+        log.info(f"[COOLDOWN_REFINE] 开始查询额度接口获取精确冷却时间, 凭证: {credential_name}, 模型: {model_name}")
+
+        quota_result = await fetch_quota_info(access_token)
+
+        if not quota_result.get("success"):
+            log.warning(f"[COOLDOWN_REFINE] 额度查询失败: {quota_result.get('error')}, 保持默认4小时冷却")
+            return
+
+        models_quota = quota_result.get("models", {})
+        if not models_quota:
+            log.warning(f"[COOLDOWN_REFINE] 额度查询返回空模型列表, 保持默认4小时冷却")
+            return
+
+        # 尝试匹配模型名（支持模糊匹配）
+        matched_quota = None
+        model_name_lower = model_name.lower()
+
+        # 1. 精确匹配
+        for quota_model, quota_data in models_quota.items():
+            if quota_model.lower() == model_name_lower:
+                matched_quota = quota_data
+                log.debug(f"[COOLDOWN_REFINE] 精确匹配到模型: {quota_model}")
+                break
+
+        # 2. 部分匹配（模型名包含在额度模型名中，或反之）
+        if not matched_quota:
+            for quota_model, quota_data in models_quota.items():
+                if model_name_lower in quota_model.lower() or quota_model.lower() in model_name_lower:
+                    matched_quota = quota_data
+                    log.debug(f"[COOLDOWN_REFINE] 模糊匹配到模型: {quota_model}")
+                    break
+
+        if not matched_quota:
+            log.warning(f"[COOLDOWN_REFINE] 未匹配到模型 {model_name} 的额度信息, 保持默认4小时冷却")
+            return
+
+        reset_time_raw = matched_quota.get("resetTimeRaw", "")
+        remaining = matched_quota.get("remaining", 0)
+
+        if not reset_time_raw:
+            log.warning(f"[COOLDOWN_REFINE] 模型 {model_name} 无重置时间信息, 保持默认4小时冷却")
+            return
+
+        # 解析 UTC 时间戳
+        try:
+            if reset_time_raw.endswith("Z"):
+                reset_time_raw = reset_time_raw.replace("Z", "+00:00")
+            reset_dt = datetime.fromisoformat(reset_time_raw)
+            if reset_dt.tzinfo is None:
+                reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+            precise_cooldown = reset_dt.astimezone(timezone.utc).timestamp()
+        except Exception as e:
+            log.warning(f"[COOLDOWN_REFINE] 解析重置时间失败: {reset_time_raw}, 错误: {e}")
+            return
+
+        import time
+        now = time.time()
+
+        # 如果精确时间已经过了（额度已恢复），直接清除冷却
+        if precise_cooldown <= now:
+            log.info(f"[COOLDOWN_REFINE] 模型 {model_name} 的额度已恢复 (remaining={remaining}), 清除冷却")
+            if hasattr(credential_manager, '_storage_adapter') and hasattr(credential_manager._storage_adapter, '_backend'):
+                await credential_manager._storage_adapter._backend.set_model_cooldown(
+                    credential_name, model_name, None, mode="antigravity"
+                )
+            return
+
+        # 用精确时间覆盖默认4小时
+        remaining_minutes = (precise_cooldown - now) / 60
+        log.info(
+            f"[COOLDOWN_REFINE] 精化冷却时间成功! 凭证: {credential_name}, 模型: {model_name}, "
+            f"剩余额度: {remaining:.1%}, "
+            f"精确冷却: {remaining_minutes:.0f}分钟 "
+            f"(原默认: {RESOURCE_EXHAUSTED_COOLDOWN_HOURS * 60}分钟)"
+        )
+
+        if hasattr(credential_manager, '_storage_adapter') and hasattr(credential_manager._storage_adapter, '_backend'):
+            await credential_manager._storage_adapter._backend.set_model_cooldown(
+                credential_name, model_name, precise_cooldown, mode="antigravity"
+            )
+
+    except Exception as e:
+        log.error(f"[COOLDOWN_REFINE] 异步精化冷却时间异常: {e}, 保持默认冷却")
+

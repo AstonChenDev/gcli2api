@@ -32,6 +32,7 @@ from src.api.utils import (
     record_api_call_error,
     parse_and_log_cooldown,
     collect_streaming_response,
+    refine_cooldown_from_quota,
 )
 
 # ==================== 全局凭证管理器 ====================
@@ -345,6 +346,14 @@ async def stream_request(
                             error_message=error_body
                         )
 
+                        # 异步精化冷却时间：如果是默认4小时冷却，查询额度接口获取精确时间
+                        if cooldown_until is not None and access_token and model_name:
+                            asyncio.create_task(
+                                refine_cooldown_from_quota(
+                                    credential_manager, current_file, access_token, model_name
+                                )
+                            )
+
                         # 检查是否应该重试
                         should_retry = await handle_error_with_retry(
                             credential_manager, status_code, current_file,
@@ -656,6 +665,14 @@ async def non_stream_request(
                         cooldown_until, mode="antigravity", model_name=model_name,
                         error_message=error_text
                     )
+
+                    # 异步精化冷却时间：如果是默认4小时冷却，查询额度接口获取精确时间
+                    if cooldown_until is not None and access_token and model_name:
+                        asyncio.create_task(
+                            refine_cooldown_from_quota(
+                                credential_manager, current_file, access_token, model_name
+                            )
+                        )
 
                     # 检查是否应该重试
                     should_retry = await handle_error_with_retry(
