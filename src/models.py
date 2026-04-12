@@ -7,15 +7,15 @@ from pydantic import BaseModel, Field
 def model_to_dict(model: BaseModel) -> Dict[str, Any]:
     """
     兼容 Pydantic v1 和 v2 的模型转字典方法，排除 None 值
-    - v1: model.dict(exclude_none=True)
-    - v2: model.model_dump(exclude_none=True)
+    - v1: model.dict(exclude_none=True, by_alias=True)
+    - v2: model.model_dump(exclude_none=True, by_alias=True)
     """
     if hasattr(model, 'model_dump'):
         # Pydantic v2
-        return model.model_dump(exclude_none=True)
+        return model.model_dump(exclude_none=True, by_alias=True)
     else:
         # Pydantic v1
-        return model.dict(exclude_none=True)
+        return model.dict(exclude_none=True, by_alias=True)
 
 
 # Common Models
@@ -143,8 +143,12 @@ class GeminiSystemInstruction(BaseModel):
 
 class GeminiImageConfig(BaseModel):
     """图片生成配置"""
-    aspect_ratio: Optional[str] = None  # "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
-    image_size: Optional[str] = None  # "1K", "2K", "4K"
+    aspect_ratio: Optional[str] = Field(None, alias="aspectRatio")  # "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
+    image_size: Optional[str] = Field(None, alias="imageSize")  # "1K", "2K", "4K"
+
+    class Config:
+        extra = "allow"
+        populate_by_name = True  # 同时接受 snake_case 和 camelCase
 
 
 class GeminiGenerationConfig(BaseModel):
@@ -160,9 +164,13 @@ class GeminiGenerationConfig(BaseModel):
     frequencyPenalty: Optional[float] = Field(None, ge=-2.0, le=2.0)
     presencePenalty: Optional[float] = Field(None, ge=-2.0, le=2.0)
     thinkingConfig: Optional[Dict[str, Any]] = None
-    # 图片生成相关参数
-    response_modalities: Optional[List[str]] = None  # ["TEXT", "IMAGE"]
-    image_config: Optional[GeminiImageConfig] = None
+    # 图片生成相关参数 - 支持 camelCase 和 snake_case
+    responseModalities: Optional[List[str]] = Field(None, alias="responseModalities")  # ["TEXT", "IMAGE"]
+    imageConfig: Optional[Dict[str, Any]] = Field(None, alias="imageConfig")
+
+    class Config:
+        extra = "allow"  # 允许透传未定义的字段
+        populate_by_name = True  # 同时接受字段名和别名
 
 
 class GeminiSafetySetting(BaseModel):
