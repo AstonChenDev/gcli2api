@@ -441,7 +441,7 @@ async def collect_streaming_response(stream_generator) -> Response:
     )
 
 
-RESOURCE_EXHAUSTED_COOLDOWN_HOURS = 4  # RESOURCE_EXHAUSTED 错误的默认冷却时间（小时）
+RESOURCE_EXHAUSTED_COOLDOWN_MINUTES = 10  # RESOURCE_EXHAUSTED 错误的默认冷却时间（分钟）
 
 
 def parse_quota_reset_timestamp(error_response: dict, mode: str = "geminicli") -> Optional[float]:
@@ -501,7 +501,7 @@ def parse_quota_reset_timestamp(error_response: dict, mode: str = "geminicli") -
             and error_obj.get("message") == "Resource has been exhausted (e.g. check quota)."
         ):
             import time
-            cooldown_until = time.time() + RESOURCE_EXHAUSTED_COOLDOWN_HOURS * 3600
+            cooldown_until = time.time() + RESOURCE_EXHAUSTED_COOLDOWN_MINUTES * 60
             return cooldown_until
 
         return None
@@ -604,7 +604,7 @@ async def refine_cooldown_from_quota(
             f"[COOLDOWN_REFINE] 精化冷却时间成功! 凭证: {credential_name}, 模型: {model_name}, "
             f"剩余额度: {remaining:.1%}, "
             f"精确冷却: {remaining_minutes:.0f}分钟 "
-            f"(原默认: {RESOURCE_EXHAUSTED_COOLDOWN_HOURS * 60}分钟)"
+            f"(原默认: {RESOURCE_EXHAUSTED_COOLDOWN_MINUTES}分钟)"
         )
 
         if hasattr(credential_manager, '_storage_adapter') and hasattr(credential_manager._storage_adapter, '_backend'):
