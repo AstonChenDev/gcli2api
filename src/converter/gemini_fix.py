@@ -237,10 +237,11 @@ async def normalize_gemini_request(
     # ========== 公共处理 ==========
 
     # 1. 安全设置覆盖
-    if "gemini-2.5-flash-lite" in model.lower():
-        result["safetySettings"] = LITE_SAFETY_SETTINGS
-    else:
+    # Extended IMAGE_* categories are accepted only by image preview models.
+    if "image" in model.lower() and "preview" in model.lower():
         result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
+    else:
+        result["safetySettings"] = LITE_SAFETY_SETTINGS
 
     # 2. 参数范围限制
     if generation_config:

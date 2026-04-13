@@ -754,10 +754,11 @@ async def normalize_antigravity_request(
         # 对于 Gemini 模型：统一转换为 functionDeclarations 并确保只使用 parameters 字段（移除 parametersJsonSchema 以防报错）
         result["tools"] = _ensure_empty_tool_schema_for_claude(result.get("tools"), model, "antigravity")
 
-    if "gemini-2.5-flash-lite" in model.lower():
-        result["safetySettings"] = LITE_SAFETY_SETTINGS
-    else:
+    # Extended IMAGE_* categories are accepted only by image preview models.
+    if "image" in model.lower() and "preview" in model.lower():
         result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
+    else:
+        result["safetySettings"] = LITE_SAFETY_SETTINGS
 
     # 2. 参数范围限制
     if generation_config:
