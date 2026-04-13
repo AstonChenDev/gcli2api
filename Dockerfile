@@ -6,7 +6,9 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    MALLOC_TRIM_THRESHOLD_=100000 \
+    MALLOC_ARENA_MAX=2
 
 # Install tzdata, jemalloc and set timezone
 # jemalloc 替代 glibc malloc，大幅减少内存碎片化
