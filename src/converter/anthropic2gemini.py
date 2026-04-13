@@ -1243,9 +1243,8 @@ async def gemini_stream_to_anthropic_stream(
             # 其他情况（SAFETY、RECITATION 等）默认为 end_turn
             stop_reason = "end_turn"
 
-        if _anthropic_debug_enabled():
             log.info(
-                f"[ANTHROPIC][stream_end] 流式结束: stop_reason={stop_reason}, "
+                f"[ANTHROPIC][stream_end] 流式结束: model={model}, stop_reason={stop_reason}, "
                 f"has_tool_use={has_tool_use}, finish_reason={finish_reason}, "
                 f"input_tokens={input_tokens}, output_tokens={output_tokens}"
             )
