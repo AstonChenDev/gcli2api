@@ -30,7 +30,6 @@ LITE_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
-    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF"},
 ]
 
 
@@ -236,12 +235,12 @@ async def normalize_gemini_request(
 
     # ========== 公共处理 ==========
 
-    # 1. 安全设置覆盖
-    # Extended IMAGE_* categories are accepted only by image preview models.
-    if "image" in model.lower() and "preview" in model.lower():
-        result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
-    else:
-        result["safetySettings"] = LITE_SAFETY_SETTINGS
+    # 1. Preserve explicit client safety settings; otherwise select a compatible default.
+    if not result.get("safetySettings"):
+        if "image" in model.lower() and "preview" in model.lower():
+            result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
+        else:
+            result["safetySettings"] = LITE_SAFETY_SETTINGS
 
     # 2. 参数范围限制
     if generation_config:

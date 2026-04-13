@@ -26,11 +26,10 @@ DEFAULT_SAFETY_SETTINGS = [
 ]
 
 LITE_SAFETY_SETTINGS = [
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
 ]
 
 
@@ -754,11 +753,11 @@ async def normalize_antigravity_request(
         # 对于 Gemini 模型：统一转换为 functionDeclarations 并确保只使用 parameters 字段（移除 parametersJsonSchema 以防报错）
         result["tools"] = _ensure_empty_tool_schema_for_claude(result.get("tools"), model, "antigravity")
 
-    # Extended IMAGE_* categories are accepted only by image preview models.
-    if "image" in model.lower() and "preview" in model.lower():
-        result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
-    else:
-        result["safetySettings"] = LITE_SAFETY_SETTINGS
+    if not result.get("safetySettings"):
+        if "image" in model.lower() and "preview" in model.lower():
+            result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
+        else:
+            result["safetySettings"] = LITE_SAFETY_SETTINGS
 
     # 2. 参数范围限制
     if generation_config:
