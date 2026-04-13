@@ -10,6 +10,6 @@ services:
       - PASSWORD=${PASSWORD:-pwd}
       - PORT=${PORT:-7861}
       - HOST=${HOST:-0.0.0.0}
-      - POSTGRESQL_URI=postgresql://gcli2api:Gcli2Api_Pg%402026%21xY@43.161.255.95:15432/gcli2api
+      # - POSTGRESQL_URI=postgresql://gcli2api:Gcli2Api_Pg%402026%21xY@43.161.255.95:15432/gcli2api
     volumes:
       - ./data/creds:/app/creds
