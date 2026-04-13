@@ -346,13 +346,13 @@ async def stream_request(
                             error_message=error_body
                         )
 
-                        # 异步精化冷却时间：如果是默认4小时冷却，查询额度接口获取精确时间
-                        if cooldown_until is not None and access_token and model_name:
-                            asyncio.create_task(
-                                refine_cooldown_from_quota(
-                                    credential_manager, current_file, access_token, model_name
-                                )
-                            )
+                        # 异步精化冷却时间（已禁用，直接使用默认冷却时间）
+                        # if cooldown_until is not None and access_token and model_name:
+                        #     asyncio.create_task(
+                        #         refine_cooldown_from_quota(
+                        #             credential_manager, current_file, access_token, model_name
+                        #         )
+                        #     )
 
                         # 检查是否应该重试
                         should_retry = await handle_error_with_retry(
@@ -666,13 +666,13 @@ async def non_stream_request(
                         error_message=error_text
                     )
 
-                    # 异步精化冷却时间：如果是默认4小时冷却，查询额度接口获取精确时间
-                    if cooldown_until is not None and access_token and model_name:
-                        asyncio.create_task(
-                            refine_cooldown_from_quota(
-                                credential_manager, current_file, access_token, model_name
-                            )
-                        )
+                    # 异步精化冷却时间（已禁用，直接使用默认冷却时间）
+                    # if cooldown_until is not None and access_token and model_name:
+                    #     asyncio.create_task(
+                    #         refine_cooldown_from_quota(
+                    #             credential_manager, current_file, access_token, model_name
+                    #         )
+                    #     )
 
                     # 检查是否应该重试
                     should_retry = await handle_error_with_retry(
