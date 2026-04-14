@@ -53,7 +53,7 @@ class PSQLManager:
                 if not self._dsn:
                     raise RuntimeError("POSTGRESQL_URI environment variable is not set")
 
-                self._pool = await asyncpg.create_pool(self._dsn, min_size=2, max_size=10)
+                self._pool = await asyncpg.create_pool(self._dsn, min_size=5, max_size=20)
 
                 async with self._pool.acquire() as conn:
                     await self._create_tables(conn)
