@@ -4,6 +4,10 @@ services:
     image: gcli2api:local
     container_name: my-gcli2api
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     ports:
       - "7861:7861"
     environment:
