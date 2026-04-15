@@ -1039,8 +1039,10 @@ function triggerTabDataLoad(tabName) {
 let _statsTimeRange = '1h';
 let _statsModelsData = [];
 let _statsCredsData = [];
+let _statsReqModelsData = [];
 let _statsModelSort = { key: 'total', dir: 'desc' };
 let _statsCredSort = { key: 'total', dir: 'desc' };
+let _statsReqModelSort = { key: 'total', dir: 'desc' };
 
 function formatNumber(n) {
     if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
@@ -1107,7 +1109,8 @@ function _getStatsTimeParams() {
 }
 
 function _sortArrow(tableType, key) {
-    const s = tableType === 'model' ? _statsModelSort : _statsCredSort;
+    const sortMap = { model: _statsModelSort, cred: _statsCredSort, reqmodel: _statsReqModelSort };
+    const s = sortMap[tableType] || _statsModelSort;
     const isActive = s.key === key;
     const arrow = isActive ? (s.dir === 'asc' ? '▲' : '▼') : '▲';
     return `<span class="sort-arrow ${isActive ? 'active' : ''}">${arrow}</span>`;
@@ -1119,14 +1122,17 @@ function _sortableTh(tableType, key, label, align) {
 }
 
 function sortStatsTable(tableType, key) {
-    const sortState = tableType === 'model' ? _statsModelSort : _statsCredSort;
+    const sortMap = { model: _statsModelSort, cred: _statsCredSort, reqmodel: _statsReqModelSort };
+    const sortState = sortMap[tableType];
+    if (!sortState) return;
     if (sortState.key === key) {
         sortState.dir = sortState.dir === 'desc' ? 'asc' : 'desc';
     } else {
         sortState.key = key;
         sortState.dir = 'desc';
     }
-    tableType === 'model' ? _renderModelTable() : _renderCredTable();
+    const renderMap = { model: _renderModelTable, cred: _renderCredTable, reqmodel: _renderReqModelTable };
+    if (renderMap[tableType]) renderMap[tableType]();
 }
 
 function _sortData(data, key, dir) {
@@ -1161,6 +1167,30 @@ function _renderModelTable() {
         return;
     }
     const sorted = _sortData(_statsModelsData, _statsModelSort.key, _statsModelSort.dir);
+    body.innerHTML = sorted.map(m => `<tr style="border-bottom:1px solid var(--border-color);">
+        <td style="padding:10px 12px;font-weight:500;">${m.model_name}</td>
+        <td style="text-align:right;padding:10px 12px;">${formatNumber(m.total)}</td>
+        <td style="text-align:right;padding:10px 12px;color:#28a745;">${formatNumber(m.success)}</td>
+        <td style="text-align:right;padding:10px 12px;color:${m.fail > 0 ? '#dc3545' : 'var(--text-muted)'};">${formatNumber(m.fail)}</td>
+        <td style="text-align:right;padding:10px 12px;">${calcRateHtml(m.success, m.total)}</td>
+    </tr>`).join('');
+}
+
+function _renderReqModelTable() {
+    const body = document.getElementById('statsReqModelBody');
+    const thead = document.querySelector('#statsReqModelTable thead tr');
+    if (!thead || !body) return;
+    thead.innerHTML =
+        _sortableTh('reqmodel','name','模型','left') +
+        _sortableTh('reqmodel','total','总请求','right') +
+        _sortableTh('reqmodel','success','成功','right') +
+        _sortableTh('reqmodel','fail','失败','right') +
+        _sortableTh('reqmodel','rate','成功率','right');
+    if (!_statsReqModelsData.length) {
+        body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--text-muted);">暂无请求数据</td></tr>';
+        return;
+    }
+    const sorted = _sortData(_statsReqModelsData, _statsReqModelSort.key, _statsReqModelSort.dir);
     body.innerHTML = sorted.map(m => `<tr style="border-bottom:1px solid var(--border-color);">
         <td style="padding:10px 12px;font-weight:500;">${m.model_name}</td>
         <td style="text-align:right;padding:10px 12px;">${formatNumber(m.total)}</td>
@@ -1211,6 +1241,25 @@ async function loadStats() {
         const pct = _rateValue(g.success, g.total);
         rateEl.textContent = calcRate(g.success, g.total);
         rateEl.style.color = _rateColor(pct);
+
+        // 请求级统计总览
+        const rq = (data.request && data.request.global) || { total: 0, success: 0, fail: 0 };
+        const reqTotalEl = document.getElementById('statsReqTotal');
+        const reqSuccessEl = document.getElementById('statsReqSuccess');
+        const reqFailEl = document.getElementById('statsReqFail');
+        const reqRateEl = document.getElementById('statsReqRate');
+        if (reqTotalEl) {
+            reqTotalEl.textContent = formatNumber(rq.total);
+            reqSuccessEl.textContent = formatNumber(rq.success);
+            reqFailEl.textContent = formatNumber(rq.fail);
+            const reqPct = _rateValue(rq.success, rq.total);
+            reqRateEl.textContent = calcRate(rq.success, rq.total);
+            reqRateEl.style.color = _rateColor(reqPct);
+        }
+        // 请求级模型明细
+        _statsReqModelsData = (data.request && data.request.models) || [];
+        _renderReqModelTable();
+
         _statsModelsData = data.models || [];
         _statsCredsData = data.credentials || [];
         _renderModelTable();

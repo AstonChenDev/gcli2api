@@ -24,9 +24,12 @@ class StatsCollector:
     FLUSH_INTERVAL = 5  # 秒
 
     def __init__(self):
-        # key: (filename, model_name, mode)
+        # 凭证级统计 key: (filename, model_name, mode)
         # value: {"total": int, "success": int, "fail": int}
         self._counters: Dict[Tuple[str, str, str], Dict[str, int]] = {}
+        # 请求级统计 key: (model_name, mode)
+        # value: {"total": int, "success": int, "fail": int}
+        self._request_counters: Dict[Tuple[str, str], Dict[str, int]] = {}
         self._flush_task: Optional[asyncio.Task] = None
         self._running = False
 
@@ -65,6 +68,34 @@ class StatsCollector:
         else:
             entry["fail"] += 1
 
+    def record_request(
+        self,
+        model_name: Optional[str],
+        mode: str,
+        success: bool,
+    ) -> None:
+        """
+        记录一次请求级结果（最终结果，不含重试过程）
+
+        Args:
+            model_name: 模型名
+            mode: geminicli 或 antigravity
+            success: 请求最终是否成功
+        """
+        model_name = model_name or "unknown"
+        key = (model_name, mode)
+
+        entry = self._request_counters.get(key)
+        if entry is None:
+            entry = {"total": 0, "success": 0, "fail": 0}
+            self._request_counters[key] = entry
+
+        entry["total"] += 1
+        if success:
+            entry["success"] += 1
+        else:
+            entry["fail"] += 1
+
     async def flush(self) -> None:
         """
         原子交换计数器 + 批量写入 DB
@@ -72,39 +103,58 @@ class StatsCollector:
         使用 `data, self._counters = self._counters, {}` 原子交换，
         保证 flush 期间新请求写入新的空 dict，不丢数据。
         """
-        # 原子交换
+        # 原子交换 - 凭证级
         data, self._counters = self._counters, {}
+        # 原子交换 - 请求级
+        req_data, self._request_counters = self._request_counters, {}
 
-        if not data:
-            return
-
-        # 计算当前分钟的 bucket（精确到分钟的 epoch）
-        bucket = int(_time.time()) // 60 * 60
-
-        # 转为 batch 记录: [(filename, model_name, mode, total, success, fail, time_bucket), ...]
-        records = [
-            (key[0], key[1], key[2], vals["total"], vals["success"], vals["fail"], bucket)
-            for key, vals in data.items()
-        ]
-
-        try:
-            from src.storage_adapter import get_storage_adapter
-            adapter = await get_storage_adapter()
-            if hasattr(adapter, '_backend') and hasattr(adapter._backend, 'batch_upsert_stats'):
-                await adapter._backend.batch_upsert_stats(records)
-            else:
-                log.warning("[STATS] Storage backend does not support batch_upsert_stats")
-        except Exception as e:
-            log.error(f"[STATS] Flush failed: {e}")
-            # 失败时把数据合并回去，避免丢失
-            for key, vals in data.items():
-                entry = self._counters.get(key)
-                if entry is None:
-                    self._counters[key] = vals
+        # 凭证级统计刷盘
+        if data:
+            bucket = int(_time.time()) // 60 * 60
+            records = [
+                (key[0], key[1], key[2], vals["total"], vals["success"], vals["fail"], bucket)
+                for key, vals in data.items()
+            ]
+            try:
+                from src.storage_adapter import get_storage_adapter
+                adapter = await get_storage_adapter()
+                if hasattr(adapter, '_backend') and hasattr(adapter._backend, 'batch_upsert_stats'):
+                    await adapter._backend.batch_upsert_stats(records)
                 else:
-                    entry["total"] += vals["total"]
-                    entry["success"] += vals["success"]
-                    entry["fail"] += vals["fail"]
+                    log.warning("[STATS] Storage backend does not support batch_upsert_stats")
+            except Exception as e:
+                log.error(f"[STATS] Flush failed: {e}")
+                for key, vals in data.items():
+                    entry = self._counters.get(key)
+                    if entry is None:
+                        self._counters[key] = vals
+                    else:
+                        entry["total"] += vals["total"]
+                        entry["success"] += vals["success"]
+                        entry["fail"] += vals["fail"]
+
+        # 请求级统计刷盘（独立于凭证级，不互相影响）
+        if req_data:
+            bucket = int(_time.time()) // 60 * 60
+            req_records = [
+                (key[0], key[1], vals["total"], vals["success"], vals["fail"], bucket)
+                for key, vals in req_data.items()
+            ]
+            try:
+                from src.storage_adapter import get_storage_adapter
+                adapter = await get_storage_adapter()
+                if hasattr(adapter, '_backend') and hasattr(adapter._backend, 'batch_upsert_request_stats'):
+                    await adapter._backend.batch_upsert_request_stats(req_records)
+            except Exception as e:
+                log.error(f"[STATS] Request stats flush failed: {e}")
+                for key, vals in req_data.items():
+                    entry = self._request_counters.get(key)
+                    if entry is None:
+                        self._request_counters[key] = vals
+                    else:
+                        entry["total"] += vals["total"]
+                        entry["success"] += vals["success"]
+                        entry["fail"] += vals["fail"]
 
     async def _flush_loop(self) -> None:
         """定时刷盘循环"""

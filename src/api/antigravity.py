@@ -20,6 +20,7 @@ from config import (
 from log import log
 
 from src.credential_manager import credential_manager
+from src.stats_collector import stats_collector
 from src.httpx_client import stream_post_async, post_async
 from src.models import Model, model_to_dict
 from src.utils import ANTIGRAVITY_USER_AGENT
@@ -402,6 +403,7 @@ async def stream_request(
             if success_recorded:
                 cred_label = credential_data.get('client_email') or current_file
                 log.info(f"[ANTIGRAVITY STREAM] 流式响应完成，模型: {model_name}, 凭证: {cred_label}")
+                stats_collector.record_request(model_name, "antigravity", True)
                 return
             elif not need_retry:
                 # 没有收到任何数据（空回复），需要重试
@@ -441,6 +443,7 @@ async def stream_request(
                         status_code=500,
                         media_type="application/json"
                     )
+                    stats_collector.record_request(model_name, "antigravity", False)
                     return
                 continue  # 重试
 
@@ -462,10 +465,12 @@ async def stream_request(
                         status_code=500,
                         media_type="application/json"
                     )
+                stats_collector.record_request(model_name, "antigravity", False)
                 return
 
     # 所有重试均已耗尽（for循环正常结束），返回最后记录的错误
     log.error("[ANTIGRAVITY STREAM] 所有重试均失败")
+    stats_collector.record_request(model_name, "antigravity", False)
     if last_error_response:
         yield last_error_response
     else:

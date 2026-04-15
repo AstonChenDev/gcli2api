@@ -22,6 +22,7 @@ from config import get_code_assist_endpoint, get_auto_ban_error_codes
 from log import log
 
 from src.credential_manager import credential_manager
+from src.stats_collector import stats_collector
 from src.httpx_client import stream_post_async, post_async
 
 # 导入共同的基础功能
@@ -341,6 +342,7 @@ async def stream_request(
             # 流式请求完成，检查结果
                 cred_label = credential_data.get('client_email') or current_file
                 log.info(f"[GEMINICLI STREAM] 流式响应完成，模型: {model_name}, 凭证: {cred_label}")
+                stats_collector.record_request(model_name, "geminicli", True)
                 return
 
             # 统一处理重试
@@ -356,6 +358,7 @@ async def stream_request(
                             status_code=429,
                             media_type="application/json"
                         )
+                    stats_collector.record_request(model_name, "geminicli", False)
                     return
 
                 log.info(f"[GEMINICLI STREAM] 重试请求 (attempt {attempt + 2}/{max_retries + 1})...")
@@ -374,6 +377,7 @@ async def stream_request(
                         status_code=500,
                         media_type="application/json"
                     )
+                    stats_collector.record_request(model_name, "geminicli", False)
                     return
                 continue  # 重试
 
@@ -395,10 +399,12 @@ async def stream_request(
                         status_code=500,
                         media_type="application/json"
                     )
+                stats_collector.record_request(model_name, "geminicli", False)
                 return
 
     # 所有重试均已耗尽（for循环正常结束），返回最后记录的错误
     log.error("[GEMINICLI STREAM] 所有重试均失败")
+    stats_collector.record_request(model_name, "geminicli", False)
     if last_error_response:
         yield last_error_response
     else:

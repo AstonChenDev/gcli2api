@@ -26,6 +26,12 @@ async def get_stats_summary(
         summary = await adapter._backend.get_stats_summary(
             mode=mode, start_time=start_time, end_time=end_time
         )
+        # 同时获取请求级统计（跟随mode过滤）
+        if hasattr(adapter._backend, 'get_request_stats_summary'):
+            request_summary = await adapter._backend.get_request_stats_summary(
+                mode=mode, start_time=start_time, end_time=end_time
+            )
+            summary["request"] = request_summary
         return summary
     except Exception as e:
         log.error(f"[STATS API] Error getting summary: {e}")

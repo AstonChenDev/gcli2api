@@ -175,6 +175,33 @@ class PSQLManager:
             # 多 Worker 竞态：表已被其他 Worker 创建，安全忽略
             log.debug(f"credential_stats table may already exist (concurrent init): {e}")
 
+        # 请求级统计表（记录每个用户请求的最终结果，不含重试过程）
+        try:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS request_stats (
+                    id SERIAL PRIMARY KEY,
+                    model_name TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'geminicli',
+                    time_bucket BIGINT NOT NULL DEFAULT 0,
+                    total_count BIGINT DEFAULT 0,
+                    success_count BIGINT DEFAULT 0,
+                    fail_count BIGINT DEFAULT 0,
+                    updated_at DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW()),
+                    UNIQUE(model_name, mode, time_bucket)
+                )
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_req_stats_model ON request_stats(model_name)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_req_stats_mode ON request_stats(mode)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_req_stats_bucket ON request_stats(time_bucket)
+            """)
+        except Exception as e:
+            log.debug(f"request_stats table may already exist (concurrent init): {e}")
+
         log.debug("PostgreSQL tables and indexes created")
 
     async def _ensure_schema_compatibility(self, conn: asyncpg.Connection) -> None:
@@ -1301,7 +1328,7 @@ class PSQLManager:
             return []
 
     async def reset_stats(self, mode: Optional[str] = None) -> bool:
-        """清零统计数据"""
+        """清零统计数据（包括凭证统计和请求统计）"""
         self._ensure_initialized()
 
         try:
@@ -1310,10 +1337,120 @@ class PSQLManager:
                     await conn.execute(
                         "DELETE FROM credential_stats WHERE mode = $1", mode
                     )
+                    await conn.execute(
+                        "DELETE FROM request_stats WHERE mode = $1", mode
+                    )
                 else:
                     await conn.execute("DELETE FROM credential_stats")
+                    await conn.execute("DELETE FROM request_stats")
             log.info(f"[STATS] Stats reset (mode={mode or 'all'})")
             return True
         except Exception as e:
             log.error(f"[STATS] Error resetting stats: {e}")
             return False
+
+    # ==================== 请求级统计 ====================
+
+    async def batch_upsert_request_stats(
+        self,
+        records: list,
+    ) -> None:
+        """
+        批量 upsert 请求级统计数据
+
+        Args:
+            records: [(model_name, mode, total, success, fail, time_bucket), ...]
+        """
+        if not records:
+            return
+        self._ensure_initialized()
+
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.executemany("""
+                    INSERT INTO request_stats (model_name, mode, total_count, success_count, fail_count, time_bucket, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW()))
+                    ON CONFLICT (model_name, mode, time_bucket)
+                    DO UPDATE SET
+                        total_count = request_stats.total_count + EXCLUDED.total_count,
+                        success_count = request_stats.success_count + EXCLUDED.success_count,
+                        fail_count = request_stats.fail_count + EXCLUDED.fail_count,
+                        updated_at = EXTRACT(EPOCH FROM NOW())
+                """, records)
+            log.debug(f"[STATS] Flushed {len(records)} request stat records to DB")
+        except Exception as e:
+            log.error(f"[STATS] Error batch upserting request stats: {e}")
+
+    async def get_request_stats_summary(
+        self,
+        mode: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        获取请求级统计汇总：全局总计 + 模型维度
+        mode=None 时查所有模式（不按内部路由模式过滤）
+        """
+        self._ensure_initialized()
+
+        # 构建过滤条件
+        where_parts = []
+        params = []
+        param_idx = 1
+        if mode:
+            where_parts.append(f"mode = ${param_idx}")
+            params.append(mode)
+            param_idx += 1
+        if start_time is not None:
+            where_parts.append(f"time_bucket >= ${param_idx}")
+            params.append(start_time)
+            param_idx += 1
+        if end_time is not None:
+            where_parts.append(f"time_bucket <= ${param_idx}")
+            params.append(end_time)
+            param_idx += 1
+
+        where_clause = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+        try:
+            async with self._pool.acquire() as conn:
+                # 全局汇总
+                global_row = await conn.fetchrow(f"""
+                    SELECT COALESCE(SUM(total_count), 0) AS total,
+                           COALESCE(SUM(success_count), 0) AS success,
+                           COALESCE(SUM(fail_count), 0) AS fail
+                    FROM request_stats
+                    {where_clause}
+                """, *params)
+
+                # 模型维度
+                model_rows = await conn.fetch(f"""
+                    SELECT model_name,
+                           SUM(total_count) AS total,
+                           SUM(success_count) AS success,
+                           SUM(fail_count) AS fail
+                    FROM request_stats
+                    {where_clause}
+                    GROUP BY model_name
+                    ORDER BY total DESC
+                """, *params)
+
+            return {
+                "global": {
+                    "total": global_row["total"],
+                    "success": global_row["success"],
+                    "fail": global_row["fail"],
+                },
+                "models": [
+                    {
+                        "model_name": r["model_name"],
+                        "total": r["total"],
+                        "success": r["success"],
+                        "fail": r["fail"],
+                    }
+                    for r in model_rows
+                ],
+            }
+        except Exception as e:
+            log.error(f"[STATS] Error getting request stats summary: {e}")
+            return {"global": {"total": 0, "success": 0, "fail": 0}, "models": []}
