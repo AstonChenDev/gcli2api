@@ -924,7 +924,8 @@ def gemini_to_anthropic_response(
 async def gemini_stream_to_anthropic_stream(
     gemini_stream: AsyncIterator[bytes],
     model: str,
-    status_code: int = 200
+    status_code: int = 200,
+    credential_name: Optional[str] = None
 ) -> AsyncIterator[bytes]:
     """
     将 Gemini 格式流式响应转换为 Anthropic SSE 格式流式响应
@@ -1245,6 +1246,7 @@ async def gemini_stream_to_anthropic_stream(
 
             log.info(
                 f"[ANTHROPIC][stream_end] 流式结束: model={model}, stop_reason={stop_reason}, "
+                f"credential={credential_name or 'N/A'}, "
                 f"has_tool_use={has_tool_use}, finish_reason={finish_reason}, "
                 f"input_tokens={input_tokens}, output_tokens={output_tokens}"
             )

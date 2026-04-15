@@ -333,13 +333,14 @@ async def stream_request(
                             credential_manager, current_file, mode="geminicli", model_name=model_name
                         )
                         success_recorded = True
-                        log.debug(f"[GEMINICLI STREAM] 开始接收流式响应，模型: {model_name}")
+                        cred_label = credential_data.get('client_email') or current_file
+                        log.info(f"[GEMINICLI STREAM] 开始接收流式响应，模型: {model_name}, 凭证: {cred_label}")
 
                     yield chunk
 
             # 流式请求完成，检查结果
-            if success_recorded:
-                log.debug(f"[GEMINICLI STREAM] 流式响应完成，模型: {model_name}")
+                cred_label = credential_data.get('client_email') or current_file
+                log.info(f"[GEMINICLI STREAM] 流式响应完成，模型: {model_name}, 凭证: {cred_label}")
                 return
 
             # 统一处理重试

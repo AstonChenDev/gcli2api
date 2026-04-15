@@ -310,20 +310,26 @@ class PSQLManager:
     async def get_next_available_credential(
         self, mode: str = "geminicli", model_name: Optional[str] = None
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """随机获取一个可用凭证（负载均衡）"""
+        """获取一个可用凭证（根据策略选择随机或顺序）"""
         self._ensure_initialized()
 
         try:
             table_name = self._get_table_name(mode)
             current_time = time.time()
+            strategy = self._config_cache.get("credential_selection_strategy", "random")
+            order_clause = "ORDER BY rotation_order ASC" if strategy in ("sequential", "round_robin") else "ORDER BY RANDOM()"
 
             async with self._pool.acquire() as conn:
                 if mode == "geminicli":
+                    tier_clause = ""
+                    if model_name and "pro" in model_name.lower():
+                        tier_clause = "AND (tier IS NULL OR tier != 'free')"
+
                     rows = await conn.fetch(f"""
                         SELECT filename, credential_data, model_cooldowns, preview
                         FROM {table_name}
-                        WHERE disabled = 0
-                        ORDER BY RANDOM()
+                        WHERE disabled = 0 {tier_clause}
+                        {order_clause}
                     """)
 
                     if not model_name:
@@ -359,7 +365,7 @@ class PSQLManager:
                         SELECT filename, credential_data, model_cooldowns, enable_credit
                         FROM {table_name}
                         WHERE disabled = 0
-                        ORDER BY RANDOM()
+                        {order_clause}
                     """)
 
                     if not model_name:
@@ -677,7 +683,7 @@ class PSQLManager:
     async def get_credentials_summary(
         self,
         offset: int = 0,
-        limit: Optional[int] = None,
+        limit: Optional[int] = 1000,
         status_filter: str = "all",
         mode: str = "geminicli",
         error_code_filter: Optional[str] = None,
@@ -721,7 +727,7 @@ class PSQLManager:
                                user_email, rotation_order, model_cooldowns, preview, tier
                         FROM {table_name}
                         {where_clause}
-                        ORDER BY rotation_order
+                        ORDER BY created_at DESC
                     """)
                 else:
                     all_rows = await conn.fetch(f"""
@@ -729,7 +735,7 @@ class PSQLManager:
                                user_email, rotation_order, model_cooldowns, tier, enable_credit
                         FROM {table_name}
                         {where_clause}
-                        ORDER BY rotation_order
+                        ORDER BY created_at DESC
                     """)
 
                 # 错误码筛选
@@ -1010,6 +1016,18 @@ class PSQLManager:
                     json.dumps(model_cooldowns), filename
                 )
 
+                # 顺序模式下，凭证进入 CD 时排到队尾 (RPUSH)
+                if cooldown_until is not None:
+                    strategy = self._config_cache.get("credential_selection_strategy", "random")
+                    if strategy == "sequential":
+                        max_row = await conn.fetchrow(
+                            f"SELECT COALESCE(MAX(rotation_order), 0) + 1 AS next_order FROM {table_name}"
+                        )
+                        await conn.execute(
+                            f"UPDATE {table_name} SET rotation_order = $1 WHERE filename = $2",
+                            max_row["next_order"], filename
+                        )
+
             log.debug(f"Set model cooldown: {filename}, model_name={model_name}, cooldown_until={cooldown_until}")
             return True
 
@@ -1090,6 +1108,17 @@ class PSQLManager:
                                 """,
                                 json.dumps(cooldowns), filename
                             )
+
+                # 均匀轮换模式：每次使用后排到队尾 (RPUSH)
+                strategy = self._config_cache.get("credential_selection_strategy", "random")
+                if strategy == "round_robin":
+                    max_row = await conn.fetchrow(
+                        f"SELECT COALESCE(MAX(rotation_order), 0) + 1 AS next_order FROM {table_name}"
+                    )
+                    await conn.execute(
+                        f"UPDATE {table_name} SET rotation_order = $1 WHERE filename = $2",
+                        max_row["next_order"], filename
+                    )
 
         except Exception as e:
             log.error(f"Error recording success for {filename}: {e}")

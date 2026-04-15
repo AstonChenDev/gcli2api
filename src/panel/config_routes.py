@@ -64,6 +64,9 @@ async def get_config(token: str = Depends(verify_panel_token)):
         current_config["keepalive_url"] = await config.get_keepalive_url()
         current_config["keepalive_interval"] = await config.get_keepalive_interval()
 
+        # 凭证选取策略
+        current_config["credential_selection_strategy"] = await config.get_credential_selection_strategy()
+
         # 服务器配置
         current_config["host"] = await config.get_server_host()
         current_config["port"] = await config.get_server_port()
@@ -160,6 +163,10 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                 new_config["keepalive_interval"] = interval
             except (ValueError, TypeError):
                 raise HTTPException(status_code=400, detail="保活间隔必须是有效整数")
+
+        if "credential_selection_strategy" in new_config:
+            if new_config["credential_selection_strategy"] not in ("random", "sequential", "round_robin"):
+                raise HTTPException(status_code=400, detail="凭证选取策略必须是 random、sequential 或 round_robin")
         # 验证服务器配置
         if "host" in new_config:
             if not isinstance(new_config["host"], str) or not new_config["host"].strip():

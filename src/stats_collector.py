@@ -21,7 +21,7 @@ class StatsCollector:
     - 分布式多 Worker 安全：SQL 用 += 原子增量
     """
 
-    FLUSH_INTERVAL = 30  # 秒
+    FLUSH_INTERVAL = 5  # 秒
 
     def __init__(self):
         # key: (filename, model_name, mode)

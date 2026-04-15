@@ -51,7 +51,7 @@ function createCredsManager(type) {
         data: {},
         filteredData: {},
         currentPage: 1,
-        pageSize: 20,
+        pageSize: 1000,
         selectedFiles: new Set(),
         totalCount: 0,
         currentStatusFilter: 'all',
@@ -2973,6 +2973,20 @@ function populateConfigForm() {
 
     setConfigField('keepaliveUrl', c.keepalive_url || '');
     setConfigField('keepaliveInterval', c.keepalive_interval || 60);
+
+    // 凭证选取策略 (select元素)
+    const strategyEl = document.getElementById('credentialSelectionStrategy');
+    if (strategyEl) {
+        strategyEl.value = c.credential_selection_strategy || 'random';
+        const configKey = 'credential_selection_strategy';
+        if (AppState.envLockedFields.has(configKey)) {
+            strategyEl.disabled = true;
+            strategyEl.classList.add('env-locked');
+        } else {
+            strategyEl.disabled = false;
+            strategyEl.classList.remove('env-locked');
+        }
+    }
 }
 
 function setConfigField(fieldId, value) {
@@ -3024,7 +3038,8 @@ async function saveConfig() {
             antigravity_switch_credential_enabled: getChecked('antigravitySwitchCredentialEnabled'),
             anti_truncation_max_attempts: getInt('antiTruncationMaxAttempts', 3),
             keepalive_url: getValue('keepaliveUrl'),
-            keepalive_interval: getInt('keepaliveInterval', 60)
+            keepalive_interval: getInt('keepaliveInterval', 60),
+            credential_selection_strategy: document.getElementById('credentialSelectionStrategy')?.value || 'random'
         };
 
         const response = await fetch('./config/save', {
@@ -3218,6 +3233,32 @@ async function resetAllUsageStats() {
             await refreshUsageStats();
         } else {
             showStatus(`重置失败: ${data.message || data.detail || data.error || '未知错误'}`, 'error');
+        }
+    } catch (error) {
+        showStatus(`网络错误: ${error.message}`, 'error');
+    }
+}
+
+// =====================================================================
+// 统计数据清零
+// =====================================================================
+async function resetStats() {
+    if (!confirm('确定要清零所有统计数据吗？此操作不可恢复！')) return;
+
+    try {
+        const response = await fetch('./stats/reset', {
+            method: 'POST',
+            headers: getAuthHeaders()
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            showStatus(data.message || '统计数据已清零', 'success');
+            // 刷新统计页面
+            if (typeof loadStatsData === 'function') loadStatsData();
+        } else {
+            showStatus(`清零失败: ${data.message || data.detail || '未知错误'}`, 'error');
         }
     } catch (error) {
         showStatus(`网络错误: ${error.message}`, 'error');

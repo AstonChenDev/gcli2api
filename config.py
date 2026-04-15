@@ -47,6 +47,7 @@ ENV_MAPPINGS = {
     "PASSWORD": "password",
     "KEEPALIVE_URL": "keepalive_url",
     "KEEPALIVE_INTERVAL": "keepalive_interval",
+    "CREDENTIAL_SELECTION_STRATEGY": "credential_selection_strategy",
 }
 
 
@@ -494,3 +495,23 @@ async def get_keepalive_interval() -> int:
             pass
 
     return int(await get_config_value("keepalive_interval", 60))
+
+
+async def get_credential_selection_strategy() -> str:
+    """
+    Get credential selection strategy.
+
+    控制凭证的选取方式。
+    - random: 随机选取（默认，原版行为）
+    - sequential: 顺序选取（圆环模式，CD后排到队尾）
+
+    Environment variable: CREDENTIAL_SELECTION_STRATEGY
+    Database config key: credential_selection_strategy
+    Default: random
+    """
+    env_value = os.getenv("CREDENTIAL_SELECTION_STRATEGY")
+    if env_value and env_value in ("random", "sequential", "round_robin"):
+        return env_value
+
+    value = str(await get_config_value("credential_selection_strategy", "random"))
+    return value if value in ("random", "sequential", "round_robin") else "random"

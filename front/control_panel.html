@@ -2094,7 +2094,7 @@
                         <option value="100">100</option>
                         <option value="200">200</option>
                         <option value="500">500</option>
-                        <option value="1000">1000</option>
+                        <option value="1000" selected>1000</option>
                     </select>
                 </div>
 
@@ -2249,7 +2249,7 @@
                         <option value="100">100</option>
                         <option value="200">200</option>
                         <option value="500">500</option>
-                        <option value="1000">1000</option>
+                        <option value="1000" selected>1000</option>
                     </select>
                 </div>
 
@@ -2535,6 +2535,19 @@
                                 <input type="number" id="keepaliveInterval" class="config-input" min="5" max="86400" />
                                 <small class="config-note">两次保活请求之间的等待时间，范围 5 - 86400 秒，默认 60 <span
                                         style="color: #28a745;">✓ 支持热更新</span></small>
+                            </div>
+                        </div>
+
+                        <div class="config-group">
+                            <h4>凭证选取策略</h4>
+                            <div class="form-group">
+                                <label for="credentialSelectionStrategy">选取方式:</label>
+                                <select id="credentialSelectionStrategy" class="config-input">
+                                    <option value="random">随机选取（默认）</option>
+                                    <option value="round_robin">均匀轮换（圆环模式）</option>
+                                    <option value="sequential">顺序选取（集中使用，CD后切换）</option>
+                                </select>
+                                <small class="config-note">随机：每次随机选凭证。均匀轮换：逐个轮换使用，分布均匀。顺序：集中使用一个凭证直到冷却后自动切到下一个，实现错峰 <span style="color: #28a745;">✓ 支持热更新</span></small>
                             </div>
                         </div>
 

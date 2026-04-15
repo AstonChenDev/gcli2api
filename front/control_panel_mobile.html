@@ -1490,9 +1490,12 @@
                         <label for="pageSizeSelect">每页显示：</label>
                         <select id="pageSizeSelect" onchange="changePageSize()">
                             <option value="10">10</option>
-                            <option value="20" selected>20</option>
+                            <option value="20">20</option>
                             <option value="50">50</option>
                             <option value="100">100</option>
+                            <option value="200">200</option>
+                            <option value="500">500</option>
+                            <option value="1000" selected>1000</option>
                         </select>
                     </div>
                 </div>
@@ -1518,9 +1521,12 @@
                                 <select id="pageSizeSelect" onchange="changePageSize()"
                                     style="padding: 4px; font-size: 12px;">
                                     <option value="10">10</option>
-                                    <option value="20" selected>20</option>
+                                    <option value="20">20</option>
                                     <option value="50">50</option>
                                     <option value="100">100</option>
+                                    <option value="200">200</option>
+                                    <option value="500">500</option>
+                                    <option value="1000" selected>1000</option>
                                 </select>
                             </div>
                         </div>
@@ -1672,9 +1678,12 @@
                         <label for="antigravityPageSizeSelect">每页显示：</label>
                         <select id="antigravityPageSizeSelect" onchange="changeAntigravityPageSize()">
                             <option value="10">10</option>
-                            <option value="20" selected>20</option>
+                            <option value="20">20</option>
                             <option value="50">50</option>
                             <option value="100">100</option>
+                            <option value="200">200</option>
+                            <option value="500">500</option>
+                            <option value="1000" selected>1000</option>
                         </select>
                     </div>
                 </div>
@@ -1992,6 +2001,19 @@
                                 <small
                                     style="display: block; color: #666; font-size: 12px; margin-top: 5px;">两次保活请求之间的等待时间，范围
                                     5 - 86400 秒，默认 60 ✓ 支持热更新</small>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <h4 style="margin-top: 0; margin-bottom: 15px;">凭证选取策略</h4>
+                            <div class="form-group">
+                                <label for="credentialSelectionStrategy">选取方式:</label>
+                                <select id="credentialSelectionStrategy" style="width: 100%; padding: 8px; border-radius: 6px; font-size: 14px;">
+                                    <option value="random">随机选取（默认）</option>
+                                    <option value="round_robin">均匀轮换（圆环模式）</option>
+                                    <option value="sequential">顺序选取（集中使用，CD后切换）</option>
+                                </select>
+                                <small style="display: block; color: #666; font-size: 12px; margin-top: 5px;">随机：每次随机选凭证。均匀轮换：逐个轮换使用。顺序：集中使用一个凭证直到冷却后切到下一个 ✓ 支持热更新</small>
                             </div>
                         </div>
 

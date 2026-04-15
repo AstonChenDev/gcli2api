@@ -387,7 +387,8 @@ async def stream_request(
                             credential_manager, current_file, mode="antigravity", model_name=model_name
                         )
                         success_recorded = True
-                        log.debug(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}")
+                        cred_label = credential_data.get('client_email') or current_file
+                        log.info(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}, 凭证: {cred_label}")
 
                     # 记录原始chunk内容（用于调试）
                     if isinstance(chunk, bytes):
@@ -399,7 +400,8 @@ async def stream_request(
 
             # 流式请求完成，检查结果
             if success_recorded:
-                log.debug(f"[ANTIGRAVITY STREAM] 流式响应完成，模型: {model_name}")
+                cred_label = credential_data.get('client_email') or current_file
+                log.info(f"[ANTIGRAVITY STREAM] 流式响应完成，模型: {model_name}, 凭证: {cred_label}")
                 return
             elif not need_retry:
                 # 没有收到任何数据（空回复），需要重试
