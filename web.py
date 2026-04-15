@@ -34,6 +34,7 @@ from src.router.vertex.model_list import router as vertex_model_list_router
 from src.task_manager import shutdown_all_tasks
 from src.panel import router as panel_router
 from src.keeplive import keepalive_service
+from src.stats_collector import stats_collector
 
 # 全局凭证管理器
 global_credential_manager = None
@@ -142,6 +143,12 @@ async def lifespan(app: FastAPI):
     else:
         log.info("[MEM] 内存回收任务已启动（仅 gc.collect，malloc_trim 不可用）")
 
+    # 启动统计收集器
+    try:
+        await stats_collector.start()
+    except Exception as e:
+        log.error(f"统计收集器启动失败: {e}")
+
     yield
 
     # 清理资源
@@ -160,6 +167,12 @@ async def lifespan(app: FastAPI):
             await _memory_trim_task
         except asyncio.CancelledError:
             pass
+
+    # 停止统计收集器（最终刷盘）
+    try:
+        await stats_collector.shutdown()
+    except Exception as e:
+        log.error(f"关闭统计收集器时出错: {e}")
 
     # 首先关闭所有异步任务
     try:

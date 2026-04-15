@@ -19,6 +19,7 @@ from config import (
 )
 from log import log
 from src.credential_manager import CredentialManager
+from src.stats_collector import stats_collector
 
 
 # ==================== 错误检查与处理 ====================
@@ -162,6 +163,8 @@ async def record_api_call_success(
         await credential_manager.record_api_call_result(
             credential_name, True, mode=mode, model_name=model_name
         )
+    # 统计计数（纯内存，无IO）
+    stats_collector.record(credential_name, model_name, mode, success=True)
 
 
 async def record_api_call_error(
@@ -195,6 +198,8 @@ async def record_api_call_error(
             model_name=model_name,
             error_message=error_message
         )
+    # 统计计数（纯内存，无IO）
+    stats_collector.record(credential_name, model_name, mode, success=False)
 
 
 # ==================== 429错误处理 ====================

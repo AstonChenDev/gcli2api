@@ -1032,6 +1032,7 @@
                 <button class="tab" onclick="switchTab('antigravity-manage')">AG凭证</button>
                 <button class="tab" onclick="switchTab('config')">配置管理</button>
                 <button class="tab" onclick="switchTab('logs')">实时日志</button>
+                <button class="tab" onclick="switchTab('stats')">📊 统计</button>
                 <button class="tab" onclick="switchTab('about')">项目信息</button>
             </div>
 
@@ -2058,6 +2059,96 @@
             </div>
 
             <!-- 项目信息标签页 -->
+            <!-- 统计仪表盘标签页 -->
+            <div id="statsTab" class="tab-content">
+                <h3>📊 请求统计仪表盘</h3>
+                <p>查看各模型和凭证的请求统计信息</p>
+
+                <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap;">
+                    <select id="statsModeSelect" onchange="loadStats()" style="padding: 8px 12px; border-radius: 6px; font-size: 14px; flex: 1;">
+                        <option value="geminicli">GCLI 模式</option>
+                        <option value="antigravity">Antigravity 模式</option>
+                    </select>
+                    <button class="refresh-btn" onclick="loadStats()" style="font-size: 13px;">🔄 刷新</button>
+                    <button class="cred-btn delete" onclick="resetStats()" style="font-size: 13px;">🗑 清零</button>
+                </div>
+
+                <!-- 时间快捷筛选 -->
+                <div style="display: flex; gap: 6px; align-items: center; margin-bottom: 16px; flex-wrap: wrap;">
+                    <span style="font-size: 12px; color: var(--text-muted);">⏱</span>
+                    <button class="tab stats-time-btn" onclick="setStatsTimeRange('5m', this)" style="font-size: 12px; padding: 4px 8px;">5分</button>
+                    <button class="tab stats-time-btn" onclick="setStatsTimeRange('15m', this)" style="font-size: 12px; padding: 4px 8px;">15分</button>
+                    <button class="tab stats-time-btn active" onclick="setStatsTimeRange('1h', this)" style="font-size: 12px; padding: 4px 8px;">1时</button>
+                    <button class="tab stats-time-btn" onclick="setStatsTimeRange('24h', this)" style="font-size: 12px; padding: 4px 8px;">24时</button>
+                    <button class="tab stats-time-btn" onclick="setStatsTimeRange('7d', this)" style="font-size: 12px; padding: 4px 8px;">7天</button>
+                    <button class="tab stats-time-btn" onclick="setStatsTimeRange('all', this)" style="font-size: 12px; padding: 4px 8px;">全部</button>
+                    <div style="display: flex; gap: 4px; align-items: center; width: 100%; margin-top: 6px;">
+                        <input type="datetime-local" id="statsStartTime" style="padding: 4px 6px; border-radius: 6px; font-size: 12px; border: 1px solid var(--border-color); flex: 1;" onchange="setStatsTimeRange('custom', null)">
+                        <span style="font-size: 12px;">~</span>
+                        <input type="datetime-local" id="statsEndTime" style="padding: 4px 6px; border-radius: 6px; font-size: 12px; border: 1px solid var(--border-color); flex: 1;" onchange="setStatsTimeRange('custom', null)">
+                    </div>
+                </div>
+
+                <div class="stats-container" id="statsGlobalContainer" style="margin-bottom: 20px;">
+                    <div class="stat-item total">
+                        <span class="stat-number" id="statsGlobalTotal">0</span>
+                        <span class="stat-label">总请求</span>
+                    </div>
+                    <div class="stat-item normal">
+                        <span class="stat-number" id="statsGlobalSuccess">0</span>
+                        <span class="stat-label">成功</span>
+                    </div>
+                    <div class="stat-item disabled">
+                        <span class="stat-number" id="statsGlobalFail">0</span>
+                        <span class="stat-label">失败</span>
+                    </div>
+                    <div class="stat-item" style="border-left: 4px solid #17a2b8;">
+                        <span class="stat-number" id="statsGlobalRate">--</span>
+                        <span class="stat-label">成功率</span>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 20px;">
+                    <h4 style="margin-bottom: 10px;">📈 模型统计</h4>
+                    <div style="overflow-x: auto;">
+                        <table id="statsModelTable" style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                            <thead>
+                                <tr style="border-bottom: 2px solid var(--border-color);">
+                                    <th style="text-align: left; padding: 8px;">模型</th>
+                                    <th style="text-align: right; padding: 8px;">总计</th>
+                                    <th style="text-align: right; padding: 8px;">成功</th>
+                                    <th style="text-align: right; padding: 8px;">失败</th>
+                                    <th style="text-align: right; padding: 8px;">成功率</th>
+                                </tr>
+                            </thead>
+                            <tbody id="statsModelBody">
+                                <tr><td colspan="5" style="text-align: center; padding: 16px; color: var(--text-muted);">暂无数据</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div>
+                    <h4 style="margin-bottom: 10px;">👤 凭证统计</h4>
+                    <div style="overflow-x: auto;">
+                        <table id="statsCredTable" style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                            <thead>
+                                <tr style="border-bottom: 2px solid var(--border-color);">
+                                    <th style="text-align: left; padding: 8px;">凭证</th>
+                                    <th style="text-align: right; padding: 8px;">总计</th>
+                                    <th style="text-align: right; padding: 8px;">成功</th>
+                                    <th style="text-align: right; padding: 8px;">失败</th>
+                                    <th style="text-align: right; padding: 8px;">成功率</th>
+                                </tr>
+                            </thead>
+                            <tbody id="statsCredBody">
+                                <tr><td colspan="5" style="text-align: center; padding: 16px; color: var(--text-muted);">暂无数据</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
             <div id="aboutTab" class="tab-content">
                 <h3>项目信息</h3>
                 <p>关于GCLI2API项目的详细信息</p>

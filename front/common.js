@@ -1030,6 +1030,140 @@ function triggerTabDataLoad(tabName) {
     if (tabName === 'antigravity-manage') AppState.antigravityCreds.refresh();
     if (tabName === 'config') loadConfig();
     if (tabName === 'logs') connectWebSocket();
+    if (tabName === 'stats') loadStats();
+}
+
+// =====================================================================
+// 统计仪表盘
+// =====================================================================
+let _statsTimeRange = '1h'; // 默认显示最近1小时
+
+function formatNumber(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+    return String(n);
+}
+
+function calcRate(success, total) {
+    if (!total || total === 0) return '--';
+    return (success / total * 100).toFixed(1) + '%';
+}
+
+function setStatsTimeRange(range, btn) {
+    _statsTimeRange = range;
+    // 更新按钮激活状态
+    if (btn) {
+        document.querySelectorAll('.stats-time-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+    } else if (range === 'custom') {
+        document.querySelectorAll('.stats-time-btn').forEach(b => b.classList.remove('active'));
+    }
+    loadStats();
+}
+
+function _getStatsTimeParams() {
+    const now = Math.floor(Date.now() / 1000);
+    const minute = 60;
+    switch (_statsTimeRange) {
+        case '5m':  return { start_time: now - 5 * minute };
+        case '15m': return { start_time: now - 15 * minute };
+        case '1h':  return { start_time: now - 3600 };
+        case '24h': return { start_time: now - 86400 };
+        case '7d':  return { start_time: now - 7 * 86400 };
+        case 'all': return {};
+        case 'custom': {
+            const params = {};
+            const startEl = document.getElementById('statsStartTime');
+            const endEl = document.getElementById('statsEndTime');
+            if (startEl?.value) params.start_time = Math.floor(new Date(startEl.value).getTime() / 1000);
+            if (endEl?.value) params.end_time = Math.floor(new Date(endEl.value).getTime() / 1000);
+            return params;
+        }
+        default: return {};
+    }
+}
+
+async function loadStats() {
+    const mode = document.getElementById('statsModeSelect')?.value || 'geminicli';
+    const timeParams = _getStatsTimeParams();
+
+    let url = `./stats/summary?mode=${mode}`;
+    if (timeParams.start_time) url += `&start_time=${timeParams.start_time}`;
+    if (timeParams.end_time) url += `&end_time=${timeParams.end_time}`;
+
+    try {
+        const response = await fetch(url, {
+            headers: getAuthHeaders()
+        });
+        const data = await response.json();
+
+        // 全局汇总
+        const g = data.global || { total: 0, success: 0, fail: 0 };
+        document.getElementById('statsGlobalTotal').textContent = formatNumber(g.total);
+        document.getElementById('statsGlobalSuccess').textContent = formatNumber(g.success);
+        document.getElementById('statsGlobalFail').textContent = formatNumber(g.fail);
+        document.getElementById('statsGlobalRate').textContent = calcRate(g.success, g.total);
+
+        // 模型表格
+        const modelBody = document.getElementById('statsModelBody');
+        const models = data.models || [];
+        if (models.length === 0) {
+            modelBody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 20px; color: var(--text-muted);">暂无数据</td></tr>';
+        } else {
+            modelBody.innerHTML = models.map(m => `
+                <tr style="border-bottom: 1px solid var(--border-color);">
+                    <td style="padding: 10px 12px; font-weight: 500;">${m.model_name}</td>
+                    <td style="text-align: right; padding: 10px 12px;">${formatNumber(m.total)}</td>
+                    <td style="text-align: right; padding: 10px 12px; color: var(--success);">${formatNumber(m.success)}</td>
+                    <td style="text-align: right; padding: 10px 12px; color: ${m.fail > 0 ? 'var(--danger)' : 'var(--text-muted)'};">${formatNumber(m.fail)}</td>
+                    <td style="text-align: right; padding: 10px 12px;">${calcRate(m.success, m.total)}</td>
+                </tr>
+            `).join('');
+        }
+
+        // 凭证表格
+        const credBody = document.getElementById('statsCredBody');
+        const creds = data.credentials || [];
+        if (creds.length === 0) {
+            credBody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 20px; color: var(--text-muted);">暂无数据</td></tr>';
+        } else {
+            credBody.innerHTML = creds.map(c => `
+                <tr style="border-bottom: 1px solid var(--border-color);">
+                    <td style="padding: 10px 12px;" title="${c.filename}">${c.display_name || c.filename}</td>
+                    <td style="text-align: right; padding: 10px 12px;">${formatNumber(c.total)}</td>
+                    <td style="text-align: right; padding: 10px 12px; color: var(--success);">${formatNumber(c.success)}</td>
+                    <td style="text-align: right; padding: 10px 12px; color: ${c.fail > 0 ? 'var(--danger)' : 'var(--text-muted)'};">${formatNumber(c.fail)}</td>
+                    <td style="text-align: right; padding: 10px 12px;">${calcRate(c.success, c.total)}</td>
+                </tr>
+            `).join('');
+        }
+    } catch (error) {
+        showStatus(`加载统计数据失败: ${error.message}`, 'error');
+    }
+}
+
+async function resetStats() {
+    const mode = document.getElementById('statsModeSelect')?.value || 'geminicli';
+    const modeLabel = mode === 'antigravity' ? 'Antigravity' : 'GCLI';
+
+    if (!confirm(`确定要清零 ${modeLabel} 模式的所有统计数据吗？\n此操作不可恢复！`)) return;
+
+    try {
+        const response = await fetch(`./stats/reset?mode=${mode}`, {
+            method: 'POST',
+            headers: getAuthHeaders()
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            showStatus('统计数据已清零', 'success');
+            await loadStats();
+        } else {
+            showStatus(`清零失败: ${data.message || '未知错误'}`, 'error');
+        }
+    } catch (error) {
+        showStatus(`清零失败: ${error.message}`, 'error');
+    }
 }
 
 

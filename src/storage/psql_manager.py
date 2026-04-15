@@ -143,6 +143,38 @@ class PSQLManager:
             CREATE INDEX IF NOT EXISTS idx_ag_rotation_order ON antigravity_credentials(rotation_order)
         """)
 
+        # 统计表（独立 try/except：多 Worker 并发启动时 CREATE TABLE IF NOT EXISTS 可能竞态冲突）
+        try:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS credential_stats (
+                    id SERIAL PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'geminicli',
+                    time_bucket BIGINT NOT NULL DEFAULT 0,
+                    total_count BIGINT DEFAULT 0,
+                    success_count BIGINT DEFAULT 0,
+                    fail_count BIGINT DEFAULT 0,
+                    updated_at DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW()),
+                    UNIQUE(filename, model_name, mode, time_bucket)
+                )
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_stats_filename ON credential_stats(filename)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_stats_model ON credential_stats(model_name)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_stats_mode ON credential_stats(mode)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_stats_bucket ON credential_stats(time_bucket)
+            """)
+        except Exception as e:
+            # 多 Worker 竞态：表已被其他 Worker 创建，安全忽略
+            log.debug(f"credential_stats table may already exist (concurrent init): {e}")
+
         log.debug("PostgreSQL tables and indexes created")
 
     async def _ensure_schema_compatibility(self, conn: asyncpg.Connection) -> None:
@@ -197,6 +229,39 @@ class PSQLManager:
                             log.error(f"Failed to add column {table_name}.{col_name}: {e}")
         except Exception as e:
             log.error(f"Error ensuring schema compatibility: {e}")
+
+        # credential_stats 表迁移：添加 time_bucket 列
+        try:
+            stats_rows = await conn.fetch("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'credential_stats'
+            """)
+            stats_existing = {r["column_name"] for r in stats_rows}
+            if "time_bucket" not in stats_existing and stats_existing:
+                log.info("[STATS] Migrating credential_stats: adding time_bucket column...")
+                # 旧表没有 time_bucket，直接重建（数据量极少）
+                await conn.execute("DROP TABLE IF EXISTS credential_stats")
+                await conn.execute("""
+                    CREATE TABLE credential_stats (
+                        id SERIAL PRIMARY KEY,
+                        filename TEXT NOT NULL,
+                        model_name TEXT NOT NULL,
+                        mode TEXT NOT NULL DEFAULT 'geminicli',
+                        time_bucket BIGINT NOT NULL DEFAULT 0,
+                        total_count BIGINT DEFAULT 0,
+                        success_count BIGINT DEFAULT 0,
+                        fail_count BIGINT DEFAULT 0,
+                        updated_at DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW()),
+                        UNIQUE(filename, model_name, mode, time_bucket)
+                    )
+                """)
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_filename ON credential_stats(filename)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_model ON credential_stats(model_name)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_mode ON credential_stats(mode)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_bucket ON credential_stats(time_bucket)")
+                log.info("[STATS] credential_stats table migrated successfully")
+        except Exception as e:
+            log.debug(f"[STATS] credential_stats migration check: {e}")
 
     async def _load_config_cache(self) -> None:
         """加载配置到内存缓存"""
@@ -1028,3 +1093,198 @@ class PSQLManager:
 
         except Exception as e:
             log.error(f"Error recording success for {filename}: {e}")
+
+    # ============ 统计方法 ============
+
+    async def batch_upsert_stats(
+        self,
+        records: list,
+    ) -> None:
+        """
+        批量 upsert 统计数据
+        
+        Args:
+            records: [(filename, model_name, mode, total, success, fail, time_bucket), ...]
+        """
+        if not records:
+            return
+        self._ensure_initialized()
+
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.executemany("""
+                    INSERT INTO credential_stats (filename, model_name, mode, total_count, success_count, fail_count, time_bucket, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, EXTRACT(EPOCH FROM NOW()))
+                    ON CONFLICT (filename, model_name, mode, time_bucket)
+                    DO UPDATE SET
+                        total_count = credential_stats.total_count + EXCLUDED.total_count,
+                        success_count = credential_stats.success_count + EXCLUDED.success_count,
+                        fail_count = credential_stats.fail_count + EXCLUDED.fail_count,
+                        updated_at = EXTRACT(EPOCH FROM NOW())
+                """, records)
+            log.debug(f"[STATS] Flushed {len(records)} stat records to DB")
+        except Exception as e:
+            log.error(f"[STATS] Error batch upserting stats: {e}")
+
+    async def get_stats_summary(
+        self,
+        mode: str = "geminicli",
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        获取统计汇总：全局总计 + 模型维度 + 凭证维度（JOIN邮箱）
+        支持按时间范围过滤（start_time/end_time 为 epoch 秒）
+        """
+        self._ensure_initialized()
+        table_name = self._get_table_name(mode)
+
+        # 构建时间过滤条件
+        time_filter = ""
+        params = [mode]
+        param_idx = 2
+        if start_time is not None:
+            time_filter += f" AND time_bucket >= ${param_idx}"
+            params.append(start_time)
+            param_idx += 1
+        if end_time is not None:
+            time_filter += f" AND time_bucket <= ${param_idx}"
+            params.append(end_time)
+            param_idx += 1
+
+        try:
+            async with self._pool.acquire() as conn:
+                # 全局汇总
+                global_row = await conn.fetchrow(f"""
+                    SELECT COALESCE(SUM(total_count), 0) AS total,
+                           COALESCE(SUM(success_count), 0) AS success,
+                           COALESCE(SUM(fail_count), 0) AS fail
+                    FROM credential_stats
+                    WHERE mode = $1{time_filter}
+                """, *params)
+
+                # 模型维度
+                model_rows = await conn.fetch(f"""
+                    SELECT model_name,
+                           SUM(total_count) AS total,
+                           SUM(success_count) AS success,
+                           SUM(fail_count) AS fail
+                    FROM credential_stats
+                    WHERE mode = $1{time_filter}
+                    GROUP BY model_name
+                    ORDER BY total DESC
+                """, *params)
+
+                # 凭证维度（JOIN 邮箱）
+                cred_rows = await conn.fetch(f"""
+                    SELECT s.filename,
+                           c.user_email,
+                           SUM(s.total_count) AS total,
+                           SUM(s.success_count) AS success,
+                           SUM(s.fail_count) AS fail
+                    FROM credential_stats s
+                    LEFT JOIN {table_name} c ON s.filename = c.filename
+                    WHERE s.mode = $1{time_filter.replace('time_bucket', 's.time_bucket')}
+                    GROUP BY s.filename, c.user_email
+                    ORDER BY total DESC
+                """, *params)
+
+            return {
+                "global": {
+                    "total": global_row["total"],
+                    "success": global_row["success"],
+                    "fail": global_row["fail"],
+                },
+                "models": [
+                    {
+                        "model_name": r["model_name"],
+                        "total": r["total"],
+                        "success": r["success"],
+                        "fail": r["fail"],
+                    }
+                    for r in model_rows
+                ],
+                "credentials": [
+                    {
+                        "filename": r["filename"],
+                        "user_email": r["user_email"],
+                        "display_name": r["user_email"] or r["filename"],
+                        "total": r["total"],
+                        "success": r["success"],
+                        "fail": r["fail"],
+                    }
+                    for r in cred_rows
+                ],
+            }
+        except Exception as e:
+            log.error(f"[STATS] Error getting stats summary: {e}")
+            return {"global": {"total": 0, "success": 0, "fail": 0}, "models": [], "credentials": []}
+
+    async def get_stats_by_credential(
+        self,
+        filename: str,
+        mode: str = "geminicli",
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> list:
+        """
+        获取单个凭证的模型级统计明细
+        """
+        self._ensure_initialized()
+        filename = os.path.basename(filename)
+
+        time_filter = ""
+        params = [filename, mode]
+        param_idx = 3
+        if start_time is not None:
+            time_filter += f" AND time_bucket >= ${param_idx}"
+            params.append(start_time)
+            param_idx += 1
+        if end_time is not None:
+            time_filter += f" AND time_bucket <= ${param_idx}"
+            params.append(end_time)
+            param_idx += 1
+
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(f"""
+                    SELECT model_name,
+                           SUM(total_count) AS total_count,
+                           SUM(success_count) AS success_count,
+                           SUM(fail_count) AS fail_count
+                    FROM credential_stats
+                    WHERE filename = $1 AND mode = $2{time_filter}
+                    GROUP BY model_name
+                    ORDER BY total_count DESC
+                """, *params)
+
+            return [
+                {
+                    "model_name": r["model_name"],
+                    "total": r["total_count"],
+                    "success": r["success_count"],
+                    "fail": r["fail_count"],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            log.error(f"[STATS] Error getting stats for {filename}: {e}")
+            return []
+
+    async def reset_stats(self, mode: Optional[str] = None) -> bool:
+        """清零统计数据"""
+        self._ensure_initialized()
+
+        try:
+            async with self._pool.acquire() as conn:
+                if mode:
+                    await conn.execute(
+                        "DELETE FROM credential_stats WHERE mode = $1", mode
+                    )
+                else:
+                    await conn.execute("DELETE FROM credential_stats")
+            log.info(f"[STATS] Stats reset (mode={mode or 'all'})")
+            return True
+        except Exception as e:
+            log.error(f"[STATS] Error resetting stats: {e}")
+            return False
