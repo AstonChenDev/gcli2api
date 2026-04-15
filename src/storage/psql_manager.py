@@ -1454,3 +1454,60 @@ class PSQLManager:
         except Exception as e:
             log.error(f"[STATS] Error getting request stats summary: {e}")
             return {"global": {"total": 0, "success": 0, "fail": 0}, "models": []}
+
+    async def get_request_stats_timeseries(
+        self,
+        mode: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取请求级统计的时间序列数据，按 time_bucket + model_name 分组
+        返回格式: [{ time_bucket, model_name, total, success, fail }, ...]
+        """
+        self._ensure_initialized()
+
+        where_parts = []
+        params = []
+        param_idx = 1
+        if mode:
+            where_parts.append(f"mode = ${param_idx}")
+            params.append(mode)
+            param_idx += 1
+        if start_time:
+            where_parts.append(f"time_bucket >= ${param_idx}")
+            params.append(start_time)
+            param_idx += 1
+        if end_time:
+            where_parts.append(f"time_bucket <= ${param_idx}")
+            params.append(end_time)
+            param_idx += 1
+
+        where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(f"""
+                    SELECT time_bucket, model_name,
+                           SUM(total_count) AS total,
+                           SUM(success_count) AS success,
+                           SUM(fail_count) AS fail
+                    FROM request_stats
+                    {where_clause}
+                    GROUP BY time_bucket, model_name
+                    ORDER BY time_bucket ASC, model_name
+                """, *params)
+
+            return [
+                {
+                    "time_bucket": r["time_bucket"],
+                    "model_name": r["model_name"],
+                    "total": r["total"],
+                    "success": r["success"],
+                    "fail": r["fail"],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            log.error(f"[STATS] Error getting request stats timeseries: {e}")
+            return []

@@ -1264,9 +1264,210 @@ async function loadStats() {
         _statsCredsData = data.credentials || [];
         _renderModelTable();
         _renderCredTable();
+
+        // 加载时间序列图表
+        loadStatsTimeseries();
     } catch (error) {
         showStatus(`加载统计数据失败: ${error.message}`, 'error');
     }
+}
+
+
+// =====================================================================
+// 📊 时间序列图表
+// =====================================================================
+let _statsChart = null;
+let _statsChartType = 'rate'; // 'rate' | 'volume'
+let _statsChartData = [];
+
+const _chartColors = [
+    { line: '#6366f1', bg: 'rgba(99, 102, 241, 0.12)' },   // indigo
+    { line: '#f59e0b', bg: 'rgba(245, 158, 11, 0.12)' },   // amber
+    { line: '#10b981', bg: 'rgba(16, 185, 129, 0.12)' },    // emerald
+    { line: '#ef4444', bg: 'rgba(239, 68, 68, 0.12)' },     // red
+    { line: '#8b5cf6', bg: 'rgba(139, 92, 246, 0.12)' },    // violet
+    { line: '#06b6d4', bg: 'rgba(6, 182, 212, 0.12)' },     // cyan
+    { line: '#f97316', bg: 'rgba(249, 115, 22, 0.12)' },    // orange
+    { line: '#ec4899', bg: 'rgba(236, 72, 153, 0.12)' },    // pink
+    { line: '#14b8a6', bg: 'rgba(20, 184, 166, 0.12)' },    // teal
+    { line: '#a855f7', bg: 'rgba(168, 85, 247, 0.12)' },    // purple
+];
+
+function setChartType(type) {
+    _statsChartType = type;
+    document.getElementById('chartTypeRate')?.classList.toggle('active', type === 'rate');
+    document.getElementById('chartTypeVolume')?.classList.toggle('active', type === 'volume');
+    _renderTimeseriesChart();
+}
+
+async function loadStatsTimeseries() {
+    const mode = document.getElementById('statsModeSelect')?.value || 'geminicli';
+    const timeParams = _getStatsTimeParams();
+    let url = `./stats/request-timeseries?mode=${mode}`;
+    if (timeParams.start_time) url += `&start_time=${timeParams.start_time}`;
+    if (timeParams.end_time) url += `&end_time=${timeParams.end_time}`;
+    try {
+        const response = await fetch(url, { headers: getAuthHeaders() });
+        const data = await response.json();
+        _statsChartData = data.series || [];
+        _renderTimeseriesChart();
+    } catch (e) {
+        console.error('Failed to load timeseries:', e);
+    }
+}
+
+function _renderTimeseriesChart() {
+    const canvas = document.getElementById('statsTimeseriesChart');
+    const emptyEl = document.getElementById('statsChartEmpty');
+    if (!canvas || typeof Chart === 'undefined') return;
+
+    // 初始化按钮状态
+    if (!document.getElementById('chartTypeRate')?.classList.contains('active') &&
+        !document.getElementById('chartTypeVolume')?.classList.contains('active')) {
+        document.getElementById('chartTypeRate')?.classList.add('active');
+    }
+
+    if (!_statsChartData.length) {
+        if (_statsChart) { _statsChart.destroy(); _statsChart = null; }
+        canvas.style.display = 'none';
+        if (emptyEl) { emptyEl.style.display = 'flex'; }
+        return;
+    }
+    canvas.style.display = '';
+    if (emptyEl) emptyEl.style.display = 'none';
+
+    // 按 model_name 分组
+    const modelMap = {};
+    const allBuckets = new Set();
+    _statsChartData.forEach(d => {
+        allBuckets.add(d.time_bucket);
+        if (!modelMap[d.model_name]) modelMap[d.model_name] = {};
+        modelMap[d.model_name][d.time_bucket] = d;
+    });
+
+    const sortedBuckets = [...allBuckets].sort((a, b) => a - b);
+    const labels = sortedBuckets.map(ts => {
+        const dt = new Date(ts * 1000);
+        const h = String(dt.getHours()).padStart(2, '0');
+        const m = String(dt.getMinutes()).padStart(2, '0');
+        const mo = String(dt.getMonth() + 1).padStart(2, '0');
+        const d = String(dt.getDate()).padStart(2, '0');
+        return sortedBuckets.length > 48 ? `${mo}/${d} ${h}:${m}` : `${h}:${m}`;
+    });
+
+    const modelNames = Object.keys(modelMap).sort();
+    const isRate = _statsChartType === 'rate';
+
+    const datasets = modelNames.map((name, i) => {
+        const color = _chartColors[i % _chartColors.length];
+        const data = sortedBuckets.map(bucket => {
+            const d = modelMap[name][bucket];
+            if (!d) return null;
+            if (isRate) {
+                return d.total > 0 ? +(d.success / d.total * 100).toFixed(1) : null;
+            }
+            return d.total;
+        });
+        return {
+            label: name,
+            data,
+            borderColor: color.line,
+            backgroundColor: color.bg,
+            borderWidth: 2.5,
+            pointRadius: sortedBuckets.length > 24 ? 0 : 3,
+            pointHoverRadius: 5,
+            pointBackgroundColor: color.line,
+            pointBorderColor: '#fff',
+            pointBorderWidth: 1.5,
+            tension: 0.35,
+            fill: true,
+            spanGaps: true,
+        };
+    });
+
+    // 检测暗色主题
+    const isDark = getComputedStyle(document.documentElement).getPropertyValue('--bg-color').trim().startsWith('#1') ||
+                   getComputedStyle(document.documentElement).getPropertyValue('--bg-color').trim().startsWith('#0') ||
+                   document.documentElement.getAttribute('data-theme') === 'dark' ||
+                   window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const gridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
+    const textColor = isDark ? 'rgba(255,255,255,0.65)' : 'rgba(0,0,0,0.55)';
+
+    if (_statsChart) _statsChart.destroy();
+
+    _statsChart = new Chart(canvas, {
+        type: 'line',
+        data: { labels, datasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: {
+                        color: textColor,
+                        usePointStyle: true,
+                        pointStyle: 'circle',
+                        padding: 16,
+                        font: { size: 12, family: "'Inter', 'SF Pro Display', system-ui, sans-serif" },
+                    },
+                },
+                tooltip: {
+                    backgroundColor: isDark ? 'rgba(30, 30, 46, 0.95)' : 'rgba(255, 255, 255, 0.95)',
+                    titleColor: isDark ? '#e0e0e0' : '#333',
+                    bodyColor: isDark ? '#ccc' : '#555',
+                    borderColor: isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)',
+                    borderWidth: 1,
+                    cornerRadius: 8,
+                    padding: 12,
+                    titleFont: { size: 13, weight: '600' },
+                    bodyFont: { size: 12 },
+                    callbacks: {
+                        label: ctx => {
+                            const v = ctx.parsed.y;
+                            if (v === null) return '';
+                            return isRate
+                                ? `${ctx.dataset.label}: ${v.toFixed(1)}%`
+                                : `${ctx.dataset.label}: ${v} 次`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    grid: { color: gridColor, drawBorder: false },
+                    ticks: {
+                        color: textColor,
+                        font: { size: 11 },
+                        maxRotation: 45,
+                        maxTicksLimit: 20,
+                    },
+                    border: { display: false },
+                },
+                y: {
+                    grid: { color: gridColor, drawBorder: false },
+                    ticks: {
+                        color: textColor,
+                        font: { size: 11 },
+                        callback: v => isRate ? v + '%' : v,
+                    },
+                    border: { display: false },
+                    min: isRate ? 0 : undefined,
+                    max: isRate ? 100 : undefined,
+                    suggestedMin: isRate ? 0 : 0,
+                }
+            },
+            animation: {
+                duration: 600,
+                easing: 'easeInOutQuart',
+            },
+        }
+    });
+
+    // 设置canvas容器高度
+    canvas.parentElement.style.minHeight = '320px';
+    canvas.style.height = '300px';
 }
 
 

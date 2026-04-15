@@ -2682,6 +2682,21 @@
                     </div>
                 </div>
 
+                <!-- 📊 模型成功率趋势图 -->
+                <div id="statsChartSection" style="margin-bottom: 24px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+                        <h4 style="margin: 0;">📊 模型稳定性趋势 <span style="font-size: 12px; color: var(--text-muted); font-weight: normal;">（各模型成功率随时间变化）</span></h4>
+                        <div style="display: flex; gap: 6px;">
+                            <button class="tab" id="chartTypeRate" onclick="setChartType('rate')" style="font-size: 12px; padding: 4px 10px;">成功率</button>
+                            <button class="tab" id="chartTypeVolume" onclick="setChartType('volume')" style="font-size: 12px; padding: 4px 10px;">请求量</button>
+                        </div>
+                    </div>
+                    <div style="position: relative; background: var(--card-bg); border-radius: 12px; padding: 16px; border: 1px solid var(--border-color); min-height: 300px;">
+                        <canvas id="statsTimeseriesChart"></canvas>
+                        <div id="statsChartEmpty" style="display: none; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 14px;">暂无数据，请先发起请求</div>
+                    </div>
+                </div>
+
                 <!-- API调用统计（含重试过程） -->
                 <h4 style="margin-bottom: 8px;">🔄 API 调用统计 <span style="font-size: 12px; color: var(--text-muted); font-weight: normal;">（含重试过程中的每次调用）</span></h4>
                 <div class="stats-container" id="statsGlobalContainer" style="margin-bottom: 24px;">
@@ -2829,6 +2844,8 @@
         </div>
     </div>
 
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <!-- 引入公共JavaScript模块 -->
     <script src="./front/common.js"></script>
 

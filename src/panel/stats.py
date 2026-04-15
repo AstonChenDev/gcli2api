@@ -38,6 +38,28 @@ async def get_stats_summary(
         return {"global": {"total": 0, "success": 0, "fail": 0}, "models": [], "credentials": []}
 
 
+@router.get("/request-timeseries")
+async def get_request_timeseries(
+    mode: str = "geminicli",
+    start_time: Optional[int] = Query(None, description="起始时间 epoch 秒"),
+    end_time: Optional[int] = Query(None, description="结束时间 epoch 秒"),
+    _=Depends(verify_panel_token),
+):
+    """获取请求级统计的时间序列数据，用于图表展示"""
+    try:
+        from src.storage_adapter import get_storage_adapter
+        adapter = await get_storage_adapter()
+        if hasattr(adapter._backend, 'get_request_stats_timeseries'):
+            data = await adapter._backend.get_request_stats_timeseries(
+                mode=mode, start_time=start_time, end_time=end_time
+            )
+            return {"series": data}
+        return {"series": []}
+    except Exception as e:
+        log.error(f"[STATS API] Error getting request timeseries: {e}")
+        return {"series": []}
+
+
 @router.get("/credential/{filename}")
 async def get_credential_stats(
     filename: str,
