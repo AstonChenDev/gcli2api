@@ -229,6 +229,7 @@ async def stream_request(
     if not cred_result:
         # 如果返回值是None，直接返回错误500
         log.error("[ANTIGRAVITY STREAM] 当前无可用凭证")
+        stats_collector.record_request(model_name, "antigravity", False)
         yield Response(
             content=json.dumps({"error": "当前无可用凭证"}),
             status_code=500,
@@ -242,6 +243,7 @@ async def stream_request(
 
     if not access_token:
         log.error(f"[ANTIGRAVITY STREAM] No access token in credential: {current_file}")
+        stats_collector.record_request(model_name, "antigravity", False)
         yield Response(
             content=json.dumps({"error": "凭证中没有访问令牌"}),
             status_code=500,
@@ -368,6 +370,7 @@ async def stream_request(
                         else:
                             # 不重试，直接返回原始错误
                             log.error(f"[ANTIGRAVITY STREAM] 达到最大重试次数或不应重试，返回原始错误")
+                            stats_collector.record_request(model_name, "antigravity", False)
                             yield chunk
                             return
                     else:
@@ -378,6 +381,7 @@ async def stream_request(
                             None, mode="antigravity", model_name=model_name,
                             error_message=error_body
                         )
+                        stats_collector.record_request(model_name, "antigravity", False)
                         yield chunk
                         return
                 else:
@@ -390,6 +394,7 @@ async def stream_request(
                         success_recorded = True
                         cred_label = credential_data.get('client_email') or current_file
                         log.info(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}, 凭证: {cred_label}")
+                        stats_collector.record_request(model_name, "antigravity", True)
 
                     # 记录原始chunk内容（用于调试）
                     if isinstance(chunk, bytes):
@@ -403,7 +408,7 @@ async def stream_request(
             if success_recorded:
                 cred_label = credential_data.get('client_email') or current_file
                 log.info(f"[ANTIGRAVITY STREAM] 流式响应完成，模型: {model_name}, 凭证: {cred_label}")
-                stats_collector.record_request(model_name, "antigravity", True)
+                # record_request 已在首个成功chunk处记录
                 return
             elif not need_retry:
                 # 没有收到任何数据（空回复），需要重试
@@ -418,6 +423,7 @@ async def stream_request(
                     need_retry = True
                 else:
                     log.error(f"[ANTIGRAVITY STREAM] 空回复达到最大重试次数")
+                    stats_collector.record_request(model_name, "antigravity", False)
                     yield Response(
                         content=json.dumps({"error": "服务返回空回复"}),
                         status_code=500,
@@ -520,6 +526,7 @@ async def non_stream_request(
     if not cred_result:
         # 如果返回值是None，直接返回错误500
         log.error("[ANTIGRAVITY] 当前无可用凭证")
+        stats_collector.record_request(model_name, "antigravity", False)
         return Response(
             content=json.dumps({"error": "当前无可用凭证"}),
             status_code=500,
@@ -615,6 +622,7 @@ async def non_stream_request(
                         need_retry = True
                     else:
                         log.error(f"[ANTIGRAVITY] 空回复达到最大重试次数")
+                        stats_collector.record_request(model_name, "antigravity", False)
                         return Response(
                             content=json.dumps({"error": "服务返回空回复"}),
                             status_code=500,
@@ -625,6 +633,7 @@ async def non_stream_request(
                     await record_api_call_success(
                         credential_manager, current_file, mode="antigravity", model_name=model_name
                     )
+                    stats_collector.record_request(model_name, "antigravity", True)
                     return Response(
                         content=response.content,
                         status_code=200,
@@ -673,14 +682,6 @@ async def non_stream_request(
                         error_message=error_text
                     )
 
-                    # 异步精化冷却时间（已禁用，直接使用默认冷却时间）
-                    # if cooldown_until is not None and access_token and model_name:
-                    #     asyncio.create_task(
-                    #         refine_cooldown_from_quota(
-                    #             credential_manager, current_file, access_token, model_name
-                    #         )
-                    #     )
-
                     # 检查是否应该重试
                     should_retry = await handle_error_with_retry(
                         credential_manager, status_code, current_file,
@@ -693,6 +694,7 @@ async def non_stream_request(
                     else:
                         # 不重试，直接返回原始错误
                         log.error(f"[ANTIGRAVITY] 达到最大重试次数或不应重试，返回原始错误")
+                        stats_collector.record_request(model_name, "antigravity", False)
                         return last_error_response
                 else:
                     # 错误码不在禁用码当中，直接返回，无需重试
@@ -702,6 +704,7 @@ async def non_stream_request(
                         None, mode="antigravity", model_name=model_name,
                         error_message=error_text
                     )
+                    stats_collector.record_request(model_name, "antigravity", False)
                     return last_error_response
             
             # 统一处理重试
@@ -717,6 +720,7 @@ async def non_stream_request(
                 )
                 if not switched:
                     log.error("[ANTIGRAVITY] 重试时无可用凭证或令牌")
+                    stats_collector.record_request(model_name, "antigravity", False)
                     return Response(
                         content=json.dumps({"error": "当前无可用凭证"}),
                         status_code=500,
@@ -733,6 +737,7 @@ async def non_stream_request(
             else:
                 # 所有重试都失败，返回最后一次的错误（如果有）或500错误
                 log.error(f"[ANTIGRAVITY] 所有重试均失败，最后异常: {e}")
+                stats_collector.record_request(model_name, "antigravity", False)
                 if last_error_response:
                     return last_error_response
                 else:
@@ -744,6 +749,7 @@ async def non_stream_request(
 
     # 所有重试都失败，返回最后一次的原始错误（如果有）或500错误
     log.error("[ANTIGRAVITY] 所有重试均失败")
+    stats_collector.record_request(model_name, "antigravity", False)
     if last_error_response:
         return last_error_response
     else:

@@ -143,6 +143,7 @@ async def stream_request(
 
     if not cred_result:
         # 如果返回值是None，直接返回错误500
+        stats_collector.record_request(model_name, "geminicli", False)
         yield Response(
             content=json.dumps({"error": "当前无可用凭证"}),
             status_code=500,
@@ -314,6 +315,7 @@ async def stream_request(
                             break
                         else:
                             log.error(f"[GEMINICLI STREAM] 达到最大重试次数，返回404错误")
+                            stats_collector.record_request(model_name, "geminicli", False)
                             yield chunk
                             return
                     else:
@@ -324,6 +326,7 @@ async def stream_request(
                             None, mode="geminicli", model_name=model_name,
                             error_message=error_body
                         )
+                        stats_collector.record_request(model_name, "geminicli", False)
                         yield chunk
                         return
                 else:
@@ -336,13 +339,15 @@ async def stream_request(
                         success_recorded = True
                         cred_label = credential_data.get('client_email') or current_file
                         log.info(f"[GEMINICLI STREAM] 开始接收流式响应，模型: {model_name}, 凭证: {cred_label}")
+                        stats_collector.record_request(model_name, "geminicli", True)
 
                     yield chunk
 
             # 流式请求完成，检查结果
+            if success_recorded:
                 cred_label = credential_data.get('client_email') or current_file
                 log.info(f"[GEMINICLI STREAM] 流式响应完成，模型: {model_name}, 凭证: {cred_label}")
-                stats_collector.record_request(model_name, "geminicli", True)
+                # record_request 已在首个成功chunk处记录
                 return
 
             # 统一处理重试
@@ -440,6 +445,7 @@ async def non_stream_request(
 
     if not cred_result:
         # 如果返回值是None，直接返回错误500
+        stats_collector.record_request(model_name, "geminicli", False)
         return Response(
             content=json.dumps({"error": "当前无可用凭证"}),
             status_code=500,
@@ -530,6 +536,7 @@ async def non_stream_request(
                 response_headers.pop('content-encoding', None)
                 response_headers.pop('content-length', None)
 
+                stats_collector.record_request(model_name, "geminicli", True)
                 return Response(
                     content=response.content,
                     status_code=200,
@@ -603,6 +610,7 @@ async def non_stream_request(
                     )
                     if not switched:
                         log.error("[NON-STREAM] 重试时无可用凭证或刷新失败")
+                        stats_collector.record_request(model_name, "geminicli", False)
                         return Response(
                             content=json.dumps({"error": "当前无可用凭证"}),
                             status_code=500,
@@ -612,6 +620,7 @@ async def non_stream_request(
                 else:
                     # 不重试，直接返回原始错误
                     log.error(f"[NON-STREAM] 达到最大重试次数或不应重试，返回原始错误")
+                    stats_collector.record_request(model_name, "geminicli", False)
                     return last_error_response
             elif status_code == 404 and "preview" in model_name.lower():
                 # 特殊处理：preview模型返回404，说明该凭证不支持preview模型
@@ -654,6 +663,7 @@ async def non_stream_request(
                     )
                     if not switched:
                         log.error("[NON-STREAM] 重试时无可用凭证或刷新失败")
+                        stats_collector.record_request(model_name, "geminicli", False)
                         return Response(
                             content=json.dumps({"error": "当前无可用凭证"}),
                             status_code=500,
@@ -662,6 +672,7 @@ async def non_stream_request(
                     continue  # 重试
                 else:
                     log.error(f"[NON-STREAM] 达到最大重试次数，返回404错误")
+                    stats_collector.record_request(model_name, "geminicli", False)
                     return last_error_response
             else:
                 # 错误码不在重试范围内，直接返回
@@ -671,6 +682,7 @@ async def non_stream_request(
                     None, mode="geminicli", model_name=model_name,
                     error_message=error_text
                 )
+                stats_collector.record_request(model_name, "geminicli", False)
                 return last_error_response
 
         except Exception as e:
@@ -682,6 +694,7 @@ async def non_stream_request(
             else:
                 # 所有重试都失败，返回最后一次的错误（如果有）或500错误
                 log.error(f"[NON-STREAM] 所有重试均失败，最后异常: {e}")
+                stats_collector.record_request(model_name, "geminicli", False)
                 if last_error_response:
                     return last_error_response
                 else:
@@ -693,6 +706,7 @@ async def non_stream_request(
 
     # 所有重试都失败，返回最后一次的原始错误
     log.error("[NON-STREAM] 所有重试均失败")
+    stats_collector.record_request(model_name, "geminicli", False)
     return last_error_response
 
 
