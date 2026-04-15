@@ -229,6 +229,13 @@
             box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
         }
 
+        .stats-time-btn.active { background: var(--primary) !important; color: #fff !important; }
+        .stats-time-btn:not(.active) { background: #f0f0f0; color: #555; }
+        .sortable-th { cursor: pointer; user-select: none; white-space: nowrap; }
+        .sortable-th:hover { color: var(--primary); }
+        .sort-arrow { font-size: 10px; margin-left: 2px; opacity: 0.4; }
+        .sort-arrow.active { opacity: 1; color: var(--primary); }
+
         .tab-content {
             display: none;
             padding: 10px 0;

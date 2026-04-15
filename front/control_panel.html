@@ -457,6 +457,17 @@
 
         .tab:active { transform: scale(0.97); transition: transform 0.1s ease; }
         .tab.active:active { transform: scale(0.98); }
+
+        /* 统计时间按钮样式覆盖 */
+        .stats-time-btn { font-size: 13px !important; padding: 4px 12px !important; min-width: auto !important; }
+        .stats-time-btn.active { background: var(--accent) !important; color: #fff !important; }
+        .stats-time-btn:not(.active) { background: var(--bg-secondary); color: var(--text-secondary); }
+
+        /* 可排序表头 */
+        .sortable-th { cursor: pointer; user-select: none; white-space: nowrap; }
+        .sortable-th:hover { color: var(--accent); }
+        .sort-arrow { font-size: 10px; margin-left: 3px; opacity: 0.4; }
+        .sort-arrow.active { opacity: 1; color: var(--accent); }
         .tab:focus { outline: none; }
         .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 

@@ -1036,7 +1036,11 @@ function triggerTabDataLoad(tabName) {
 // =====================================================================
 // 统计仪表盘
 // =====================================================================
-let _statsTimeRange = '1h'; // 默认显示最近1小时
+let _statsTimeRange = '1h';
+let _statsModelsData = [];
+let _statsCredsData = [];
+let _statsModelSort = { key: 'total', dir: 'desc' };
+let _statsCredSort = { key: 'total', dir: 'desc' };
 
 function formatNumber(n) {
     if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
@@ -1044,14 +1048,33 @@ function formatNumber(n) {
     return String(n);
 }
 
+function _rateValue(success, total) {
+    if (!total || total === 0) return -1;
+    return success / total * 100;
+}
+
+function _rateColor(pct) {
+    if (pct < 0) return 'var(--text-muted)';
+    if (pct >= 95) return '#28a745';
+    if (pct >= 85) return '#f0ad4e';
+    return '#dc3545';
+}
+
 function calcRate(success, total) {
-    if (!total || total === 0) return '--';
-    return (success / total * 100).toFixed(1) + '%';
+    const pct = _rateValue(success, total);
+    if (pct < 0) return '--';
+    return pct.toFixed(1) + '%';
+}
+
+function calcRateHtml(success, total) {
+    const pct = _rateValue(success, total);
+    const text = pct < 0 ? '--' : pct.toFixed(1) + '%';
+    const color = _rateColor(pct);
+    return `<span style="color:${color};font-weight:600;">${text}</span>`;
 }
 
 function setStatsTimeRange(range, btn) {
     _statsTimeRange = range;
-    // 更新按钮激活状态
     if (btn) {
         document.querySelectorAll('.stats-time-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
@@ -1083,86 +1106,117 @@ function _getStatsTimeParams() {
     }
 }
 
+function _sortArrow(tableType, key) {
+    const s = tableType === 'model' ? _statsModelSort : _statsCredSort;
+    const isActive = s.key === key;
+    const arrow = isActive ? (s.dir === 'asc' ? '▲' : '▼') : '▲';
+    return `<span class="sort-arrow ${isActive ? 'active' : ''}">${arrow}</span>`;
+}
+
+function _sortableTh(tableType, key, label, align) {
+    const st = align === 'right' ? 'text-align:right;padding:10px 12px;' : 'text-align:left;padding:10px 12px;';
+    return `<th class="sortable-th" style="${st}" onclick="sortStatsTable('${tableType}','${key}')">${label}${_sortArrow(tableType, key)}</th>`;
+}
+
+function sortStatsTable(tableType, key) {
+    const sortState = tableType === 'model' ? _statsModelSort : _statsCredSort;
+    if (sortState.key === key) {
+        sortState.dir = sortState.dir === 'desc' ? 'asc' : 'desc';
+    } else {
+        sortState.key = key;
+        sortState.dir = 'desc';
+    }
+    tableType === 'model' ? _renderModelTable() : _renderCredTable();
+}
+
+function _sortData(data, key, dir) {
+    return [...data].sort((a, b) => {
+        let va, vb;
+        if (key === 'rate') {
+            va = a.total ? a.success / a.total : -1;
+            vb = b.total ? b.success / b.total : -1;
+        } else if (key === 'name' || key === 'display_name') {
+            va = (a.model_name || a.display_name || a.filename || '').toLowerCase();
+            vb = (b.model_name || b.display_name || b.filename || '').toLowerCase();
+            return dir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+        } else {
+            va = a[key] || 0; vb = b[key] || 0;
+        }
+        return dir === 'asc' ? va - vb : vb - va;
+    });
+}
+
+function _renderModelTable() {
+    const body = document.getElementById('statsModelBody');
+    const thead = document.querySelector('#statsModelTable thead tr');
+    if (!thead) return;
+    thead.innerHTML =
+        _sortableTh('model','name','模型','left') +
+        _sortableTh('model','total','总计','right') +
+        _sortableTh('model','success','成功','right') +
+        _sortableTh('model','fail','失败','right') +
+        _sortableTh('model','rate','成功率','right');
+    if (!_statsModelsData.length) {
+        body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--text-muted);">暂无数据</td></tr>';
+        return;
+    }
+    const sorted = _sortData(_statsModelsData, _statsModelSort.key, _statsModelSort.dir);
+    body.innerHTML = sorted.map(m => `<tr style="border-bottom:1px solid var(--border-color);">
+        <td style="padding:10px 12px;font-weight:500;">${m.model_name}</td>
+        <td style="text-align:right;padding:10px 12px;">${formatNumber(m.total)}</td>
+        <td style="text-align:right;padding:10px 12px;color:#28a745;">${formatNumber(m.success)}</td>
+        <td style="text-align:right;padding:10px 12px;color:${m.fail > 0 ? '#dc3545' : 'var(--text-muted)'};">${formatNumber(m.fail)}</td>
+        <td style="text-align:right;padding:10px 12px;">${calcRateHtml(m.success, m.total)}</td>
+    </tr>`).join('');
+}
+
+function _renderCredTable() {
+    const body = document.getElementById('statsCredBody');
+    const thead = document.querySelector('#statsCredTable thead tr');
+    if (!thead) return;
+    thead.innerHTML =
+        _sortableTh('cred','display_name','凭证','left') +
+        _sortableTh('cred','total','总计','right') +
+        _sortableTh('cred','success','成功','right') +
+        _sortableTh('cred','fail','失败','right') +
+        _sortableTh('cred','rate','成功率','right');
+    if (!_statsCredsData.length) {
+        body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--text-muted);">暂无数据</td></tr>';
+        return;
+    }
+    const sorted = _sortData(_statsCredsData, _statsCredSort.key, _statsCredSort.dir);
+    body.innerHTML = sorted.map(c => `<tr style="border-bottom:1px solid var(--border-color);">
+        <td style="padding:10px 12px;" title="${c.filename}">${c.display_name || c.filename}</td>
+        <td style="text-align:right;padding:10px 12px;">${formatNumber(c.total)}</td>
+        <td style="text-align:right;padding:10px 12px;color:#28a745;">${formatNumber(c.success)}</td>
+        <td style="text-align:right;padding:10px 12px;color:${c.fail > 0 ? '#dc3545' : 'var(--text-muted)'};">${formatNumber(c.fail)}</td>
+        <td style="text-align:right;padding:10px 12px;">${calcRateHtml(c.success, c.total)}</td>
+    </tr>`).join('');
+}
+
 async function loadStats() {
     const mode = document.getElementById('statsModeSelect')?.value || 'geminicli';
     const timeParams = _getStatsTimeParams();
-
     let url = `./stats/summary?mode=${mode}`;
     if (timeParams.start_time) url += `&start_time=${timeParams.start_time}`;
     if (timeParams.end_time) url += `&end_time=${timeParams.end_time}`;
-
     try {
-        const response = await fetch(url, {
-            headers: getAuthHeaders()
-        });
+        const response = await fetch(url, { headers: getAuthHeaders() });
         const data = await response.json();
-
-        // 全局汇总
         const g = data.global || { total: 0, success: 0, fail: 0 };
         document.getElementById('statsGlobalTotal').textContent = formatNumber(g.total);
         document.getElementById('statsGlobalSuccess').textContent = formatNumber(g.success);
         document.getElementById('statsGlobalFail').textContent = formatNumber(g.fail);
-        document.getElementById('statsGlobalRate').textContent = calcRate(g.success, g.total);
-
-        // 模型表格
-        const modelBody = document.getElementById('statsModelBody');
-        const models = data.models || [];
-        if (models.length === 0) {
-            modelBody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 20px; color: var(--text-muted);">暂无数据</td></tr>';
-        } else {
-            modelBody.innerHTML = models.map(m => `
-                <tr style="border-bottom: 1px solid var(--border-color);">
-                    <td style="padding: 10px 12px; font-weight: 500;">${m.model_name}</td>
-                    <td style="text-align: right; padding: 10px 12px;">${formatNumber(m.total)}</td>
-                    <td style="text-align: right; padding: 10px 12px; color: var(--success);">${formatNumber(m.success)}</td>
-                    <td style="text-align: right; padding: 10px 12px; color: ${m.fail > 0 ? 'var(--danger)' : 'var(--text-muted)'};">${formatNumber(m.fail)}</td>
-                    <td style="text-align: right; padding: 10px 12px;">${calcRate(m.success, m.total)}</td>
-                </tr>
-            `).join('');
-        }
-
-        // 凭证表格
-        const credBody = document.getElementById('statsCredBody');
-        const creds = data.credentials || [];
-        if (creds.length === 0) {
-            credBody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 20px; color: var(--text-muted);">暂无数据</td></tr>';
-        } else {
-            credBody.innerHTML = creds.map(c => `
-                <tr style="border-bottom: 1px solid var(--border-color);">
-                    <td style="padding: 10px 12px;" title="${c.filename}">${c.display_name || c.filename}</td>
-                    <td style="text-align: right; padding: 10px 12px;">${formatNumber(c.total)}</td>
-                    <td style="text-align: right; padding: 10px 12px; color: var(--success);">${formatNumber(c.success)}</td>
-                    <td style="text-align: right; padding: 10px 12px; color: ${c.fail > 0 ? 'var(--danger)' : 'var(--text-muted)'};">${formatNumber(c.fail)}</td>
-                    <td style="text-align: right; padding: 10px 12px;">${calcRate(c.success, c.total)}</td>
-                </tr>
-            `).join('');
-        }
+        const rateEl = document.getElementById('statsGlobalRate');
+        const pct = _rateValue(g.success, g.total);
+        rateEl.textContent = calcRate(g.success, g.total);
+        rateEl.style.color = _rateColor(pct);
+        _statsModelsData = data.models || [];
+        _statsCredsData = data.credentials || [];
+        _renderModelTable();
+        _renderCredTable();
     } catch (error) {
         showStatus(`加载统计数据失败: ${error.message}`, 'error');
-    }
-}
-
-async function resetStats() {
-    const mode = document.getElementById('statsModeSelect')?.value || 'geminicli';
-    const modeLabel = mode === 'antigravity' ? 'Antigravity' : 'GCLI';
-
-    if (!confirm(`确定要清零 ${modeLabel} 模式的所有统计数据吗？\n此操作不可恢复！`)) return;
-
-    try {
-        const response = await fetch(`./stats/reset?mode=${mode}`, {
-            method: 'POST',
-            headers: getAuthHeaders()
-        });
-        const data = await response.json();
-
-        if (data.success) {
-            showStatus('统计数据已清零', 'success');
-            await loadStats();
-        } else {
-            showStatus(`清零失败: ${data.message || '未知错误'}`, 'error');
-        }
-    } catch (error) {
-        showStatus(`清零失败: ${error.message}`, 'error');
     }
 }
 
