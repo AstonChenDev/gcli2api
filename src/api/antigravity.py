@@ -230,6 +230,7 @@ async def stream_request(
         # 如果返回值是None，直接返回错误500
         log.error("[ANTIGRAVITY STREAM] 当前无可用凭证")
         stats_collector.record_request(model_name, "antigravity", False)
+        stats_collector.record_error_code(model_name, "antigravity", 0)
         yield Response(
             content=json.dumps({"error": "当前无可用凭证"}),
             status_code=500,
@@ -244,6 +245,7 @@ async def stream_request(
     if not access_token:
         log.error(f"[ANTIGRAVITY STREAM] No access token in credential: {current_file}")
         stats_collector.record_request(model_name, "antigravity", False)
+        stats_collector.record_error_code(model_name, "antigravity", 0)
         yield Response(
             content=json.dumps({"error": "凭证中没有访问令牌"}),
             status_code=500,
@@ -348,6 +350,7 @@ async def stream_request(
                             cooldown_until, mode="antigravity", model_name=model_name,
                             error_message=error_body
                         )
+                        stats_collector.record_error_code(model_name, "antigravity", status_code, error_body)
 
                         # 异步精化冷却时间（已禁用，直接使用默认冷却时间）
                         # if cooldown_until is not None and access_token and model_name:
@@ -371,6 +374,7 @@ async def stream_request(
                             # 不重试，直接返回原始错误
                             log.error(f"[ANTIGRAVITY STREAM] 达到最大重试次数或不应重试，返回原始错误")
                             stats_collector.record_request(model_name, "antigravity", False)
+                            stats_collector.record_error_code(model_name, "antigravity", status_code, error_body)
                             yield chunk
                             return
                     else:
@@ -382,6 +386,7 @@ async def stream_request(
                             error_message=error_body
                         )
                         stats_collector.record_request(model_name, "antigravity", False)
+                        stats_collector.record_error_code(model_name, "antigravity", status_code, error_body)
                         yield chunk
                         return
                 else:
@@ -424,6 +429,7 @@ async def stream_request(
                 else:
                     log.error(f"[ANTIGRAVITY STREAM] 空回复达到最大重试次数")
                     stats_collector.record_request(model_name, "antigravity", False)
+                    stats_collector.record_error_code(model_name, "antigravity", 0)
                     yield Response(
                         content=json.dumps({"error": "服务返回空回复"}),
                         status_code=500,
@@ -450,6 +456,7 @@ async def stream_request(
                         media_type="application/json"
                     )
                     stats_collector.record_request(model_name, "antigravity", False)
+                    stats_collector.record_error_code(model_name, "antigravity", 0)
                     return
                 continue  # 重试
 
@@ -472,11 +479,13 @@ async def stream_request(
                         media_type="application/json"
                     )
                 stats_collector.record_request(model_name, "antigravity", False)
+                stats_collector.record_error_code(model_name, "antigravity", status_code, error_body if 'error_body' in dir() else None)
                 return
 
     # 所有重试均已耗尽（for循环正常结束），返回最后记录的错误
     log.error("[ANTIGRAVITY STREAM] 所有重试均失败")
     stats_collector.record_request(model_name, "antigravity", False)
+    stats_collector.record_error_code(model_name, "antigravity", status_code, error_body if 'error_body' in dir() else None)
     if last_error_response:
         yield last_error_response
     else:
@@ -527,6 +536,7 @@ async def non_stream_request(
         # 如果返回值是None，直接返回错误500
         log.error("[ANTIGRAVITY] 当前无可用凭证")
         stats_collector.record_request(model_name, "antigravity", False)
+        stats_collector.record_error_code(model_name, "antigravity", 0)
         return Response(
             content=json.dumps({"error": "当前无可用凭证"}),
             status_code=500,
@@ -623,6 +633,7 @@ async def non_stream_request(
                     else:
                         log.error(f"[ANTIGRAVITY] 空回复达到最大重试次数")
                         stats_collector.record_request(model_name, "antigravity", False)
+                        stats_collector.record_error_code(model_name, "antigravity", 0)
                         return Response(
                             content=json.dumps({"error": "服务返回空回复"}),
                             status_code=500,
@@ -681,6 +692,7 @@ async def non_stream_request(
                         cooldown_until, mode="antigravity", model_name=model_name,
                         error_message=error_text
                     )
+                    stats_collector.record_error_code(model_name, "antigravity", status_code, error_text)
 
                     # 检查是否应该重试
                     should_retry = await handle_error_with_retry(
@@ -695,6 +707,7 @@ async def non_stream_request(
                         # 不重试，直接返回原始错误
                         log.error(f"[ANTIGRAVITY] 达到最大重试次数或不应重试，返回原始错误")
                         stats_collector.record_request(model_name, "antigravity", False)
+                        stats_collector.record_error_code(model_name, "antigravity", status_code, error_text)
                         return last_error_response
                 else:
                     # 错误码不在禁用码当中，直接返回，无需重试
@@ -705,6 +718,7 @@ async def non_stream_request(
                         error_message=error_text
                     )
                     stats_collector.record_request(model_name, "antigravity", False)
+                    stats_collector.record_error_code(model_name, "antigravity", status_code, error_text)
                     return last_error_response
             
             # 统一处理重试
@@ -721,6 +735,7 @@ async def non_stream_request(
                 if not switched:
                     log.error("[ANTIGRAVITY] 重试时无可用凭证或令牌")
                     stats_collector.record_request(model_name, "antigravity", False)
+                    stats_collector.record_error_code(model_name, "antigravity", 0)
                     return Response(
                         content=json.dumps({"error": "当前无可用凭证"}),
                         status_code=500,
@@ -738,6 +753,7 @@ async def non_stream_request(
                 # 所有重试都失败，返回最后一次的错误（如果有）或500错误
                 log.error(f"[ANTIGRAVITY] 所有重试均失败，最后异常: {e}")
                 stats_collector.record_request(model_name, "antigravity", False)
+                stats_collector.record_error_code(model_name, "antigravity", 0)
                 if last_error_response:
                     return last_error_response
                 else:
@@ -750,6 +766,7 @@ async def non_stream_request(
     # 所有重试都失败，返回最后一次的原始错误（如果有）或500错误
     log.error("[ANTIGRAVITY] 所有重试均失败")
     stats_collector.record_request(model_name, "antigravity", False)
+    stats_collector.record_error_code(model_name, "antigravity", status_code, error_text if 'error_text' in dir() else None)
     if last_error_response:
         return last_error_response
     else:

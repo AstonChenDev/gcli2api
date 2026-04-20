@@ -202,6 +202,33 @@ class PSQLManager:
         except Exception as e:
             log.debug(f"request_stats table may already exist (concurrent init): {e}")
 
+        # 错误码统计表
+        try:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS error_code_stats (
+                    id SERIAL PRIMARY KEY,
+                    model_name TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'geminicli',
+                    error_code INTEGER NOT NULL,
+                    time_bucket BIGINT NOT NULL DEFAULT 0,
+                    count BIGINT DEFAULT 0,
+                    last_description TEXT DEFAULT '',
+                    updated_at DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW()),
+                    UNIQUE(model_name, mode, error_code, time_bucket)
+                )
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_err_stats_mode ON error_code_stats(mode)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_err_stats_bucket ON error_code_stats(time_bucket)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_err_stats_code ON error_code_stats(error_code)
+            """)
+        except Exception as e:
+            log.debug(f"error_code_stats table may already exist (concurrent init): {e}")
+
         log.debug("PostgreSQL tables and indexes created")
 
     async def _ensure_schema_compatibility(self, conn: asyncpg.Connection) -> None:
@@ -234,6 +261,9 @@ class PSQLManager:
                 ("call_count", "INTEGER DEFAULT 0"),
                 ("created_at", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())"),
                 ("updated_at", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())"),
+            ],
+            "error_code_stats": [
+                ("last_description", "TEXT DEFAULT ''"),
             ],
         }
 
@@ -1340,9 +1370,13 @@ class PSQLManager:
                     await conn.execute(
                         "DELETE FROM request_stats WHERE mode = $1", mode
                     )
+                    await conn.execute(
+                        "DELETE FROM error_code_stats WHERE mode = $1", mode
+                    )
                 else:
                     await conn.execute("DELETE FROM credential_stats")
                     await conn.execute("DELETE FROM request_stats")
+                    await conn.execute("DELETE FROM error_code_stats")
             log.info(f"[STATS] Stats reset (mode={mode or 'all'})")
             return True
         except Exception as e:
@@ -1511,3 +1545,121 @@ class PSQLManager:
         except Exception as e:
             log.error(f"[STATS] Error getting request stats timeseries: {e}")
             return []
+
+    # ==================== 错误码统计 ====================
+
+    async def batch_upsert_error_code_stats(
+        self,
+        records: list,
+    ) -> None:
+        """
+        批量 upsert 错误码统计数据
+
+        Args:
+            records: [(model_name, mode, error_code, count, time_bucket, description), ...]
+        """
+        if not records:
+            return
+        self._ensure_initialized()
+
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.executemany("""
+                    INSERT INTO error_code_stats (model_name, mode, error_code, count, time_bucket, last_description, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW()))
+                    ON CONFLICT (model_name, mode, error_code, time_bucket)
+                    DO UPDATE SET
+                        count = error_code_stats.count + EXCLUDED.count,
+                        last_description = CASE
+                            WHEN EXCLUDED.last_description != '' THEN EXCLUDED.last_description
+                            ELSE error_code_stats.last_description
+                        END,
+                        updated_at = EXTRACT(EPOCH FROM NOW())
+                """, records)
+            log.debug(f"[STATS] Flushed {len(records)} error code stat records to DB")
+        except Exception as e:
+            log.error(f"[STATS] Error batch upserting error code stats: {e}")
+
+    async def get_error_code_stats(
+        self,
+        mode: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        获取错误码统计：按 error_code 汇总 + 按 model_name × error_code 明细
+        """
+        self._ensure_initialized()
+
+        where_parts = []
+        params = []
+        param_idx = 1
+        if mode:
+            where_parts.append(f"mode = ${param_idx}")
+            params.append(mode)
+            param_idx += 1
+        if start_time is not None:
+            where_parts.append(f"time_bucket >= ${param_idx}")
+            params.append(start_time)
+            param_idx += 1
+        if end_time is not None:
+            where_parts.append(f"time_bucket <= ${param_idx}")
+            params.append(end_time)
+            param_idx += 1
+
+        where_clause = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+        try:
+            async with self._pool.acquire() as conn:
+                # 构建子查询的 mode 过滤条件
+                mode_filter_sub = ""
+                sub_params = list(params)  # 复制主查询参数
+                if mode:
+                    sub_param_idx = param_idx
+                    mode_filter_sub = f" AND e2.mode = ${sub_param_idx}"
+                    sub_params.append(mode)
+
+                # 按 error_code 汇总，同时获取最新描述
+                summary_rows = await conn.fetch(f"""
+                    SELECT error_code, SUM(count) AS total_count,
+                           (SELECT e2.last_description FROM error_code_stats e2
+                            WHERE e2.error_code = e.error_code{mode_filter_sub}
+                              AND e2.last_description != ''
+                            ORDER BY e2.updated_at DESC LIMIT 1) AS last_description
+                    FROM error_code_stats e
+                    {where_clause}
+                    GROUP BY error_code
+                    ORDER BY total_count DESC
+                """, *sub_params)
+
+                # 按 model_name × error_code 明细
+                detail_rows = await conn.fetch(f"""
+                    SELECT model_name, error_code, SUM(count) AS total_count
+                    FROM error_code_stats
+                    {where_clause}
+                    GROUP BY model_name, error_code
+                    ORDER BY total_count DESC
+                """, *params)
+
+            return {
+                "summary": [
+                    {
+                        "error_code": r["error_code"],
+                        "count": r["total_count"],
+                        "description": r["last_description"] or "",
+                    }
+                    for r in summary_rows
+                ],
+                "by_model": [
+                    {
+                        "model_name": r["model_name"],
+                        "error_code": r["error_code"],
+                        "count": r["total_count"],
+                    }
+                    for r in detail_rows
+                ],
+            }
+        except Exception as e:
+            log.error(f"[STATS] Error getting error code stats: {e}")
+            return {"summary": [], "by_model": []}
+

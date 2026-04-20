@@ -2149,6 +2149,45 @@
                     </div>
                 </div>
 
+                <!-- ⚠️ 错误码分布 -->
+                <div id="statsErrorCodeSection" style="margin-bottom: 18px;">
+                    <h4 style="margin-bottom: 10px; font-size: 14px;">⚠️ 错误码分布 <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">（各错误码占比）</span></h4>
+                    <div style="display: flex; flex-direction: column; gap: 12px;">
+                        <div style="position: relative; background: var(--card-bg); border-radius: 10px; padding: 12px; border: 1px solid var(--border-color);">
+                            <canvas id="statsErrorCodeChart" style="max-height: 200px;"></canvas>
+                            <div id="statsErrorCodeChartEmpty" style="display: none; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px;">暂无错误数据 ✅</div>
+                        </div>
+                        <div style="overflow-x: auto;">
+                            <table id="statsErrorCodeTable" style="width: 100%; border-collapse: collapse; font-size: 12px;">
+                                <thead>
+                                    <tr style="border-bottom: 2px solid var(--border-color);">
+                                        <th style="text-align: left; padding: 8px;">错误码</th>
+                                        <th style="text-align: left; padding: 8px;">描述</th>
+                                        <th style="text-align: right; padding: 8px;">次数</th>
+                                        <th style="text-align: right; padding: 8px;">占比</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="statsErrorCodeBody">
+                                    <tr><td colspan="4" style="text-align: center; padding: 16px; color: var(--text-muted);">暂无错误数据 ✅</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 模型错误明细 -->
+                <div id="statsErrorByModelSection" style="margin-bottom: 18px;">
+                    <h4 style="margin-bottom: 8px; font-size: 14px;">🔍 模型错误明细 <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">（点击列头排序）</span></h4>
+                    <div style="overflow-x: auto; background: var(--card-bg); border-radius: 10px; padding: 8px 10px; border: 1px solid var(--border-color);">
+                        <table id="statsErrorByModelTable" style="width: 100%; border-collapse: collapse; font-size: 12px;">
+                            <thead id="statsErrorByModelHead"></thead>
+                            <tbody id="statsErrorByModelBody">
+                                <tr><td style="text-align: center; padding: 16px; color: var(--text-muted);">暂无模型错误数据</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <!-- API调用统计 -->
                 <h4 style="margin-bottom: 6px; font-size: 14px;">🔄 API 调用 <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">（含重试）</span></h4>
                 <div class="stats-container" id="statsGlobalContainer" style="margin-bottom: 20px;">

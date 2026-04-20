@@ -1043,6 +1043,8 @@ let _statsReqModelsData = [];
 let _statsModelSort = { key: 'total', dir: 'desc' };
 let _statsCredSort = { key: 'total', dir: 'desc' };
 let _statsReqModelSort = { key: 'total', dir: 'desc' };
+let _errorCodeByModelData = [];
+let _errorCodeByModelSort = { key: 'total', dir: 'desc' };
 
 function formatNumber(n) {
     if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
@@ -1267,9 +1269,248 @@ async function loadStats() {
 
         // 加载时间序列图表
         loadStatsTimeseries();
+        // 加载错误码分布
+        loadErrorCodeStats();
     } catch (error) {
         showStatus(`加载统计数据失败: ${error.message}`, 'error');
     }
+}
+
+
+// =====================================================================
+// ⚠️ 错误码分布
+// =====================================================================
+let _errorCodeChart = null;
+let _errorCodeData = [];
+
+const _errorCodeColors = [
+    '#ef4444', // red - 429
+    '#f97316', // orange - 503
+    '#eab308', // yellow - 500
+    '#6366f1', // indigo - 403
+    '#8b5cf6', // violet - 404
+    '#06b6d4', // cyan - 400
+    '#ec4899', // pink - 401
+    '#64748b', // slate - 0 (internal)
+    '#14b8a6', // teal
+    '#a855f7', // purple
+];
+
+async function loadErrorCodeStats() {
+    const mode = document.getElementById('statsModeSelect')?.value || 'geminicli';
+    const timeParams = _getStatsTimeParams();
+    let url = `./stats/error-codes?mode=${mode}`;
+    if (timeParams.start_time) url += `&start_time=${timeParams.start_time}`;
+    if (timeParams.end_time) url += `&end_time=${timeParams.end_time}`;
+    try {
+        const response = await fetch(url, { headers: getAuthHeaders() });
+        const data = await response.json();
+        _errorCodeData = data.summary || [];
+        _errorCodeByModelData = data.by_model || [];
+        _renderErrorCodeChart();
+        _renderErrorCodeTable();
+        _renderErrorCodeByModelTable();
+    } catch (e) {
+        console.error('Failed to load error code stats:', e);
+    }
+}
+
+function _renderErrorCodeChart() {
+    const canvas = document.getElementById('statsErrorCodeChart');
+    const emptyEl = document.getElementById('statsErrorCodeChartEmpty');
+    if (!canvas || typeof Chart === 'undefined') return;
+
+    if (!_errorCodeData.length) {
+        if (_errorCodeChart) { _errorCodeChart.destroy(); _errorCodeChart = null; }
+        canvas.style.display = 'none';
+        if (emptyEl) emptyEl.style.display = 'flex';
+        return;
+    }
+    canvas.style.display = '';
+    if (emptyEl) emptyEl.style.display = 'none';
+
+    const labels = _errorCodeData.map(d => d.error_code === 0 ? 'Internal Error' : `HTTP ${d.error_code}`);
+    const counts = _errorCodeData.map(d => d.count);
+    const colors = _errorCodeData.map((_, i) => _errorCodeColors[i % _errorCodeColors.length]);
+
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+                   window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const textColor = isDark ? 'rgba(255,255,255,0.65)' : 'rgba(0,0,0,0.55)';
+
+    if (_errorCodeChart) _errorCodeChart.destroy();
+
+    _errorCodeChart = new Chart(canvas, {
+        type: 'doughnut',
+        data: {
+            labels,
+            datasets: [{
+                data: counts,
+                backgroundColor: colors,
+                borderColor: isDark ? '#1e1e2e' : '#ffffff',
+                borderWidth: 2,
+                hoverOffset: 6,
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            cutout: '55%',
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: {
+                        color: textColor,
+                        usePointStyle: true,
+                        pointStyle: 'circle',
+                        padding: 12,
+                        font: { size: 11, family: "'Inter', 'SF Pro Display', system-ui, sans-serif" },
+                    },
+                },
+                tooltip: {
+                    backgroundColor: isDark ? 'rgba(30, 30, 46, 0.95)' : 'rgba(255, 255, 255, 0.95)',
+                    titleColor: isDark ? '#e0e0e0' : '#333',
+                    bodyColor: isDark ? '#ccc' : '#555',
+                    borderColor: isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)',
+                    borderWidth: 1,
+                    cornerRadius: 8,
+                    padding: 10,
+                    callbacks: {
+                        label: ctx => {
+                            const total = counts.reduce((a, b) => a + b, 0);
+                            const pct = total > 0 ? (ctx.parsed / total * 100).toFixed(1) : '0';
+                            return ` ${ctx.label}: ${ctx.parsed} 次 (${pct}%)`;
+                        }
+                    }
+                }
+            },
+            animation: { duration: 500, easing: 'easeInOutQuart' },
+        }
+    });
+}
+
+function _renderErrorCodeTable() {
+    const body = document.getElementById('statsErrorCodeBody');
+    if (!body) return;
+
+    if (!_errorCodeData.length) {
+        body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:20px;color:var(--text-muted);">暂无错误数据 ✅</td></tr>';
+        return;
+    }
+
+    const total = _errorCodeData.reduce((sum, d) => sum + d.count, 0);
+
+    body.innerHTML = _errorCodeData.map((d, i) => {
+        const pct = total > 0 ? (d.count / total * 100).toFixed(1) : '0';
+        const color = _errorCodeColors[i % _errorCodeColors.length];
+        const codeLabel = d.error_code === 0 ? 'Internal' : String(d.error_code);
+        const descLabel = d.label || (d.error_code === 0 ? 'Internal Error' : `HTTP ${d.error_code}`);
+        return `<tr style="border-bottom:1px solid var(--border-color);">
+            <td style="padding:10px 12px;font-weight:600;">
+                <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};margin-right:6px;vertical-align:middle;"></span>${codeLabel}
+            </td>
+            <td style="padding:10px 12px;color:var(--text-muted);">${descLabel}</td>
+            <td style="text-align:right;padding:10px 12px;font-weight:500;">${formatNumber(d.count)}</td>
+            <td style="text-align:right;padding:10px 12px;">
+                <div style="display:flex;align-items:center;justify-content:flex-end;gap:6px;">
+                    <div style="width:60px;height:6px;border-radius:3px;background:var(--border-color);overflow:hidden;">
+                        <div style="width:${pct}%;height:100%;border-radius:3px;background:${color};"></div>
+                    </div>
+                    <span style="font-weight:500;min-width:42px;text-align:right;">${pct}%</span>
+                </div>
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+function _sortErrorByModel(key) {
+    if (_errorCodeByModelSort.key === key) {
+        _errorCodeByModelSort.dir = _errorCodeByModelSort.dir === 'asc' ? 'desc' : 'asc';
+    } else {
+        _errorCodeByModelSort = { key, dir: 'desc' };
+    }
+    _renderErrorCodeByModelTable();
+}
+
+function _renderErrorCodeByModelTable() {
+    const body = document.getElementById('statsErrorByModelBody');
+    const thead = document.getElementById('statsErrorByModelHead');
+    if (!body || !thead) return;
+
+    if (!_errorCodeByModelData.length) {
+        thead.innerHTML = '';
+        body.innerHTML = '<tr><td colspan="1" style="text-align:center;padding:20px;color:var(--text-muted);">暂无模型错误数据</td></tr>';
+        return;
+    }
+
+    // 收集所有唯一的 error_code，建立 code → label 映射
+    const errorCodes = [...new Set(_errorCodeByModelData.map(d => d.error_code))].sort((a, b) => a - b);
+    const codeLabelMap = {};
+    _errorCodeData.forEach(d => {
+        codeLabelMap[d.error_code] = d.label || (d.error_code === 0 ? 'Internal' : `HTTP ${d.error_code}`);
+    });
+
+    // 按模型聚合: { model: { code: count, ... } }
+    const modelMap = {};
+    _errorCodeByModelData.forEach(d => {
+        if (!modelMap[d.model_name]) modelMap[d.model_name] = {};
+        modelMap[d.model_name][d.error_code] = (modelMap[d.model_name][d.error_code] || 0) + d.count;
+    });
+
+    // 生成行数据
+    let rows = Object.entries(modelMap).map(([model, codes]) => {
+        const total = Object.values(codes).reduce((a, b) => a + b, 0);
+        return { model, codes, total };
+    });
+
+    // 排序
+    const sortKey = _errorCodeByModelSort.key;
+    const sortDir = _errorCodeByModelSort.dir;
+    rows.sort((a, b) => {
+        let va, vb;
+        if (sortKey === 'model') {
+            va = a.model.toLowerCase(); vb = b.model.toLowerCase();
+            return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+        }
+        if (sortKey === 'total') {
+            va = a.total; vb = b.total;
+        } else {
+            // sortKey is an error code number
+            const code = Number(sortKey);
+            va = a.codes[code] || 0;
+            vb = b.codes[code] || 0;
+        }
+        return sortDir === 'asc' ? va - vb : vb - va;
+    });
+
+    const arrow = (key) => {
+        if (_errorCodeByModelSort.key !== key) return '';
+        return _errorCodeByModelSort.dir === 'asc' ? ' ↑' : ' ↓';
+    };
+    const thStyle = 'padding:8px 10px;cursor:pointer;white-space:nowrap;user-select:none;';
+
+    // 表头
+    thead.innerHTML = `<tr style="border-bottom:2px solid var(--border-color);">
+        <th style="${thStyle}text-align:left;min-width:120px;" onclick="_sortErrorByModel('model')">模型${arrow('model')}</th>
+        ${errorCodes.map(code => {
+            const shortLabel = code === 0 ? 'Internal' : String(code);
+            return `<th style="${thStyle}text-align:center;" onclick="_sortErrorByModel('${code}')" title="${codeLabelMap[code] || ''}">${shortLabel}${arrow(String(code))}</th>`;
+        }).join('')}
+        <th style="${thStyle}text-align:right;" onclick="_sortErrorByModel('total')">合计${arrow('total')}</th>
+    </tr>`;
+
+    // 表体
+    const grandTotal = rows.reduce((s, r) => s + r.total, 0);
+    body.innerHTML = rows.map(r => {
+        return `<tr style="border-bottom:1px solid var(--border-color);">
+            <td style="padding:8px 10px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px;" title="${r.model}">${r.model}</td>
+            ${errorCodes.map(code => {
+                const cnt = r.codes[code] || 0;
+                const bg = cnt > 0 ? 'background:rgba(239,68,68,0.08);' : '';
+                return `<td style="text-align:center;padding:8px 10px;${bg}">${cnt > 0 ? formatNumber(cnt) : '<span style="color:var(--text-muted)">-</span>'}</td>`;
+            }).join('')}
+            <td style="text-align:right;padding:8px 10px;font-weight:600;">${formatNumber(r.total)}</td>
+        </tr>`;
+    }).join('');
 }
 
 

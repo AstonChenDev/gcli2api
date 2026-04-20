@@ -80,6 +80,68 @@ async def get_credential_stats(
         log.error(f"[STATS API] Error getting credential stats: {e}")
         return {"filename": filename, "models": []}
 
+# HTTP 错误码描述映射（仅作为回退）
+_ERROR_CODE_LABELS = {
+    0: "Internal Error",
+    400: "Bad Request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not Found",
+    429: "Rate Limited",
+    500: "Server Error",
+    503: "Service Unavailable",
+}
+
+
+def _extract_short_description(raw_desc: str, max_len: int = 120) -> str:
+    """从上游原始错误响应中提取简短描述"""
+    if not raw_desc:
+        return ""
+    # 尝试解析 JSON 格式的错误体
+    try:
+        import json
+        data = json.loads(raw_desc)
+        # Google API 通常返回 {"error": {"message": "...", "status": "..."}}
+        err = data.get("error", {})
+        if isinstance(err, dict):
+            msg = err.get("message", "") or err.get("status", "")
+            if msg:
+                return msg[:max_len]
+        # 有些返回 {"error": "string"}
+        if isinstance(err, str) and err:
+            return err[:max_len]
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    # 非 JSON，直接截断
+    return raw_desc[:max_len]
+
+
+@router.get("/error-codes")
+async def get_error_code_stats(
+    mode: str = "geminicli",
+    start_time: Optional[int] = Query(None, description="起始时间 epoch 秒"),
+    end_time: Optional[int] = Query(None, description="结束时间 epoch 秒"),
+    _=Depends(verify_panel_token),
+):
+    """获取错误码分布统计"""
+    try:
+        from src.storage_adapter import get_storage_adapter
+        adapter = await get_storage_adapter()
+        if hasattr(adapter._backend, 'get_error_code_stats'):
+            data = await adapter._backend.get_error_code_stats(
+                mode=mode, start_time=start_time, end_time=end_time
+            )
+            # 补充 label：优先使用上游描述，回退到硬编码
+            for item in data.get("summary", []):
+                code = item["error_code"]
+                upstream_desc = _extract_short_description(item.get("description", ""))
+                item["label"] = upstream_desc or _ERROR_CODE_LABELS.get(code, f"HTTP {code}")
+            return data
+        return {"summary": [], "by_model": []}
+    except Exception as e:
+        log.error(f"[STATS API] Error getting error code stats: {e}")
+        return {"summary": [], "by_model": []}
+
 
 @router.post("/reset")
 async def reset_stats(mode: str = None, _=Depends(verify_panel_token)):
@@ -96,3 +158,4 @@ async def reset_stats(mode: str = None, _=Depends(verify_panel_token)):
     except Exception as e:
         log.error(f"[STATS API] Error resetting stats: {e}")
         return {"success": False, "message": str(e)}
+

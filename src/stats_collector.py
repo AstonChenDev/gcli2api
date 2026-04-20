@@ -6,7 +6,7 @@
 import asyncio
 import os
 import time as _time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from log import log
 
@@ -30,6 +30,9 @@ class StatsCollector:
         # 请求级统计 key: (model_name, mode)
         # value: {"total": int, "success": int, "fail": int}
         self._request_counters: Dict[Tuple[str, str], Dict[str, int]] = {}
+        # 错误码统计 key: (model_name, mode, error_code)
+        # value: {"count": int, "desc": str}  (desc 保留最近一次的上游描述)
+        self._error_code_counters: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
         self._flush_task: Optional[asyncio.Task] = None
         self._running = False
 
@@ -96,6 +99,33 @@ class StatsCollector:
         else:
             entry["fail"] += 1
 
+    def record_error_code(
+        self,
+        model_name: Optional[str],
+        mode: str,
+        error_code: int,
+        error_description: Optional[str] = None,
+    ) -> None:
+        """
+        记录一次错误码 — 纯内存操作，无 IO
+
+        Args:
+            model_name: 模型名
+            mode: geminicli 或 antigravity
+            error_code: HTTP 状态码（0 表示内部错误/无状态码）
+            error_description: 上游返回的错误描述文本（可选）
+        """
+        model_name = model_name or "unknown"
+        key = (model_name, mode, error_code)
+        entry = self._error_code_counters.get(key)
+        if entry is None:
+            self._error_code_counters[key] = {"count": 1, "desc": error_description or ""}
+        else:
+            entry["count"] += 1
+            # 始终更新为最新的描述（如果有的话）
+            if error_description:
+                entry["desc"] = error_description
+
     async def flush(self) -> None:
         """
         原子交换计数器 + 批量写入 DB
@@ -107,6 +137,8 @@ class StatsCollector:
         data, self._counters = self._counters, {}
         # 原子交换 - 请求级
         req_data, self._request_counters = self._request_counters, {}
+        # 原子交换 - 错误码
+        err_data, self._error_code_counters = self._error_code_counters, {}
 
         # 凭证级统计刷盘
         if data:
@@ -155,6 +187,29 @@ class StatsCollector:
                         entry["total"] += vals["total"]
                         entry["success"] += vals["success"]
                         entry["fail"] += vals["fail"]
+
+        # 错误码统计刷盘
+        if err_data:
+            bucket = int(_time.time()) // 60 * 60
+            err_records = [
+                (key[0], key[1], key[2], vals["count"], bucket, vals.get("desc", ""))
+                for key, vals in err_data.items()
+            ]
+            try:
+                from src.storage_adapter import get_storage_adapter
+                adapter = await get_storage_adapter()
+                if hasattr(adapter, '_backend') and hasattr(adapter._backend, 'batch_upsert_error_code_stats'):
+                    await adapter._backend.batch_upsert_error_code_stats(err_records)
+            except Exception as e:
+                log.error(f"[STATS] Error code stats flush failed: {e}")
+                for key, vals in err_data.items():
+                    entry = self._error_code_counters.get(key)
+                    if entry is None:
+                        self._error_code_counters[key] = vals
+                    else:
+                        entry["count"] += vals["count"]
+                        if vals.get("desc"):
+                            entry["desc"] = vals["desc"]
 
     async def _flush_loop(self) -> None:
         """定时刷盘循环"""
