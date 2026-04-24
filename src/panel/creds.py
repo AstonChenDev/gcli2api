@@ -279,6 +279,7 @@ async def get_creds_status_common(
             "backend_type": backend_type,
             "model_cooldowns": summary.get("model_cooldowns", {}),
             "tier": summary.get("tier", "pro"),
+            "test_result": summary.get("test_result"),
         }
 
         if mode == "geminicli":
@@ -1547,11 +1548,12 @@ async def test_credential(
 
         if status_code == 200 or status_code == 429:
             log.info(f"凭证测试成功: {filename} (mode={mode}, model={test_model}, status={status_code})")
-            # 测试成功时清除错误状态
+            # 测试成功时清除错误状态并保存测试结果
             if status_code == 200:
                 await storage_adapter.update_credential_state(filename, {
                     "error_codes": [],
-                    "error_messages": {}
+                    "error_messages": {},
+                    "test_result": "success"
                 }, mode=mode)
 
                 # 如果是 geminicli 模式且第一次测试成功，继续测试 gemini-3-flash-preview
@@ -1594,44 +1596,41 @@ async def test_credential(
                     except Exception as e:
                         log.error(f"Preview 模型测试异常: {filename} - {e}")
 
-            # 返回成功响应
+            else:
+                # 429 限流但凭证有效，仅保存测试结果
+                await storage_adapter.update_credential_state(filename, {
+                    "test_result": "success"
+                }, mode=mode)
+
+            # 返回成功响应（统一使用 HTTP 200，真实状态码放在 JSON body 中）
             return JSONResponse(
-                status_code=status_code,
+                status_code=200,
                 content={
                     "success": True,
                     "status_code": status_code,
-                    "message": "测试成功",
+                    "message": "测试成功" if status_code == 200 else "凭证有效但被限流(429)",
                     "filename": filename
                 }
             )
         else:
             log.warning(f"凭证测试失败: {filename} (mode={mode}, status={status_code})")
-            # 测试失败时保存错误码和错误消息（覆盖模式，只保存最新的一个错误）
+            error_text = response.text if hasattr(response, 'text') else ""
+
+            # 打印详细错误内容到日志
+            log.error(f"凭证测试错误详情 - 文件: {filename}, 模式: {mode}, 状态码: {status_code}, 错误内容: {error_text}")
+
+            # 仅保存测试结果到独立字段，不覆盖生产 error_codes（避免与并发请求冲突）
             try:
-                error_text = response.text if hasattr(response, 'text') else ""
-
-                # 打印详细错误内容到日志
-                log.error(f"凭证测试错误详情 - 文件: {filename}, 模式: {mode}, 状态码: {status_code}, 错误内容: {error_text}")
-
-                # 使用覆盖模式保存错误（与 credential_manager 保持一致）
-                error_codes = [status_code]
-                error_messages = {str(status_code): error_text if error_text else f"HTTP {status_code}"}
-
-                # 更新状态
                 await storage_adapter.update_credential_state(filename, {
-                    "error_codes": error_codes,
-                    "error_messages": error_messages
+                    "test_result": f"fail:{status_code}"
                 }, mode=mode)
-
-                log.info(f"已保存测试错误信息: {filename} - 错误码 {status_code}")
+                log.info(f"已保存测试结果: {filename} - fail:{status_code}")
             except Exception as e:
-                log.error(f"保存测试错误信息失败: {e}")
+                log.error(f"保存测试结果失败: {e}")
 
-        # 返回错误响应，包含完整的错误信息
-        error_text = response.text if hasattr(response, 'text') else ""
-
+        # 返回错误响应（统一使用 HTTP 200，真实上游错误码放在 JSON body 中）
         return JSONResponse(
-            status_code=status_code,
+            status_code=200,
             content={
                 "success": False,
                 "status_code": status_code,

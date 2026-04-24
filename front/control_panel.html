@@ -2036,6 +2036,8 @@
                             disabled>批量删除</button>
                         <button class="batch-btn" style="background-color: #ff9800;" id="batchVerifyBtn"
                             onclick="batchVerifyProjectIds()" disabled>批量检验</button>
+                        <button class="batch-btn" style="background-color: #00acc1;" id="batchTestBtn"
+                            onclick="batchTestCredentials()" disabled>批量消息测试</button>
                         <button class="batch-btn" style="background-color: #9c27b0;" id="batchPreviewBtn"
                             onclick="batchConfigurePreview()" disabled>批量设置预览</button>
                         <button class="batch-btn" style="background-color: #ea580c;" id="batchClearCooldownBtn"
@@ -2192,6 +2194,8 @@
                             onclick="batchAntigravityAction('delete')" disabled>批量删除</button>
                         <button class="batch-btn" style="background-color: #ff9800;" id="antigravityBatchVerifyBtn"
                             onclick="batchVerifyAntigravityProjectIds()" disabled>批量检验</button>
+                        <button class="batch-btn" style="background-color: #00acc1;" id="antigravityBatchTestBtn"
+                            onclick="batchTestAntigravityCredentials()" disabled>批量消息测试</button>
                         <button class="batch-btn" style="background-color: #20c997;" id="antigravityBatchEnableCreditBtn"
                             onclick="batchAntigravityAction('enable_credit')" disabled>批量开启Credit</button>
                         <button class="batch-btn" style="background-color: #6c757d;" id="antigravityBatchDisableCreditBtn"
@@ -2888,7 +2892,7 @@
     <!-- Chart.js CDN -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <!-- 引入公共JavaScript模块 -->
-    <script src="./front/common.js"></script>
+    <script src="./front/common.js?v=20260423"></script>
 
 </body>
 

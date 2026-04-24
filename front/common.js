@@ -127,7 +127,8 @@ function createCredsManager(type) {
                             model_cooldowns: item.model_cooldowns || {},
                             preview: item.preview,
                             tier: item.tier || 'pro',
-                            enable_credit: !!item.enable_credit
+                            enable_credit: !!item.enable_credit,
+                            test_result: item.test_result || null
                         };
                     });
 
@@ -255,7 +256,7 @@ function createCredsManager(type) {
             const selectedCount = this.selectedFiles.size;
             document.getElementById(this.getElementId('SelectedCount')).textContent = `已选择 ${selectedCount} 项`;
 
-            const batchBtns = ['Enable', 'Disable', 'Delete', 'Verify', 'Preview', 'EnableCredit', 'DisableCredit', 'ClearCooldown'].map(action =>
+            const batchBtns = ['Enable', 'Disable', 'Delete', 'Verify', 'Preview', 'Test', 'EnableCredit', 'DisableCredit', 'ClearCooldown'].map(action =>
                 document.getElementById(this.getElementId(`Batch${action}Btn`))
             );
             batchBtns.forEach(btn => btn && (btn.disabled = selectedCount === 0));
@@ -641,6 +642,19 @@ function createCredCard(credInfo, manager) {
         }
     } else {
         statusBadges += '<span class="status-badge" style="background-color: #28a745; color: white;">无错误</span>';
+    }
+
+    // 测试结果 badge（常驻显示）
+    const testResult = credInfo.test_result;
+    if (testResult === 'success') {
+        statusBadges += '<span class="status-badge test-result-badge" data-test-filename="' + filename + '" style="background-color: #28a745; color: white;" title="消息测试通过">🧪 测试通过</span>';
+    } else if (testResult && testResult.startsWith('fail:')) {
+        const failCode = testResult.split(':')[1];
+        const badgeColor = failCode === '429' ? '#ff9800' : '#dc3545';
+        const badgeText = failCode === '429' ? '🧪 限流(' + failCode + ')' : '🧪 失败(' + failCode + ')';
+        statusBadges += '<span class="status-badge test-result-badge" data-test-filename="' + filename + '" style="background-color: ' + badgeColor + '; color: white;" title="消息测试失败: HTTP ' + failCode + '">' + badgeText + '</span>';
+    } else {
+        statusBadges += '<span class="status-badge test-result-badge" data-test-filename="' + filename + '" style="background-color: #6c757d; color: white;" title="尚未进行消息测试">🧪 未测试</span>';
     }
 
     // Preview状态显示 (仅对geminicli模式显示)
@@ -2381,33 +2395,40 @@ async function testCredential(filename) {
         // 解析JSON响应
         const data = await response.json();
 
-        if (response.status === 200) {
+        if (data.success) {
             // 凭证可用
             const successMsg = `✅ 测试成功！\n文件: ${filename}\n状态: ${data.message || '凭证可用'} (${data.status_code || 200})`;
             showStatus('✅ 测试成功！', 'success');
             showMessageModal('测试成功', successMsg, 'success');
-            await AppState.creds.refresh();
+            // 就地更新卡片 badge，不调 refresh
+            updateTestResultBadge(filename, 'success');
         }
         else {
-            // 其他错误 - 显示完整错误信息
-            let errorDetails = `❌ 测试失败\n文件: ${filename}\n`;
+            // 其他错误 - 使用 data.status_code（真实上游错误码）
+            const realStatusCode = data.status_code || 'unknown';
+            let errorMsg = '';
+            let errorDetails = `❌ 测试失败\n文件: ${filename}\n错误码: ${realStatusCode}\n`;
 
-            // 如果有完整的错误响应，添加到详情中
             if (data.error) {
                 try {
-                    // 尝试格式化JSON错误
                     const errorObj = JSON.parse(data.error);
-                    errorDetails += `\n错误详情:\n${JSON.stringify(errorObj, null, 2)}`;
+                    // 提取可读的错误信息
+                    errorMsg = errorObj?.error?.message || errorObj?.message || errorObj?.error?.status || '';
+                    errorDetails += `\n错误信息: ${errorMsg || '无'}\n\n错误详情:\n${JSON.stringify(errorObj, null, 2)}`;
                 } catch {
-                    // 如果不是JSON，直接显示文本
+                    errorMsg = data.error.substring(0, 200);
                     errorDetails += `\n错误详情:\n${data.error}`;
                 }
             } else {
-                errorDetails += `错误码: ${data.status_code || response.status}`;
+                errorMsg = data.message || '';
+                errorDetails += `错误信息: ${errorMsg || 'HTTP ' + realStatusCode}`;
             }
 
-            showStatus(`❌ 测试失败 - ${data.message || '错误码: ' + (data.status_code || response.status)}`, 'error');
+            const statusText = errorMsg ? `❌ 测试失败(${realStatusCode}): ${errorMsg}` : `❌ 测试失败 - 错误码: ${realStatusCode}`;
+            showStatus(statusText, 'error');
             showMessageModal('测试失败', errorDetails, 'error');
+            // 就地更新卡片 badge
+            updateTestResultBadge(filename, `fail:${realStatusCode}`);
         }
     } catch (error) {
         const errorMsg = `测试失败: ${error.message}`;
@@ -2429,39 +2450,67 @@ async function testAntigravityCredential(filename) {
         // 解析JSON响应
         const data = await response.json();
 
-        if (response.status === 200) {
+        if (data.success) {
             // 凭证可用
             const successMsg = `✅ 测试成功！\n文件: ${filename}\n状态: ${data.message || 'Antigravity凭证可用'} (${data.status_code || 200})`;
             showStatus('✅ 测试成功！', 'success');
             showMessageModal('测试成功', successMsg, 'success');
-            await AppState.antigravityCreds.refresh();
+            // 就地更新卡片 badge，不调 refresh
+            updateTestResultBadge(filename, 'success');
         }
         else {
-            // 其他错误 - 显示完整错误信息
-            let errorDetails = `❌ 测试失败\n文件: ${filename}\n`;
+            // 其他错误 - 使用 data.status_code（真实上游错误码）
+            const realStatusCode = data.status_code || 'unknown';
+            let errorMsg = '';
+            let errorDetails = `❌ 测试失败\n文件: ${filename}\n错误码: ${realStatusCode}\n`;
 
-            // 如果有完整的错误响应，添加到详情中
             if (data.error) {
                 try {
-                    // 尝试格式化JSON错误
                     const errorObj = JSON.parse(data.error);
-                    errorDetails += `\n错误详情:\n${JSON.stringify(errorObj, null, 2)}`;
+                    // 提取可读的错误信息
+                    errorMsg = errorObj?.error?.message || errorObj?.message || errorObj?.error?.status || '';
+                    errorDetails += `\n错误信息: ${errorMsg || '无'}\n\n错误详情:\n${JSON.stringify(errorObj, null, 2)}`;
                 } catch {
-                    // 如果不是JSON，直接显示文本
+                    errorMsg = data.error.substring(0, 200);
                     errorDetails += `\n错误详情:\n${data.error}`;
                 }
             } else {
-                errorDetails += `错误码: ${data.status_code || response.status}`;
+                errorMsg = data.message || '';
+                errorDetails += `错误信息: ${errorMsg || 'HTTP ' + realStatusCode}`;
             }
 
-            showStatus(`❌ 测试失败 - ${data.message || '错误码: ' + (data.status_code || response.status)}`, 'error');
+            const statusText = errorMsg ? `❌ 测试失败(${realStatusCode}): ${errorMsg}` : `❌ 测试失败 - 错误码: ${realStatusCode}`;
+            showStatus(statusText, 'error');
             showMessageModal('测试失败', errorDetails, 'error');
+            // 就地更新卡片 badge
+            updateTestResultBadge(filename, `fail:${realStatusCode}`);
         }
     } catch (error) {
         const errorMsg = `测试失败: ${error.message}`;
         showStatus(`❌ ${errorMsg}`, 'error');
         showMessageModal('测试失败', `❌ ${errorMsg}`, 'error');
     }
+}
+
+// 就地更新凭证卡片的测试结果 badge
+function updateTestResultBadge(filename, result) {
+    const badges = document.querySelectorAll(`.test-result-badge[data-test-filename="${filename}"]`);
+    badges.forEach(badge => {
+        if (result === 'success') {
+            badge.textContent = '🧪 测试通过';
+            badge.style.backgroundColor = '#28a745';
+            badge.title = '消息测试通过';
+        } else if (result && result.startsWith('fail:')) {
+            const failCode = result.split(':')[1];
+            badge.textContent = failCode === '429' ? `🧪 限流(${failCode})` : `🧪 失败(${failCode})`;
+            badge.style.backgroundColor = failCode === '429' ? '#ff9800' : '#dc3545';
+            badge.title = `消息测试失败: HTTP ${failCode}`;
+        } else {
+            badge.textContent = '🧪 未测试';
+            badge.style.backgroundColor = '#6c757d';
+            badge.title = '尚未进行消息测试';
+        }
+    });
 }
 
 async function configurePreviewChannel(filename) {
@@ -2961,6 +3010,168 @@ async function batchVerifyAntigravityProjectIds() {
     } else {
         showStatus(`⚠️ 批量检验完成：成功 ${successCount}/${selectedFiles.length} 个，失败 ${failCount} 个`, 'info');
         showMessageModal('Antigravity批量检验完成', summary, 'info');
+    }
+
+    console.log(summary);
+}
+
+// 批量消息测试 - GCLI
+async function batchTestCredentials() {
+    const selectedFiles = Array.from(AppState.creds.selectedFiles);
+    if (selectedFiles.length === 0) {
+        showStatus('❌ 请先选择要测试的凭证', 'error');
+        showMessageModal('提示', '请先选择要测试的凭证', 'error');
+        return;
+    }
+
+    if (!confirm(`确定要批量消息测试 ${selectedFiles.length} 个凭证吗？\n\n将并行测试以加快速度。`)) {
+        return;
+    }
+
+    showStatus(`🧪 正在并行测试 ${selectedFiles.length} 个凭证，请稍候...`, 'info');
+
+    // 并行执行所有测试请求
+    const promises = selectedFiles.map(async (filename) => {
+        try {
+            const response = await fetch(`./creds/test/${encodeURIComponent(filename)}`, {
+                method: 'POST',
+                headers: getAuthHeaders()
+            });
+            const data = await response.json();
+
+            if (data.success) {
+                return {
+                    success: true,
+                    filename,
+                    statusCode: data.status_code,
+                    message: data.message
+                };
+            } else {
+                return {
+                    success: false,
+                    filename,
+                    statusCode: data.status_code,
+                    error: data.message || `HTTP ${data.status_code}`
+                };
+            }
+        } catch (error) {
+            return { success: false, filename, statusCode: null, error: error.message };
+        }
+    });
+
+    // 等待所有请求完成
+    const results = await Promise.all(promises);
+
+    // 统计结果并就地更新 badge
+    let successCount = 0;
+    let failCount = 0;
+    const resultMessages = [];
+
+    results.forEach(result => {
+        if (result.success) {
+            successCount++;
+            resultMessages.push(`✅ ${result.filename}: ${result.message || '测试通过'}`);
+            updateTestResultBadge(result.filename, 'success');
+        } else {
+            failCount++;
+            const code = result.statusCode || 'unknown';
+            resultMessages.push(`❌ ${result.filename}: ${result.error} (${code})`);
+            updateTestResultBadge(result.filename, `fail:${code}`);
+        }
+    });
+
+    const summary = `批量消息测试完成！\n\n成功: ${successCount} 个\n失败: ${failCount} 个\n总计: ${selectedFiles.length} 个\n\n详细结果:\n${resultMessages.join('\n')}`;
+
+    if (failCount === 0) {
+        showStatus(`✅ 全部测试成功！成功 ${successCount}/${selectedFiles.length} 个凭证`, 'success');
+        showMessageModal('批量消息测试完成', summary, 'success');
+    } else if (successCount === 0) {
+        showStatus(`❌ 全部测试失败！失败 ${failCount}/${selectedFiles.length} 个凭证`, 'error');
+        showMessageModal('批量消息测试完成', summary, 'error');
+    } else {
+        showStatus(`⚠️ 批量测试完成：成功 ${successCount}/${selectedFiles.length} 个，失败 ${failCount} 个`, 'info');
+        showMessageModal('批量消息测试完成', summary, 'info');
+    }
+
+    console.log(summary);
+}
+
+// 批量消息测试 - Antigravity
+async function batchTestAntigravityCredentials() {
+    const selectedFiles = Array.from(AppState.antigravityCreds.selectedFiles);
+    if (selectedFiles.length === 0) {
+        showStatus('❌ 请先选择要测试的Antigravity凭证', 'error');
+        showMessageModal('提示', '请先选择要测试的Antigravity凭证', 'error');
+        return;
+    }
+
+    if (!confirm(`确定要批量消息测试 ${selectedFiles.length} 个Antigravity凭证吗？\n\n将并行测试以加快速度。`)) {
+        return;
+    }
+
+    showStatus(`🧪 正在并行测试 ${selectedFiles.length} 个Antigravity凭证，请稍候...`, 'info');
+
+    // 并行执行所有测试请求
+    const promises = selectedFiles.map(async (filename) => {
+        try {
+            const response = await fetch(`./creds/test/${encodeURIComponent(filename)}?mode=antigravity`, {
+                method: 'POST',
+                headers: getAuthHeaders()
+            });
+            const data = await response.json();
+
+            if (data.success) {
+                return {
+                    success: true,
+                    filename,
+                    statusCode: data.status_code,
+                    message: data.message
+                };
+            } else {
+                return {
+                    success: false,
+                    filename,
+                    statusCode: data.status_code,
+                    error: data.message || `HTTP ${data.status_code}`
+                };
+            }
+        } catch (error) {
+            return { success: false, filename, statusCode: null, error: error.message };
+        }
+    });
+
+    // 等待所有请求完成
+    const results = await Promise.all(promises);
+
+    // 统计结果并就地更新 badge
+    let successCount = 0;
+    let failCount = 0;
+    const resultMessages = [];
+
+    results.forEach(result => {
+        if (result.success) {
+            successCount++;
+            resultMessages.push(`✅ ${result.filename}: ${result.message || '测试通过'}`);
+            updateTestResultBadge(result.filename, 'success');
+        } else {
+            failCount++;
+            const code = result.statusCode || 'unknown';
+            resultMessages.push(`❌ ${result.filename}: ${result.error} (${code})`);
+            updateTestResultBadge(result.filename, `fail:${code}`);
+        }
+    });
+
+    const summary = `Antigravity批量消息测试完成！\n\n成功: ${successCount} 个\n失败: ${failCount} 个\n总计: ${selectedFiles.length} 个\n\n详细结果:\n${resultMessages.join('\n')}`;
+
+    if (failCount === 0) {
+        showStatus(`✅ 全部测试成功！成功 ${successCount}/${selectedFiles.length} 个Antigravity凭证`, 'success');
+        showMessageModal('Antigravity批量消息测试完成', summary, 'success');
+    } else if (successCount === 0) {
+        showStatus(`❌ 全部测试失败！失败 ${failCount}/${selectedFiles.length} 个Antigravity凭证`, 'error');
+        showMessageModal('Antigravity批量消息测试完成', summary, 'error');
+    } else {
+        showStatus(`⚠️ 批量测试完成：成功 ${successCount}/${selectedFiles.length} 个，失败 ${failCount} 个`, 'info');
+        showMessageModal('Antigravity批量消息测试完成', summary, 'info');
     }
 
     console.log(summary);

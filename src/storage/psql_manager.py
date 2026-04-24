@@ -27,6 +27,7 @@ class PSQLManager:
         "preview",
         "tier",
         "enable_credit",
+        "test_result",
     }
 
     def __init__(self):
@@ -88,6 +89,7 @@ class PSQLManager:
                 model_cooldowns TEXT DEFAULT '{}',
                 preview INTEGER DEFAULT 1,
                 tier TEXT DEFAULT 'pro',
+                test_result TEXT,
 
                 rotation_order INTEGER DEFAULT 0,
                 call_count INTEGER DEFAULT 0,
@@ -112,6 +114,7 @@ class PSQLManager:
                 model_cooldowns TEXT DEFAULT '{}',
                 tier TEXT DEFAULT 'pro',
                 enable_credit INTEGER DEFAULT 0,
+                test_result TEXT,
 
                 rotation_order INTEGER DEFAULT 0,
                 call_count INTEGER DEFAULT 0,
@@ -247,6 +250,7 @@ class PSQLManager:
                 ("call_count", "INTEGER DEFAULT 0"),
                 ("created_at", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())"),
                 ("updated_at", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())"),
+                ("test_result", "TEXT"),
             ],
             "antigravity_credentials": [
                 ("disabled", "INTEGER DEFAULT 0"),
@@ -261,6 +265,7 @@ class PSQLManager:
                 ("call_count", "INTEGER DEFAULT 0"),
                 ("created_at", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())"),
                 ("updated_at", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())"),
+                ("test_result", "TEXT"),
             ],
             "error_code_stats": [
                 ("last_description", "TEXT DEFAULT ''"),
@@ -622,7 +627,7 @@ class PSQLManager:
             async with self._pool.acquire() as conn:
                 if mode == "geminicli":
                     row = await conn.fetchrow(f"""
-                        SELECT disabled, error_codes, last_success, user_email, model_cooldowns, preview, tier
+                        SELECT disabled, error_codes, last_success, user_email, model_cooldowns, preview, tier, test_result
                         FROM {table_name} WHERE filename = $1
                     """, filename)
 
@@ -635,6 +640,7 @@ class PSQLManager:
                             "model_cooldowns": json.loads(row["model_cooldowns"] or "{}"),
                             "preview": bool(row["preview"]) if row["preview"] is not None else True,
                             "tier": row["tier"] if row["tier"] is not None else "pro",
+                            "test_result": row["test_result"],
                         }
 
                     return {
@@ -645,10 +651,11 @@ class PSQLManager:
                         "model_cooldowns": {},
                         "preview": True,
                         "tier": "pro",
+                        "test_result": None,
                     }
                 else:
                     row = await conn.fetchrow(f"""
-                        SELECT disabled, error_codes, last_success, user_email, model_cooldowns, tier, enable_credit
+                        SELECT disabled, error_codes, last_success, user_email, model_cooldowns, tier, enable_credit, test_result
                         FROM {table_name} WHERE filename = $1
                     """, filename)
 
@@ -661,6 +668,7 @@ class PSQLManager:
                             "model_cooldowns": json.loads(row["model_cooldowns"] or "{}"),
                             "tier": row["tier"] if row["tier"] is not None else "pro",
                             "enable_credit": bool(row["enable_credit"]) if row["enable_credit"] is not None else False,
+                            "test_result": row["test_result"],
                         }
 
                     return {
@@ -671,6 +679,7 @@ class PSQLManager:
                         "model_cooldowns": {},
                         "tier": "pro",
                         "enable_credit": False,
+                        "test_result": None,
                     }
 
         except Exception as e:
@@ -689,7 +698,7 @@ class PSQLManager:
                 if mode == "geminicli":
                     rows = await conn.fetch(f"""
                         SELECT filename, disabled, error_codes, last_success,
-                               user_email, model_cooldowns, preview, tier
+                               user_email, model_cooldowns, preview, tier, test_result
                         FROM {table_name}
                     """)
 
@@ -707,12 +716,13 @@ class PSQLManager:
                             "model_cooldowns": model_cooldowns,
                             "preview": bool(row["preview"]) if row["preview"] is not None else True,
                             "tier": row["tier"] if row["tier"] is not None else "pro",
+                            "test_result": row["test_result"],
                         }
                     return states
                 else:
                     rows = await conn.fetch(f"""
                         SELECT filename, disabled, error_codes, last_success,
-                               user_email, model_cooldowns, tier, enable_credit
+                               user_email, model_cooldowns, tier, enable_credit, test_result
                         FROM {table_name}
                     """)
 
@@ -730,6 +740,7 @@ class PSQLManager:
                             "model_cooldowns": model_cooldowns,
                             "tier": row["tier"] if row["tier"] is not None else "pro",
                             "enable_credit": bool(row["enable_credit"]) if row["enable_credit"] is not None else False,
+                            "test_result": row["test_result"],
                         }
                     return states
 
@@ -781,7 +792,7 @@ class PSQLManager:
                 if mode == "geminicli":
                     all_rows = await conn.fetch(f"""
                         SELECT filename, disabled, error_codes, last_success,
-                               user_email, rotation_order, model_cooldowns, preview, tier
+                               user_email, rotation_order, model_cooldowns, preview, tier, test_result
                         FROM {table_name}
                         {where_clause}
                         ORDER BY created_at DESC
@@ -789,7 +800,7 @@ class PSQLManager:
                 else:
                     all_rows = await conn.fetch(f"""
                         SELECT filename, disabled, error_codes, last_success,
-                               user_email, rotation_order, model_cooldowns, tier, enable_credit
+                               user_email, rotation_order, model_cooldowns, tier, enable_credit, test_result
                         FROM {table_name}
                         {where_clause}
                         ORDER BY created_at DESC
@@ -846,6 +857,7 @@ class PSQLManager:
                         "rotation_order": row["rotation_order"],
                         "model_cooldowns": active_cooldowns,
                         "tier": row["tier"] if row["tier"] is not None else "pro",
+                        "test_result": row["test_result"],
                     }
 
                     if mode == "geminicli":

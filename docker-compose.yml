@@ -15,7 +15,7 @@ services:
       - PORT=${PORT:-7861}
       - HOST=${HOST:-0.0.0.0}
       - WORKERS=${WORKERS:-4}
-      - POSTGRESQL_URI=postgresql://gcli2api:Gcli2Api_Pg%402026%21xY@43.162.94.148:15432/gcli2api
-      # - POSTGRESQL_URI=postgresql://gcli2api:gcli2api_pass@host.docker.internal:15432/gcli2api
+      # - POSTGRESQL_URI=postgresql://gcli2api:Gcli2Api_Pg%402026%21xY@43.162.94.148:15432/gcli2api
+      - POSTGRESQL_URI=postgresql://gcli2api:gcli2api_pass@host.docker.internal:15432/gcli2api
     volumes:
       - ./data/creds:/app/creds

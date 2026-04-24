@@ -1427,6 +1427,8 @@
                             disabled>批量删除</button>
                         <button class="btn btn-small" id="batchVerifyBtn" onclick="batchVerifyProjectIds()"
                             disabled>批量检验</button>
+                        <button class="btn btn-small" id="batchTestBtn" onclick="batchTestCredentials()"
+                            disabled>批量消息测试</button>
                         <button class="btn btn-small" id="batchPreviewBtn" onclick="batchConfigurePreview()"
                             disabled>批量设置预览</button>
                         <button class="btn btn-small" onclick="refreshAllEmails()">刷新所有邮箱</button>
@@ -1626,6 +1628,8 @@
                             onclick="batchAntigravityAction('disable_credit')" disabled>批量关闭积分</button>
                         <button class="btn btn-small" id="antigravityBatchVerifyBtn"
                             onclick="batchVerifyAntigravityProjectIds()" disabled>批量检验</button>
+                        <button class="btn btn-small" id="antigravityBatchTestBtn"
+                            onclick="batchTestAntigravityCredentials()" disabled>批量消息测试</button>
                         <button class="btn btn-small" onclick="refreshAllAntigravityEmails()">刷新所有邮箱</button>
                         <button class="btn btn-small" onclick="deduplicateAntigravityByEmail()">凭证一键去重</button>
                     </div>
@@ -2326,7 +2330,7 @@
     </div>
 
     <!-- 引入公共JavaScript模块 -->
-    <script src="./front/common.js"></script>
+    <script src="./front/common.js?v=20260423"></script>
 </body>
 
 </html>
