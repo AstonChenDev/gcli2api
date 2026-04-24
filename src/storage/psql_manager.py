@@ -1085,10 +1085,10 @@ class PSQLManager:
                     json.dumps(model_cooldowns), filename
                 )
 
-                # 顺序模式下，凭证进入 CD 时排到队尾 (RPUSH)
+                # 顺序/均匀轮换模式下，凭证进入 CD 时排到队尾 (RPUSH)
                 if cooldown_until is not None:
                     strategy = self._config_cache.get("credential_selection_strategy", "random")
-                    if strategy == "sequential":
+                    if strategy in ("sequential", "round_robin"):
                         max_row = await conn.fetchrow(
                             f"SELECT COALESCE(MAX(rotation_order), 0) + 1 AS next_order FROM {table_name}"
                         )

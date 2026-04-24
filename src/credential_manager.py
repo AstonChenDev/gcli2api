@@ -286,6 +286,21 @@ class CredentialManager:
 
                 await self.update_credential_state(credential_name, state_updates, mode=mode)
 
+                # 均匀轮换模式：失败时也排到队尾，避免失败凭证一直占据队首
+                backend = self._storage_adapter._backend
+                if hasattr(backend, '_config_cache') and hasattr(backend, '_pool'):
+                    strategy = backend._config_cache.get("credential_selection_strategy", "random")
+                    if strategy == "round_robin":
+                        table_name = backend._get_table_name(mode)
+                        async with backend._pool.acquire() as conn:
+                            max_row = await conn.fetchrow(
+                                f"SELECT COALESCE(MAX(rotation_order), 0) + 1 AS next_order FROM {table_name}"
+                            )
+                            await conn.execute(
+                                f"UPDATE {table_name} SET rotation_order = $1 WHERE filename = $2",
+                                max_row["next_order"], credential_name
+                            )
+
                 # 设置模型级冷却
                 if cooldown_until is not None and model_name:
                     if hasattr(self._storage_adapter._backend, 'set_model_cooldown'):
