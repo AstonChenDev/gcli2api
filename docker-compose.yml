@@ -10,6 +10,8 @@ services:
         hard: 65536
     ports:
       - "7861:7861"
+      - "11452:11451"
+      - "11454:11454"
     environment:
       - PASSWORD=${PASSWORD:-pwd}
       - PORT=${PORT:-7861}
