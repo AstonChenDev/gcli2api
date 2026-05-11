@@ -58,6 +58,42 @@ from src.task_manager import create_managed_task
 router = APIRouter()
 
 
+# ==================== 辅助函数 ====================
+
+def _process_inline_data_in_response(response_data: dict):
+    """处理 Gemini 响应中的 inlineData，上传到 COS 并替换为 URL
+
+    就地修改 response_data，将 inlineData 部分替换为包含 COS URL 的文本。
+    如果 COS 未配置或上传失败，保持原始 inlineData 不变。
+
+    Args:
+        response_data: Gemini 格式的响应字典
+    """
+    from src.cos_uploader import is_enabled, upload_base64_image
+
+    if not is_enabled():
+        return
+
+    for candidate in response_data.get("candidates", []):
+        parts = candidate.get("content", {}).get("parts", [])
+        for i, part in enumerate(parts):
+            if "inlineData" in part:
+                inline_data = part["inlineData"]
+                mime_type = inline_data.get("mimeType", "image/png")
+                base64_data = inline_data.get("data", "")
+
+                cos_url = upload_base64_image(base64_data, mime_type)
+                if cos_url:
+                    # 替换 inlineData 为包含 URL 的 fileData
+                    parts[i] = {
+                        "fileData": {
+                            "mimeType": mime_type,
+                            "fileUri": cos_url
+                        }
+                    }
+                    log.info(f"[GEMINI] inlineData 已替换为 COS URL: {cos_url}")
+
+
 # ==================== API 路由 ====================
 
 @router.post("/antigravity/v1beta/models/{model:path}:generateContent")
@@ -113,12 +149,15 @@ async def generate_content(
     # 解包装响应：Antigravity API 可能返回的格式有额外的 response 包装层
     # 需要提取并返回标准 Gemini 格式
     # 保持 Gemini 原生的 inlineData 格式,不进行 Markdown 转换
+    # 但如果配置了 COS，将 inlineData 上传到 COS 后替换为 URL
     try:
         if response.status_code == 200:
             response_data = json.loads(response.body if hasattr(response, 'body') else response.content)
             # 如果有 response 包装，解包装它
             if "response" in response_data:
                 unwrapped_data = response_data["response"]
+                # 处理 inlineData：上传到 COS（如果已配置）
+                _process_inline_data_in_response(unwrapped_data)
                 return JSONResponse(content=unwrapped_data)
         # 错误响应或没有 response 字段，直接返回
         return response
@@ -289,6 +328,8 @@ async def stream_generate_content(
                         if "response" in data and "candidates" not in data:
                             log.debug(f"[ANTIGRAVITY-ANTI-TRUNCATION] 展开response包装")
                             unwrapped_data = data["response"]
+                            # 处理 inlineData：上传到 COS
+                            _process_inline_data_in_response(unwrapped_data)
                             # 重新构建SSE格式
                             yield f"data: {json.dumps(unwrapped_data, ensure_ascii=False)}\n\n".encode('utf-8')
                         else:
@@ -366,6 +407,8 @@ async def stream_generate_content(
                         if "response" in data and "candidates" not in data:
                             log.debug(f"[ANTIGRAVITY] 展开response包装")
                             unwrapped_data = data["response"]
+                            # 处理 inlineData：上传到 COS
+                            _process_inline_data_in_response(unwrapped_data)
                             # 重新构建SSE格式
                             yield f"data: {json.dumps(unwrapped_data, ensure_ascii=False)}\n\n".encode('utf-8')
                         else:
