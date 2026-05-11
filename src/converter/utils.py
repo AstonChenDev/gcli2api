@@ -1,4 +1,85 @@
-from typing import Any, Dict
+import base64
+import io
+from typing import Any, Dict, Tuple
+
+from log import log
+
+
+def compress_image_base64(
+    base64_data: str,
+    source_mime: str = "image/png",
+    target_format: str = "webp",
+    quality: int = 85,
+) -> Tuple[str, str]:
+    """将 base64 图片数据压缩为目标格式（PNG → WebP）
+
+    用于减少跨境传输的图片体积，WebP 相比 PNG 通常可压缩 5-10 倍。
+    如果压缩失败或压缩后反而更大，则返回原始数据。
+
+    Args:
+        base64_data: 原始 base64 编码的图片数据
+        source_mime: 原始 MIME 类型，如 "image/png"
+        target_format: 目标格式，支持 "webp" 和 "jpeg"
+        quality: 压缩质量（1-100），默认 85
+
+    Returns:
+        (compressed_base64, new_mime_type) 元组
+    """
+    # 只压缩 PNG 和较大的图片，JPEG/WebP 已经是压缩格式
+    if source_mime not in ("image/png", "image/bmp", "image/tiff"):
+        return base64_data, source_mime
+
+    # 跳过太小的图片（< 50KB base64 ≈ < 37KB 原始）
+    if len(base64_data) < 50 * 1024:
+        return base64_data, source_mime
+
+    try:
+        from PIL import Image
+
+        img_bytes = base64.b64decode(base64_data)
+        img = Image.open(io.BytesIO(img_bytes))
+
+        output = io.BytesIO()
+        if target_format == "webp":
+            img.save(output, format="WEBP", quality=quality, method=4)
+        elif target_format == "jpeg":
+            # JPEG 不支持 alpha 通道
+            if img.mode == "RGBA":
+                img = img.convert("RGB")
+            img.save(output, format="JPEG", quality=quality)
+        else:
+            return base64_data, source_mime
+
+        compressed_bytes = output.getvalue()
+        compressed_b64 = base64.b64encode(compressed_bytes).decode()
+        new_mime = f"image/{target_format}"
+
+        original_size = len(base64_data)
+        compressed_size = len(compressed_b64)
+
+        # 如果压缩后反而更大，返回原始数据
+        if compressed_size >= original_size:
+            log.debug(
+                f"[IMAGE_COMPRESS] 压缩后更大，保留原始: "
+                f"{original_size // 1024}KB → {compressed_size // 1024}KB"
+            )
+            return base64_data, source_mime
+
+        ratio = original_size / compressed_size if compressed_size > 0 else 0
+        log.info(
+            f"[IMAGE_COMPRESS] {source_mime} → {new_mime}: "
+            f"{original_size // 1024}KB → {compressed_size // 1024}KB "
+            f"(压缩比 {ratio:.1f}x)"
+        )
+
+        return compressed_b64, new_mime
+
+    except ImportError:
+        log.warning("[IMAGE_COMPRESS] Pillow 未安装，跳过图片压缩")
+        return base64_data, source_mime
+    except Exception as e:
+        log.warning(f"[IMAGE_COMPRESS] 压缩失败，返回原始数据: {e}")
+        return base64_data, source_mime
 
 from src.converter.thoughtSignature_fix import (
     is_internal_placeholder_text,
@@ -47,6 +128,8 @@ def extract_content_and_reasoning(parts: list) -> tuple:
             inline_data = part["inlineData"]
             mime_type = inline_data.get("mimeType", "image/png")
             base64_data = inline_data.get("data", "")
+            # 压缩图片以减少传输体积
+            base64_data, mime_type = compress_image_base64(base64_data, mime_type)
             images.append({
                 "type": "image_url",
                 "image_url": {

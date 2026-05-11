@@ -1582,6 +1582,9 @@ def convert_gemini_to_openai_response(
                 inline_data = part["inlineData"]
                 mime_type = inline_data.get("mimeType", "image/png")
                 base64_data = inline_data.get("data", "")
+                # 压缩图片以减少传输体积
+                from src.converter.utils import compress_image_base64
+                base64_data, mime_type = compress_image_base64(base64_data, mime_type)
                 # 使用 Markdown 格式
                 content_parts.append(f"![gemini-generated-content](data:{mime_type};base64,{base64_data})")
         
@@ -1756,6 +1759,9 @@ def convert_gemini_to_openai_stream(
                 inline_data = part["inlineData"]
                 mime_type = inline_data.get("mimeType", "image/png")
                 base64_data = inline_data.get("data", "")
+                # 压缩图片以减少传输体积
+                from src.converter.utils import compress_image_base64
+                base64_data, mime_type = compress_image_base64(base64_data, mime_type)
                 content_parts.append(f"![gemini-generated-content](data:{mime_type};base64,{base64_data})")
         
         # 合并所有内容部分
