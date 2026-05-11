@@ -156,13 +156,15 @@ async def generate_content(
             # 如果有 response 包装，解包装它
             if "response" in response_data:
                 unwrapped_data = response_data["response"]
-                # 处理 inlineData：上传到 COS（如果已配置）
-                _process_inline_data_in_response(unwrapped_data)
-                return JSONResponse(content=unwrapped_data)
-        # 错误响应或没有 response 字段，直接返回
+            else:
+                unwrapped_data = response_data
+            # 处理 inlineData：上传到 COS（如果已配置）
+            _process_inline_data_in_response(unwrapped_data)
+            return JSONResponse(content=unwrapped_data)
+        # 错误响应，直接返回
         return response
     except Exception as e:
-        log.warning(f"Failed to unwrap response: {e}, returning original response")
+        log.warning(f"Failed to unwrap/process response: {e}, returning original response")
         return response
 
 @router.post("/antigravity/v1beta/models/{model:path}:streamGenerateContent")
