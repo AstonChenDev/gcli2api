@@ -14,3 +14,4 @@ redis>=4.2.0
 asyncpg
 wreq
 Pillow>=11.0.0
+cos-python-sdk-v5>=1.9.30

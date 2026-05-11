@@ -208,10 +208,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# GZip 响应压缩中间件（base64 文本压缩效果好，可减少 30-50% 传输体积）
-from starlette.middleware.gzip import GZipMiddleware
-app.add_middleware(GZipMiddleware, minimum_size=1000)
-
 # 挂载路由器
 # OpenAI兼容路由 - 处理OpenAI格式请求
 app.include_router(geminicli_openai_router, prefix="", tags=["Geminicli OpenAI API"])

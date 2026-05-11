@@ -197,8 +197,11 @@ def build_gemini_fake_stream_chunks(content: str, reasoning_content: str, finish
             for img in images:
                 if img.get("type") == "image_url":
                     url = img.get("image_url", {}).get("url", "")
-                    # 解析 data URL: data:{mime_type};base64,{data}
-                    if url.startswith("data:"):
+                    if url.startswith("http"):
+                        # COS URL：作为 markdown 文本输出
+                        parts.append({"text": f"![gemini-generated-content]({url})"})
+                    elif url.startswith("data:"):
+                        # data URL：解析为 inlineData
                         parts_of_url = url.split(";base64,")
                         if len(parts_of_url) == 2:
                             mime_type = parts_of_url[0].replace("data:", "")
@@ -469,14 +472,31 @@ def build_anthropic_fake_stream_chunks(content: str, reasoning_content: str, fin
         for img in images:
             if img.get("type") == "image_url":
                 url = img.get("image_url", {}).get("url", "")
-                # 解析 data URL: data:{mime_type};base64,{data}
-                if url.startswith("data:"):
+                if url.startswith("http"):
+                    # COS URL：使用 url source 类型
+                    chunks.append({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "image",
+                            "source": {
+                                "type": "url",
+                                "url": url
+                            }
+                        }
+                    })
+                    chunks.append({
+                        "type": "content_block_stop",
+                        "index": block_index
+                    })
+                    block_index += 1
+                elif url.startswith("data:"):
+                    # data URL：解析为 base64 source
                     parts_of_url = url.split(";base64,")
                     if len(parts_of_url) == 2:
                         mime_type = parts_of_url[0].replace("data:", "")
                         base64_data = parts_of_url[1]
 
-                        # image content_block_start
                         chunks.append({
                             "type": "content_block_start",
                             "index": block_index,
@@ -490,7 +510,6 @@ def build_anthropic_fake_stream_chunks(content: str, reasoning_content: str, fin
                             }
                         })
 
-                        # image content_block_stop
                         chunks.append({
                             "type": "content_block_stop",
                             "index": block_index
