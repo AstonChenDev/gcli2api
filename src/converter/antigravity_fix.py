@@ -668,7 +668,11 @@ def _normalize_antigravity_request(
                             log.debug(f"[ANTIGRAVITY] 已在最后一个 assistant 消息开头插入思考块（含跳过验证签名）")
                         break
 
-    if "claude" in model.lower():
+    if "gemini-3.1-pro-high" in model.lower() or "gemini-3-pro-high" in model.lower():
+        original_model = model
+        model = "gemini-pro-agent"
+        log.debug(f"[ANTIGRAVITY] 映射模型: {original_model} -> {model}")
+    elif "claude" in model.lower():
         # 2. Claude 模型关键词映射
         # 使用关键词匹配而不是精确匹配，更灵活地处理各种变体
         original_model = model
