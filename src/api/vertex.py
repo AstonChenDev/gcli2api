@@ -738,6 +738,8 @@ async def stream_request(
                                     recaptcha_token = None
                                     break
                                 if chunk is not None:
+                                    if not content_yielded:
+                                        log.info(f"[VERTEX STREAM] 开始接收流式响应，模型: {model}")
                                     content_yielded = True
                                     is_first_auth = False
                                     sse = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
@@ -745,6 +747,7 @@ async def stream_request(
 
                                     fr = _get_finish_reason(chunk)
                                     if fr and fr != _FINISH_REASON_UNSPECIFIED:
+                                        log.info(f"[VERTEX STREAM] 流式响应完成 (收到 finish_reason: {fr})，模型: {model}")
                                         return
 
                             if auth_retry or need_retry or quota_retry:
@@ -757,6 +760,7 @@ async def stream_request(
                 need_retry = True
 
         if content_yielded:
+            log.info(f"[VERTEX STREAM] 流式响应完成，模型: {model}")
             return
 
         if auth_retry:
@@ -900,6 +904,7 @@ async def non_stream_request(
                 media_type="application/json",
             )
 
+        log.info(f"[VERTEX NON-STREAM] 响应成功，模型: {model}")
         return Response(
             content=json.dumps(result, ensure_ascii=False).encode("utf-8"),
             status_code=200,
