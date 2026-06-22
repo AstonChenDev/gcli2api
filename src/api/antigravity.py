@@ -38,6 +38,26 @@ from src.api.utils import (
 
 # ==================== 全局凭证管理器 ====================
 
+def _has_generated_content(data_json: dict) -> bool:
+    """检查 response JSON 中是否包含生成的文本内容。"""
+    resp = data_json.get("response") if "response" in data_json else data_json
+    if not isinstance(resp, dict):
+        return False
+    candidates = resp.get("candidates")
+    if isinstance(candidates, list) and len(candidates) > 0:
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            content = cand.get("content")
+            if isinstance(content, dict):
+                parts = content.get("parts")
+                if isinstance(parts, list):
+                    for part in parts:
+                        if isinstance(part, dict) and part.get("text"):
+                            return True
+    return False
+
+
 # 使用全局单例 credential_manager，自动初始化
 
 
@@ -305,6 +325,11 @@ async def stream_request(
         success_recorded = False  # 标记是否已记录成功
         need_retry = False  # 标记是否需要重试
 
+        sse_data_count = 0
+        has_any_text = False
+        is_empty_candidate = False
+        empty_candidate_json = None
+
         try:
             async for chunk in stream_post_async(
                 url=target_url,
@@ -399,26 +424,34 @@ async def stream_request(
                         log.info(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}, 凭证: {cred_label}")
                         stats_collector.record_request(model_name, "antigravity", True)
 
-                    # 检测特殊的0输出token响应并打印
+                    # 检测特殊的0输出token响应并收集数据
                     try:
                         chunk_str = chunk.decode('utf-8', errors='ignore') if isinstance(chunk, bytes) else str(chunk)
-                        if chunk_str.startswith("data: "):
-                            data_str = chunk_str[6:].strip()
-                            if data_str != "[DONE]":
-                                data_json = json.loads(data_str)
-                                usage_meta = None
-                                if "response" in data_json and isinstance(data_json["response"], dict):
-                                    usage_meta = data_json["response"].get("usageMetadata")
-                                elif "usageMetadata" in data_json:
-                                    usage_meta = data_json["usageMetadata"]
+                        for line in chunk_str.split("\n"):
+                            line = line.strip()
+                            if line.startswith("data: "):
+                                data_str = line[6:].strip()
+                                if data_str and data_str != "[DONE]":
+                                    sse_data_count += 1
+                                    try:
+                                        data_json = json.loads(data_str)
+                                        if _has_generated_content(data_json):
+                                            has_any_text = True
+                                        
+                                        usage_meta = None
+                                        if "response" in data_json and isinstance(data_json["response"], dict):
+                                            usage_meta = data_json["response"].get("usageMetadata")
+                                        elif "usageMetadata" in data_json:
+                                            usage_meta = data_json["usageMetadata"]
 
-                                if isinstance(usage_meta, dict):
-                                    p_tokens = usage_meta.get("promptTokenCount")
-                                    t_tokens = usage_meta.get("totalTokenCount")
-                                    if p_tokens is not None and t_tokens is not None and p_tokens == t_tokens and t_tokens > 0:
-                                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 检测到目标空响应！")
-                                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 对应请求体 Request Body: {json.dumps(final_payload, ensure_ascii=False)}")
-                                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 原始响应 Response: {chunk_str.strip()}")
+                                        if isinstance(usage_meta, dict):
+                                            p_tokens = usage_meta.get("promptTokenCount")
+                                            t_tokens = usage_meta.get("totalTokenCount")
+                                            if p_tokens is not None and t_tokens is not None and p_tokens == t_tokens and t_tokens > 0:
+                                                is_empty_candidate = True
+                                                empty_candidate_json = data_json
+                                    except Exception:
+                                        pass
                     except Exception as e:
                         log.debug(f"Special logger parse error: {e}")
 
@@ -428,6 +461,13 @@ async def stream_request(
             if success_recorded:
                 cred_label = credential_data.get('client_email') or current_file
                 log.info(f"[ANTIGRAVITY STREAM] 流式响应完成，模型: {model_name}, 凭证: {cred_label}")
+                
+                # 检测特殊的0输出token响应并且该请求只返回了一个有效的 JSON 流且不包含任何生成文本
+                if sse_data_count == 1 and is_empty_candidate and not has_any_text:
+                    log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 检测到目标空响应！")
+                    log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 对应请求体 Request Body: {json.dumps(final_payload, ensure_ascii=False)}")
+                    log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 原始响应 Response: {json.dumps(empty_candidate_json, ensure_ascii=False)}")
+
                 # record_request 已在首个成功chunk处记录
                 return
             elif not need_retry:
@@ -642,9 +682,10 @@ async def non_stream_request(
                     p_tokens = usage_meta.get("promptTokenCount")
                     t_tokens = usage_meta.get("totalTokenCount")
                     if p_tokens is not None and t_tokens is not None and p_tokens == t_tokens and t_tokens > 0:
-                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 检测到目标空响应（非流式）！")
-                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 对应请求体 Request Body: {json.dumps(final_payload, ensure_ascii=False)}")
-                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 原始响应 Response: {response.text}")
+                        if not _has_generated_content(data_json):
+                            log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 检测到目标空响应（非流式）！")
+                            log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 对应请求体 Request Body: {json.dumps(final_payload, ensure_ascii=False)}")
+                            log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 原始响应 Response: {response.text}")
             except Exception as e:
                 log.debug(f"Special logger non-stream parse error: {e}")
 
