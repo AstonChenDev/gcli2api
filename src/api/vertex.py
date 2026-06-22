@@ -724,7 +724,7 @@ async def stream_request(
                             last_end = 0
                             for obj, end_pos in _parse_json_objects(text):
                                 last_end = end_pos
-                                chunk, auth_err, quota_err = _process_object(obj)
+                                chunk, auth_err, quota_err = _process_object(obj, model)
                                 if auth_err:
                                     if is_first_auth:
                                         is_first_auth = False
