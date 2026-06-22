@@ -262,7 +262,6 @@ async def stream_request(
     # 构建 CLI 格式请求体
     inner_request = body.get("request", body)
     final_payload, _ = await wrap_cli_request(inner_request, model_name, project_id)
-    log.debug(f"[ANTIGRAVITY STREAM REQUEST] final_payload: {json.dumps(final_payload, ensure_ascii=False)}")
 
     # 3. 调用stream_post_async进行请求
     retry_config = await get_retry_config()
@@ -322,7 +321,6 @@ async def stream_request(
                         error_body = chunk.body.decode('utf-8') if isinstance(chunk.body, bytes) else str(chunk.body)
                     except Exception:
                         error_body = ""
-                    log.debug(f"[ANTIGRAVITY STREAM RAW ERROR] status: {status_code}, response: {error_body}")
 
                     # 如果错误码是429、503或者在禁用码当中，做好记录后进行重试
                     if _is_retryable_status(status_code, DISABLE_ERROR_CODES):
@@ -401,11 +399,28 @@ async def stream_request(
                         log.info(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}, 凭证: {cred_label}")
                         stats_collector.record_request(model_name, "antigravity", True)
 
-                    # 记录原始chunk内容（用于调试）
-                    if isinstance(chunk, bytes):
-                        log.debug(f"[ANTIGRAVITY STREAM RAW] chunk(bytes): {chunk.decode('utf-8', errors='ignore')}")
-                    else:
-                        log.debug(f"[ANTIGRAVITY STREAM RAW] chunk(str): {chunk}")
+                    # 检测特殊的0输出token响应并打印
+                    try:
+                        chunk_str = chunk.decode('utf-8', errors='ignore') if isinstance(chunk, bytes) else str(chunk)
+                        if chunk_str.startswith("data: "):
+                            data_str = chunk_str[6:].strip()
+                            if data_str != "[DONE]":
+                                data_json = json.loads(data_str)
+                                usage_meta = None
+                                if "response" in data_json and isinstance(data_json["response"], dict):
+                                    usage_meta = data_json["response"].get("usageMetadata")
+                                elif "usageMetadata" in data_json:
+                                    usage_meta = data_json["usageMetadata"]
+
+                                if isinstance(usage_meta, dict):
+                                    p_tokens = usage_meta.get("promptTokenCount")
+                                    t_tokens = usage_meta.get("totalTokenCount")
+                                    if p_tokens is not None and t_tokens is not None and p_tokens == t_tokens and t_tokens > 0:
+                                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 检测到目标空响应！")
+                                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 对应请求体 Request Body: {json.dumps(final_payload, ensure_ascii=False)}")
+                                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 原始响应 Response: {chunk_str.strip()}")
+                    except Exception as e:
+                        log.debug(f"Special logger parse error: {e}")
 
                     yield chunk
 
@@ -564,7 +579,6 @@ async def non_stream_request(
     # 构建 CLI 格式请求体
     inner_request = body.get("request", body)
     final_payload, _ = await wrap_cli_request(inner_request, model_name, project_id)
-    log.debug(f"[ANTIGRAVITY REQUEST] final_payload: {json.dumps(final_payload, ensure_ascii=False)}")
 
     # 3. 调用post_async进行请求
     retry_config = await get_retry_config()
@@ -615,7 +629,24 @@ async def non_stream_request(
             )
 
             status_code = response.status_code
-            log.debug(f"[ANTIGRAVITY RAW RESPONSE] status: {status_code}, response: {response.text}")
+            # 检测特殊的0输出token响应并打印
+            try:
+                data_json = json.loads(response.text)
+                usage_meta = None
+                if "response" in data_json and isinstance(data_json["response"], dict):
+                    usage_meta = data_json["response"].get("usageMetadata")
+                elif "usageMetadata" in data_json:
+                    usage_meta = data_json["usageMetadata"]
+
+                if isinstance(usage_meta, dict):
+                    p_tokens = usage_meta.get("promptTokenCount")
+                    t_tokens = usage_meta.get("totalTokenCount")
+                    if p_tokens is not None and t_tokens is not None and p_tokens == t_tokens and t_tokens > 0:
+                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 检测到目标空响应（非流式）！")
+                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 对应请求体 Request Body: {json.dumps(final_payload, ensure_ascii=False)}")
+                        log.info(f"[ANTIGRAVITY SPECIAL LOGGER] 原始响应 Response: {response.text}")
+            except Exception as e:
+                log.debug(f"Special logger non-stream parse error: {e}")
 
             # 成功
             if status_code == 200:
