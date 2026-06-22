@@ -262,7 +262,7 @@ async def stream_request(
     # 构建 CLI 格式请求体
     inner_request = body.get("request", body)
     final_payload, _ = await wrap_cli_request(inner_request, model_name, project_id)
-    log.info(f"[ANTIGRAVITY STREAM REQUEST] final_payload: {json.dumps(final_payload, ensure_ascii=False)}")
+    log.debug(f"[ANTIGRAVITY STREAM REQUEST] final_payload: {json.dumps(final_payload, ensure_ascii=False)}")
 
     # 3. 调用stream_post_async进行请求
     retry_config = await get_retry_config()
@@ -322,7 +322,7 @@ async def stream_request(
                         error_body = chunk.body.decode('utf-8') if isinstance(chunk.body, bytes) else str(chunk.body)
                     except Exception:
                         error_body = ""
-                    log.info(f"[ANTIGRAVITY STREAM RAW ERROR] status: {status_code}, response: {error_body}")
+                    log.debug(f"[ANTIGRAVITY STREAM RAW ERROR] status: {status_code}, response: {error_body}")
 
                     # 如果错误码是429、503或者在禁用码当中，做好记录后进行重试
                     if _is_retryable_status(status_code, DISABLE_ERROR_CODES):
@@ -403,9 +403,9 @@ async def stream_request(
 
                     # 记录原始chunk内容（用于调试）
                     if isinstance(chunk, bytes):
-                        log.info(f"[ANTIGRAVITY STREAM RAW] chunk(bytes): {chunk.decode('utf-8', errors='ignore')}")
+                        log.debug(f"[ANTIGRAVITY STREAM RAW] chunk(bytes): {chunk.decode('utf-8', errors='ignore')}")
                     else:
-                        log.info(f"[ANTIGRAVITY STREAM RAW] chunk(str): {chunk}")
+                        log.debug(f"[ANTIGRAVITY STREAM RAW] chunk(str): {chunk}")
 
                     yield chunk
 
@@ -564,7 +564,7 @@ async def non_stream_request(
     # 构建 CLI 格式请求体
     inner_request = body.get("request", body)
     final_payload, _ = await wrap_cli_request(inner_request, model_name, project_id)
-    log.info(f"[ANTIGRAVITY REQUEST] final_payload: {json.dumps(final_payload, ensure_ascii=False)}")
+    log.debug(f"[ANTIGRAVITY REQUEST] final_payload: {json.dumps(final_payload, ensure_ascii=False)}")
 
     # 3. 调用post_async进行请求
     retry_config = await get_retry_config()
@@ -615,7 +615,7 @@ async def non_stream_request(
             )
 
             status_code = response.status_code
-            log.info(f"[ANTIGRAVITY RAW RESPONSE] status: {status_code}, response: {response.text}")
+            log.debug(f"[ANTIGRAVITY RAW RESPONSE] status: {status_code}, response: {response.text}")
 
             # 成功
             if status_code == 200:
