@@ -48,6 +48,7 @@ ENV_MAPPINGS = {
     "KEEPALIVE_URL": "keepalive_url",
     "KEEPALIVE_INTERVAL": "keepalive_interval",
     "CREDENTIAL_SELECTION_STRATEGY": "credential_selection_strategy",
+    "VERTEX_MAX_RETRIES": "vertex_max_retries",
 }
 
 
@@ -515,3 +516,21 @@ async def get_credential_selection_strategy() -> str:
 
     value = str(await get_config_value("credential_selection_strategy", "random"))
     return value if value in ("random", "sequential", "round_robin") else "random"
+
+
+async def get_vertex_max_retries() -> int:
+    """
+    Get max retries for Vertex API.
+
+    Environment variable: VERTEX_MAX_RETRIES
+    Database config key: vertex_max_retries
+    Default: 3
+    """
+    env_value = os.getenv("VERTEX_MAX_RETRIES")
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            pass
+
+    return int(await get_config_value("vertex_max_retries", 3))

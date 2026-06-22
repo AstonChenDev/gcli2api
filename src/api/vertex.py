@@ -13,6 +13,7 @@ import string
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import Response
+from config import get_vertex_max_retries
 from log import log
 from src.converter.thoughtSignature_fix import decode_tool_id_and_signature
 
@@ -615,7 +616,7 @@ async def stream_request(
     model = body.get("model", "")
     gemini_payload = body.get("request", {})
 
-    max_retries = 3
+    max_retries = await get_vertex_max_retries()
     recaptcha_token: Optional[str] = None
     is_first_auth = True
 
@@ -805,7 +806,7 @@ async def non_stream_request(
     model = body.get("model", "")
     gemini_payload = body.get("request", {})
 
-    max_retries = 3
+    max_retries = await get_vertex_max_retries()
 
     for attempt in range(max_retries + 1):
         log.debug(f"[VERTEX NON-STREAM] attempt {attempt + 1}/{max_retries + 1}, model={model}")
