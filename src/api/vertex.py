@@ -151,7 +151,7 @@ def _batch_graphql_headers() -> Dict[str, str]:
 
 # ==================== reCAPTCHA ====================
 
-async def _fetch_recaptcha_token_once() -> Optional[str]:
+async def _fetch_recaptcha_token_once(model: str = "") -> Optional[str]:
     """单次尝试获取 reCAPTCHA token，失败返回 None。"""
     if not WREQ_AVAILABLE:
         return None
@@ -185,13 +185,13 @@ async def _fetch_recaptcha_token_once() -> Optional[str]:
             emulation=emulation,
         )
         if anchor_resp.status != 200:
-            log.warning(f"[VERTEX RECAPTCHA] anchor GET failed: status={anchor_resp.status}")
+            log.warning(f"[VERTEX RECAPTCHA] anchor GET failed: status={anchor_resp.status}, model={model}")
             return None
 
         anchor_body = await anchor_resp.text()
         m = _TOKEN_RE.search(anchor_body)
         if not m:
-            log.warning(f"[VERTEX RECAPTCHA] anchor token regex miss, body[:200]={anchor_body[:200]}")
+            log.warning(f"[VERTEX RECAPTCHA] anchor token regex miss, body[:200]={anchor_body[:200]}, model={model}")
             return None
         base_token = m.group(1)
 
@@ -223,32 +223,32 @@ async def _fetch_recaptcha_token_once() -> Optional[str]:
             emulation=emulation,
         )
         if reload_resp.status != 200:
-            log.warning(f"[VERTEX RECAPTCHA] reload POST failed: status={reload_resp.status}")
+            log.warning(f"[VERTEX RECAPTCHA] reload POST failed: status={reload_resp.status}, model={model}")
             return None
 
         reload_body = await reload_resp.text()
         rm = _RRESP_RE.search(reload_body)
         if not rm:
-            log.warning(f"[VERTEX RECAPTCHA] rresp regex miss in reload response")
+            log.warning(f"[VERTEX RECAPTCHA] rresp regex miss in reload response, model={model}")
             return None
 
         return rm.group(1)
 
     except Exception as e:
-        log.warning(f"[VERTEX RECAPTCHA] exception: {e}")
+        log.warning(f"[VERTEX RECAPTCHA] exception: {e}, model={model}")
         return None
 
 
-async def fetch_recaptcha_token() -> Optional[str]:
+async def fetch_recaptcha_token(model: str = "") -> Optional[str]:
     """获取 reCAPTCHA token，最多重试 3 次。"""
     for attempt in range(3):
-        log.debug(f"[VERTEX RECAPTCHA] attempt {attempt + 1}/3")
-        token = await _fetch_recaptcha_token_once()
+        log.debug(f"[VERTEX RECAPTCHA] attempt {attempt + 1}/3, model={model}")
+        token = await _fetch_recaptcha_token_once(model)
         if token:
-            log.debug(f"[VERTEX RECAPTCHA] token obtained on attempt {attempt + 1}")
+            log.debug(f"[VERTEX RECAPTCHA] token obtained on attempt {attempt + 1}, model={model}")
             return token
-        log.warning(f"[VERTEX RECAPTCHA] attempt {attempt + 1} failed")
-    log.error("[VERTEX RECAPTCHA] all 3 attempts failed")
+        log.warning(f"[VERTEX RECAPTCHA] attempt {attempt + 1} failed, model={model}")
+    log.error(f"[VERTEX RECAPTCHA] all 3 attempts failed, model={model}")
     return None
 
 
@@ -377,7 +377,7 @@ def _build_variables(model: str, gemini_payload: Dict[str, Any]) -> Dict[str, An
         gemini_payload["contents"] = _drop_invalid_tool_turns(gemini_payload["contents"])
         gemini_payload["contents"] = _fix_thought_signatures(gemini_payload["contents"])
         gemini_payload["contents"] = _fix_function_response_names(gemini_payload["contents"])
-    log.debug(f"[VERTEX] contents to upstream: {json.dumps(gemini_payload.get('contents', []), ensure_ascii=False)}")
+    log.debug(f"[VERTEX] contents to upstream: {json.dumps(gemini_payload.get('contents', []), ensure_ascii=False)}, model={model}")
     vars_: Dict[str, Any] = {"model": model}
     for field in _SUPPORTED_VAR_FIELDS:
         if field in gemini_payload:
@@ -461,7 +461,7 @@ def _parse_json_objects(raw_text: str):
             break
 
 
-def _process_object(obj: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], bool]:
+def _process_object(obj: Dict[str, Any], model: str = "") -> Tuple[Optional[Dict[str, Any]], Optional[str], bool]:
     """
     处理单个上游 JSON 对象，提取 Gemini chunk。
     返回 (chunk, auth_error_msg, is_quota_error)。
@@ -482,9 +482,9 @@ def _process_object(obj: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Opti
             if _is_auth_error(err_msg):
                 return None, err_msg, False
             if _is_quota_error(err_msg):
-                log.warning(f"[VERTEX] upstream quota/429 error: {err_msg}")
+                log.warning(f"[VERTEX] upstream quota/429 error: {err_msg}, model={model}")
                 return None, None, True
-            log.warning(f"[VERTEX] upstream errors in result: {err_msg}")
+            log.warning(f"[VERTEX] upstream errors in result: {err_msg}, model={model}")
 
         data = result.get("data")
         if not isinstance(data, dict):
@@ -624,7 +624,7 @@ async def stream_request(
         log.debug(f"[VERTEX STREAM] attempt {attempt + 1}/{max_retries + 1}, model={model}")
 
         if not recaptcha_token:
-            recaptcha_token = await fetch_recaptcha_token()
+            recaptcha_token = await fetch_recaptcha_token(model)
             is_first_auth = True
 
         if not recaptcha_token:
@@ -654,7 +654,7 @@ async def stream_request(
                 emulation=Emulation.Chrome131,
             )
         except Exception as e:
-            log.error(f"[VERTEX STREAM] wreq post exception: {e}")
+            log.error(f"[VERTEX STREAM] wreq post exception: {e}, model={model}")
             if attempt < max_retries:
                 await asyncio.sleep(1 + attempt)
                 recaptcha_token = None
@@ -671,7 +671,7 @@ async def stream_request(
                 err_body = await resp.text()
             except Exception:
                 err_body = ""
-            log.error(f"[VERTEX STREAM] HTTP {resp.status}: {err_body[:300]}")
+            log.error(f"[VERTEX STREAM] HTTP {resp.status}: {err_body[:300]}, model={model}")
 
             if _is_auth_error(err_body):
                 if is_first_auth:
@@ -699,7 +699,7 @@ async def stream_request(
                 await asyncio.sleep(0.5)
                 continue
             if quota_retry:
-                log.warning(f"[VERTEX STREAM] HTTP 429, retry {attempt + 1}/{max_retries}")
+                log.warning(f"[VERTEX STREAM] HTTP 429, retry {attempt + 1}/{max_retries}, model={model}")
                 continue
             if need_retry and attempt < max_retries:
                 await asyncio.sleep(1 + attempt)
@@ -720,7 +720,7 @@ async def stream_request(
                         if raw_chunk:
                             buffer += raw_chunk
                             text = buffer.decode("utf-8", errors="replace")
-                            log.debug(f"[VERTEX STREAM] raw buffer: {text[:500]}")
+                            log.debug(f"[VERTEX STREAM] raw buffer: {text[:500]}, model={model}")
                             last_end = 0
                             for obj, end_pos in _parse_json_objects(text):
                                 last_end = end_pos
@@ -752,7 +752,7 @@ async def stream_request(
                             # 只保留未被成功解析的尾部
                             buffer = text[last_end:].encode("utf-8") if last_end < len(text) else b""
         except Exception as e:
-            log.error(f"[VERTEX STREAM] stream read error: {e}")
+            log.error(f"[VERTEX STREAM] stream read error: {e}, model={model}")
             if not content_yielded and attempt < max_retries:
                 need_retry = True
 
@@ -764,7 +764,7 @@ async def stream_request(
             continue
 
         if quota_retry and attempt < max_retries:
-            log.warning(f"[VERTEX STREAM] upstream 429, retry {attempt + 1}/{max_retries}")
+            log.warning(f"[VERTEX STREAM] upstream 429, retry {attempt + 1}/{max_retries}, model={model}")
             continue
 
         if need_retry and attempt < max_retries:
@@ -811,7 +811,7 @@ async def non_stream_request(
     for attempt in range(max_retries + 1):
         log.debug(f"[VERTEX NON-STREAM] attempt {attempt + 1}/{max_retries + 1}, model={model}")
 
-        recaptcha_token = await fetch_recaptcha_token()
+        recaptcha_token = await fetch_recaptcha_token(model)
         if not recaptcha_token:
             if attempt >= max_retries:
                 return Response(
@@ -833,7 +833,7 @@ async def non_stream_request(
                 emulation=Emulation.Chrome131,
             )
         except Exception as e:
-            log.error(f"[VERTEX NON-STREAM] wreq exception: {e}")
+            log.error(f"[VERTEX NON-STREAM] wreq exception: {e}, model={model}")
             if attempt < max_retries:
                 await asyncio.sleep(1)
                 continue
@@ -850,13 +850,13 @@ async def non_stream_request(
             raw_text = ""
 
         if status != 200:
-            log.error(f"[VERTEX NON-STREAM] HTTP {status}: {raw_text[:300]}")
+            log.error(f"[VERTEX NON-STREAM] HTTP {status}: {raw_text[:300]}, model={model}")
             if _is_auth_error(raw_text) and attempt < max_retries:
                 await asyncio.sleep(1)
                 continue
             if status == 429 and attempt < max_retries:
-                log.warning(f"[VERTEX NON-STREAM] HTTP 429, retry {attempt + 1}/{max_retries}")
-                recaptcha_token = await fetch_recaptcha_token()
+                log.warning(f"[VERTEX NON-STREAM] HTTP 429, retry {attempt + 1}/{max_retries}, model={model}")
+                recaptcha_token = await fetch_recaptcha_token(model)
                 continue
             if status in (500, 503) and attempt < max_retries:
                 await asyncio.sleep(2 + attempt)
@@ -868,9 +868,9 @@ async def non_stream_request(
             )
 
         # 解析响应
-        result = _build_non_stream_response(raw_text)
+        result = _build_non_stream_response(raw_text, model)
         if result is None:
-            log.error(f"[VERTEX NON-STREAM] parse failed: {raw_text[:300]}")
+            log.error(f"[VERTEX NON-STREAM] parse failed: {raw_text[:300]}, model={model}")
             if attempt < max_retries:
                 await asyncio.sleep(1)
                 continue
@@ -892,7 +892,7 @@ async def non_stream_request(
 
         if isinstance(result, dict) and "quota_error" in result:
             if attempt < max_retries:
-                log.warning(f"[VERTEX NON-STREAM] upstream 429, retry {attempt + 1}/{max_retries}")
+                log.warning(f"[VERTEX NON-STREAM] upstream 429, retry {attempt + 1}/{max_retries}, model={model}")
                 continue  # 下一轮循环会重新 fetch_recaptcha_token
             return Response(
                 content=json.dumps({"error": {"code": 429, "message": result["quota_error"], "status": "RESOURCE_EXHAUSTED"}}),
@@ -913,7 +913,7 @@ async def non_stream_request(
     )
 
 
-def _build_non_stream_response(raw_text: str) -> Optional[Dict[str, Any]]:
+def _build_non_stream_response(raw_text: str, model: str = "") -> Optional[Dict[str, Any]]:
     """
     从 batchGraphql 响应中提取并组装标准 Gemini generateContent 响应体。
     返回 Gemini 格式 dict，None（解析失败），或 {"auth_error": msg}。
@@ -944,7 +944,7 @@ def _build_non_stream_response(raw_text: str) -> Optional[Dict[str, Any]]:
                     return {"auth_error": err_msg}
                 if _is_quota_error(err_msg):
                     return {"quota_error": err_msg}
-                log.warning(f"[VERTEX NON-STREAM] upstream error: {err_msg}")
+                log.warning(f"[VERTEX NON-STREAM] upstream error: {err_msg}, model={model}")
                 continue
 
             data = result.get("data")
