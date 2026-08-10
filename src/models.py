@@ -1,6 +1,6 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # Pydantic v1/v2 兼容性辅助函数
@@ -12,10 +12,10 @@ def model_to_dict(model: BaseModel) -> Dict[str, Any]:
     """
     if hasattr(model, 'model_dump'):
         # Pydantic v2
-        return model.model_dump(exclude_none=True, by_alias=True)
+        return cast(Dict[str, Any], model.model_dump(exclude_none=True, by_alias=True))
     else:
         # Pydantic v1
-        return model.dict(exclude_none=True, by_alias=True)
+        return cast(Dict[str, Any], model.dict(exclude_none=True, by_alias=True))
 
 
 # Common Models
@@ -58,6 +58,8 @@ class OpenAIChatMessage(BaseModel):
 
 
 class OpenAIChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     model: str
     messages: List[OpenAIChatMessage]
     stream: bool = False
@@ -73,10 +75,6 @@ class OpenAIChatCompletionRequest(BaseModel):
     top_k: Optional[int] = Field(None, ge=1)
     tools: Optional[List[OpenAITool]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
-
-    class Config:
-        extra = "allow"  # Allow additional fields not explicitly defined
-
 
 # 通用的聊天完成请求模型（兼容OpenAI和其他格式）
 ChatCompletionRequest = OpenAIChatCompletionRequest
@@ -123,15 +121,13 @@ class OpenAIChatCompletionStreamResponse(BaseModel):
 
 # Gemini Models
 class GeminiPart(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     text: Optional[str] = None
     inlineData: Optional[Dict[str, Any]] = None
     fileData: Optional[Dict[str, Any]] = None
     thought: Optional[bool] = None  # 改为 None，避免序列化时包含 False
     
-    class Config:
-        extra = "allow"  # 允许额外字段（如 functionCall, functionResponse）
-
-
 class GeminiContent(BaseModel):
     role: str
     parts: List[GeminiPart]
@@ -143,15 +139,15 @@ class GeminiSystemInstruction(BaseModel):
 
 class GeminiImageConfig(BaseModel):
     """图片生成配置"""
+    model_config = ConfigDict(extra="allow", validate_by_name=True, validate_by_alias=True)
+
     aspect_ratio: Optional[str] = Field(None, alias="aspectRatio")  # "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
     image_size: Optional[str] = Field(None, alias="imageSize")  # "1K", "2K", "4K"
 
-    class Config:
-        extra = "allow"
-        populate_by_name = True  # 同时接受 snake_case 和 camelCase
-
 
 class GeminiGenerationConfig(BaseModel):
+    model_config = ConfigDict(extra="allow", validate_by_name=True, validate_by_alias=True)
+
     temperature: Optional[float] = Field(None, ge=0.0, le=2.0)
     topP: Optional[float] = Field(None, ge=0.0, le=1.0)
     topK: Optional[int] = Field(None, ge=1)
@@ -165,13 +161,8 @@ class GeminiGenerationConfig(BaseModel):
     presencePenalty: Optional[float] = Field(None, ge=-2.0, le=2.0)
     thinkingConfig: Optional[Dict[str, Any]] = None
     # 图片生成相关参数 - 支持 camelCase 和 snake_case
-    responseModalities: Optional[List[str]] = Field(None, alias="responseModalities")  # ["TEXT", "IMAGE"]
-    imageConfig: Optional[Dict[str, Any]] = Field(None, alias="imageConfig")
-
-    class Config:
-        extra = "allow"  # 允许透传未定义的字段
-        populate_by_name = True  # 同时接受字段名和别名
-
+    response_modalities: Optional[List[str]] = Field(None, alias="responseModalities")  # ["TEXT", "IMAGE"]
+    image_config: Optional[Dict[str, Any]] = Field(None, alias="imageConfig")
 
 class GeminiSafetySetting(BaseModel):
     category: str
@@ -179,6 +170,8 @@ class GeminiSafetySetting(BaseModel):
 
 
 class GeminiRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     contents: List[GeminiContent]
     systemInstruction: Optional[GeminiSystemInstruction] = None
     generationConfig: Optional[GeminiGenerationConfig] = None
@@ -186,10 +179,6 @@ class GeminiRequest(BaseModel):
     tools: Optional[List[Dict[str, Any]]] = None
     toolConfig: Optional[Dict[str, Any]] = None
     cachedContent: Optional[str] = None
-
-    class Config:
-        extra = "allow"  # 允许透传未定义的字段
-
 
 class GeminiCandidate(BaseModel):
     content: GeminiContent
@@ -242,6 +231,8 @@ class ClaudeMetadata(BaseModel):
 
 
 class ClaudeRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     model: str
     messages: List[ClaudeMessage]
     max_tokens: int = Field(..., ge=1)
@@ -254,10 +245,6 @@ class ClaudeRequest(BaseModel):
     metadata: Optional[ClaudeMetadata] = None
     tools: Optional[List[ClaudeTool]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
-
-    class Config:
-        extra = "allow"
-
 
 class ClaudeUsage(BaseModel):
     input_tokens: int
@@ -278,6 +265,8 @@ class ClaudeResponse(BaseModel):
 
 
 class ClaudeStreamEvent(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: str  # "message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"
     message: Optional[ClaudeResponse] = None
     index: Optional[int] = None
@@ -285,8 +274,6 @@ class ClaudeStreamEvent(BaseModel):
     delta: Optional[Dict[str, Any]] = None
     usage: Optional[ClaudeUsage] = None
 
-    class Config:
-        extra = "allow"
 
 
 # Error Models
