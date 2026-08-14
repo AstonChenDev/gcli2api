@@ -1,0 +1,32 @@
+.git
+.github
+.env
+.env.*
+.venv
+env
+venv
+__pycache__
+*.py[cod]
+*.log
+*.tmp
+*.bak
+.DS_Store
+
+# Runtime data and credentials must be mounted or injected, never baked in.
+creds
+data
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local tooling and deployment metadata are not needed in the image.
+.idea
+.vscode
+.claude
+.kiro
+tools
+aicode
+streamchat
+docker-compose*.yml
+compose*.yml

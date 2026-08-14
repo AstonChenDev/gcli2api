@@ -1,5 +1,11 @@
-# Multi-stage build for gcli2api
+# Production image for gcli2api
 FROM python:3.13-slim AS base
+
+ARG VCS_REF=unknown
+
+LABEL org.opencontainers.image.title="gcli2api" \
+      org.opencontainers.image.source="https://github.com/AstonChenDev/gcli2api" \
+      org.opencontainers.image.revision="${VCS_REF}"
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -38,8 +44,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Expose port
-EXPOSE 7861
+# Application, candidate, v3 and OAuth callback ports
+EXPOSE 7861 7862 7863 11451 11454
+
+STOPSIGNAL SIGTERM
 
 # Default command
 CMD ["python", "web.py"]

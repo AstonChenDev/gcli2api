@@ -67,72 +67,17 @@ bash start.sh
 
 ### Docker 环境
 
-**Docker 运行命令**
-```bash
-# 使用通用密码
-docker run -d --name gcli2api --network host -e PASSWORD=pwd -e PORT=7861 -v $(pwd)/data/creds:/app/creds ghcr.io/su-kaka/gcli2api:latest
-
-# 使用分离密码
-docker run -d --name gcli2api --network host -e API_PASSWORD=api_pwd -e PANEL_PASSWORD=panel_pwd -e PORT=7861 -v $(pwd)/data/creds:/app/creds ghcr.io/su-kaka/gcli2api:latest
-```
-
-**Docker Mac**
-```bash
-# 使用通用密码
-docker run -d \
-  --name gcli2api \
-  -p 7861:7861 \
-  -p 8080:8080 \
-  -e PASSWORD=pwd \
-  -e PORT=7861 \
-  -v "$(pwd)/data/creds":/app/creds \
-  ghcr.io/su-kaka/gcli2api:latest
-```
+生产环境使用仓库内统一的 `Dockerfile` 和 `docker-compose.yml`。主实例默认启动，候选实例与第三实例通过 Compose Profiles 控制。
 
 ```bash
-# 使用分离密码
-docker run -d \
---name gcli2api \
--p 7861:7861 \
--p 8080:8080 \
--e API_PASSWORD=api_pwd \
--e PANEL_PASSWORD=panel_pwd \
--e PORT=7861 \
--v $(pwd)/data/creds:/app/creds \
-ghcr.io/su-kaka/gcli2api:latest
+cp .env.example .env
+chmod 600 .env
+# 填写强密码、PostgreSQL URI、镜像版本以及可选 COS 配置
+docker compose config --quiet
+docker compose up -d --build
 ```
 
-**Docker Compose 运行命令**
-1. 将以下内容保存为 `docker-compose.yml` 文件：
-    ```yaml
-    version: '3.8'
-
-    services:
-      gcli2api:
-        image: ghcr.io/su-kaka/gcli2api:latest
-        container_name: gcli2api
-        restart: unless-stopped
-        network_mode: host
-        environment:
-          # 使用通用密码（推荐用于简单部署）
-          - PASSWORD=pwd
-          - PORT=7861
-          # 或使用分离密码（推荐用于生产环境）
-          # - API_PASSWORD=your_api_password
-          # - PANEL_PASSWORD=your_panel_password
-        volumes:
-          - ./data/creds:/app/creds
-        healthcheck:
-          test: ["CMD-SHELL", "python -c \"import sys, urllib.request, os; port = os.environ.get('PORT', '7861'); req = urllib.request.Request(f'http://localhost:{port}/v1/models', headers={'Authorization': 'Bearer ' + os.environ.get('PASSWORD', 'pwd')}); sys.exit(0 if urllib.request.urlopen(req, timeout=5).getcode() == 200 else 1)\""]
-          interval: 30s
-          timeout: 10s
-          retries: 3
-          start_period: 40s
-    ```
-2. 启动服务：
-    ```bash
-    docker-compose up -d
-    ```
+`.env` 中不再提供默认生产密码，数据库和 COS 密钥也不写入 Compose。完整的双服务器配置、蓝绿发布和回滚步骤见 [生产部署说明](docs/PRODUCTION_DEPLOYMENT.md)。
 
 ## 核心功能
 
