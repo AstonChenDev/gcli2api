@@ -9,6 +9,7 @@ import time as _time
 from typing import Any, Dict, Optional, Tuple
 
 from log import log
+from src.request_context import get_client_ip
 
 
 class StatsCollector:
@@ -30,6 +31,9 @@ class StatsCollector:
         # 请求级统计 key: (model_name, mode)
         # value: {"total": int, "success": int, "fail": int}
         self._request_counters: Dict[Tuple[str, str], Dict[str, int]] = {}
+        # 调用方 IP 统计 key: (client_ip, model_name, mode)
+        # value: {"total": int, "success": int, "fail": int}
+        self._ip_request_counters: Dict[Tuple[str, str, str], Dict[str, int]] = {}
         # 错误码统计 key: (model_name, mode, error_code)
         # value: {"count": int, "desc": str}  (desc 保留最近一次的上游描述)
         self._error_code_counters: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
@@ -76,6 +80,7 @@ class StatsCollector:
         model_name: Optional[str],
         mode: str,
         success: bool,
+        client_ip: Optional[str] = None,
     ) -> None:
         """
         记录一次请求级结果（最终结果，不含重试过程）
@@ -84,6 +89,7 @@ class StatsCollector:
             model_name: 模型名
             mode: geminicli 或 antigravity
             success: 请求最终是否成功
+            client_ip: 调用方 IP；未传时从当前 HTTP 请求上下文读取
         """
         model_name = model_name or "unknown"
         key = (model_name, mode)
@@ -98,6 +104,21 @@ class StatsCollector:
             entry["success"] += 1
         else:
             entry["fail"] += 1
+
+        if client_ip is None:
+            client_ip = get_client_ip()
+        client_ip = client_ip or "unknown"
+        ip_key = (client_ip, model_name, mode)
+        ip_entry = self._ip_request_counters.get(ip_key)
+        if ip_entry is None:
+            ip_entry = {"total": 0, "success": 0, "fail": 0}
+            self._ip_request_counters[ip_key] = ip_entry
+
+        ip_entry["total"] += 1
+        if success:
+            ip_entry["success"] += 1
+        else:
+            ip_entry["fail"] += 1
 
     def record_error_code(
         self,
@@ -137,6 +158,8 @@ class StatsCollector:
         data, self._counters = self._counters, {}
         # 原子交换 - 请求级
         req_data, self._request_counters = self._request_counters, {}
+        # 原子交换 - 调用方 IP
+        ip_data, self._ip_request_counters = self._ip_request_counters, {}
         # 原子交换 - 错误码
         err_data, self._error_code_counters = self._error_code_counters, {}
 
@@ -183,6 +206,29 @@ class StatsCollector:
                     entry = self._request_counters.get(key)
                     if entry is None:
                         self._request_counters[key] = vals
+                    else:
+                        entry["total"] += vals["total"]
+                        entry["success"] += vals["success"]
+                        entry["fail"] += vals["fail"]
+
+        # 调用方 IP 统计刷盘
+        if ip_data:
+            bucket = int(_time.time()) // 60 * 60
+            ip_records = [
+                (key[0], key[1], key[2], vals["total"], vals["success"], vals["fail"], bucket)
+                for key, vals in ip_data.items()
+            ]
+            try:
+                from src.storage_adapter import get_storage_adapter
+                adapter = await get_storage_adapter()
+                if hasattr(adapter._backend, "batch_upsert_ip_request_stats"):
+                    await adapter._backend.batch_upsert_ip_request_stats(ip_records)
+            except Exception as e:
+                log.error(f"[STATS] IP request stats flush failed: {e}")
+                for key, vals in ip_data.items():
+                    entry = self._ip_request_counters.get(key)
+                    if entry is None:
+                        self._ip_request_counters[key] = vals
                     else:
                         entry["total"] += vals["total"]
                         entry["success"] += vals["success"]

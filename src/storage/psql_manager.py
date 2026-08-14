@@ -205,6 +205,34 @@ class PSQLManager:
         except Exception as e:
             log.debug(f"request_stats table may already exist (concurrent init): {e}")
 
+        # 调用方 IP 请求统计表（每个用户请求仅记录最终结果）
+        try:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ip_request_stats (
+                    id SERIAL PRIMARY KEY,
+                    client_ip TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'geminicli',
+                    time_bucket BIGINT NOT NULL DEFAULT 0,
+                    total_count BIGINT DEFAULT 0,
+                    success_count BIGINT DEFAULT 0,
+                    fail_count BIGINT DEFAULT 0,
+                    updated_at DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW()),
+                    UNIQUE(client_ip, model_name, mode, time_bucket)
+                )
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ip_req_stats_client ON ip_request_stats(client_ip)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ip_req_stats_mode ON ip_request_stats(mode)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ip_req_stats_bucket ON ip_request_stats(time_bucket)
+            """)
+        except Exception as e:
+            log.debug(f"ip_request_stats table may already exist (concurrent init): {e}")
+
         # 错误码统计表
         try:
             await conn.execute("""
@@ -1383,11 +1411,15 @@ class PSQLManager:
                         "DELETE FROM request_stats WHERE mode = $1", mode
                     )
                     await conn.execute(
+                        "DELETE FROM ip_request_stats WHERE mode = $1", mode
+                    )
+                    await conn.execute(
                         "DELETE FROM error_code_stats WHERE mode = $1", mode
                     )
                 else:
                     await conn.execute("DELETE FROM credential_stats")
                     await conn.execute("DELETE FROM request_stats")
+                    await conn.execute("DELETE FROM ip_request_stats")
                     await conn.execute("DELETE FROM error_code_stats")
             log.info(f"[STATS] Stats reset (mode={mode or 'all'})")
             return True
@@ -1558,6 +1590,126 @@ class PSQLManager:
             log.error(f"[STATS] Error getting request stats timeseries: {e}")
             return []
 
+    # ==================== 调用方 IP 统计 ====================
+
+    async def batch_upsert_ip_request_stats(
+        self,
+        records: list,
+    ) -> None:
+        """批量 upsert 调用方 IP + 模型维度的请求统计。"""
+        if not records:
+            return
+        self._ensure_initialized()
+
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.executemany("""
+                    INSERT INTO ip_request_stats (
+                        client_ip, model_name, mode, total_count,
+                        success_count, fail_count, time_bucket, updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, EXTRACT(EPOCH FROM NOW()))
+                    ON CONFLICT (client_ip, model_name, mode, time_bucket)
+                    DO UPDATE SET
+                        total_count = ip_request_stats.total_count + EXCLUDED.total_count,
+                        success_count = ip_request_stats.success_count + EXCLUDED.success_count,
+                        fail_count = ip_request_stats.fail_count + EXCLUDED.fail_count,
+                        updated_at = EXTRACT(EPOCH FROM NOW())
+                """, records)
+            log.debug(f"[STATS] Flushed {len(records)} IP request stat records to DB")
+        except Exception as e:
+            log.error(f"[STATS] Error batch upserting IP request stats: {e}")
+            raise
+
+    async def get_ip_request_stats_summary(
+        self,
+        mode: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        """按调用方 IP 汇总请求数，并附带该 IP 使用的模型。"""
+        self._ensure_initialized()
+        limit = max(1, min(int(limit), 500))
+
+        where_parts = []
+        params = []
+        param_idx = 1
+        if mode:
+            where_parts.append(f"mode = ${param_idx}")
+            params.append(mode)
+            param_idx += 1
+        if start_time is not None:
+            where_parts.append(f"time_bucket >= ${param_idx}")
+            params.append(start_time)
+            param_idx += 1
+        if end_time is not None:
+            where_parts.append(f"time_bucket <= ${param_idx}")
+            params.append(end_time)
+            param_idx += 1
+
+        where_clause = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+        try:
+            async with self._pool.acquire() as conn:
+                ip_rows = await conn.fetch(f"""
+                    SELECT client_ip,
+                           SUM(total_count) AS total,
+                           SUM(success_count) AS success,
+                           SUM(fail_count) AS fail,
+                           COUNT(*) OVER() AS total_ips
+                    FROM ip_request_stats
+                    {where_clause}
+                    GROUP BY client_ip
+                    ORDER BY total DESC, client_ip
+                    LIMIT ${param_idx}
+                """, *params, limit)
+
+                if not ip_rows:
+                    return {"total_ips": 0, "limit": limit, "ips": []}
+
+                selected_ips = [row["client_ip"] for row in ip_rows]
+                model_where_parts = list(where_parts)
+                model_where_parts.append(f"client_ip = ANY(${param_idx}::text[])")
+                model_where_clause = " WHERE " + " AND ".join(model_where_parts)
+                model_rows = await conn.fetch(f"""
+                    SELECT client_ip, model_name,
+                           SUM(total_count) AS total,
+                           SUM(success_count) AS success,
+                           SUM(fail_count) AS fail
+                    FROM ip_request_stats
+                    {model_where_clause}
+                    GROUP BY client_ip, model_name
+                    ORDER BY client_ip, total DESC, model_name
+                """, *params, selected_ips)
+
+            models_by_ip = {client_ip: [] for client_ip in selected_ips}
+            for row in model_rows:
+                models_by_ip[row["client_ip"]].append({
+                    "model_name": row["model_name"],
+                    "total": row["total"],
+                    "success": row["success"],
+                    "fail": row["fail"],
+                })
+
+            return {
+                "total_ips": ip_rows[0]["total_ips"],
+                "limit": limit,
+                "ips": [
+                    {
+                        "client_ip": row["client_ip"],
+                        "total": row["total"],
+                        "success": row["success"],
+                        "fail": row["fail"],
+                        "models": models_by_ip[row["client_ip"]],
+                    }
+                    for row in ip_rows
+                ],
+            }
+        except Exception as e:
+            log.error(f"[STATS] Error getting IP request stats summary: {e}")
+            return {"total_ips": 0, "limit": limit, "ips": []}
+
     # ==================== 错误码统计 ====================
 
     async def batch_upsert_error_code_stats(
@@ -1674,4 +1826,3 @@ class PSQLManager:
         except Exception as e:
             log.error(f"[STATS] Error getting error code stats: {e}")
             return {"summary": [], "by_model": []}
-

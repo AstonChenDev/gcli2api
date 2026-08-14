@@ -60,6 +60,31 @@ async def get_request_timeseries(
         return {"series": []}
 
 
+@router.get("/ip-addresses")
+async def get_ip_address_stats(
+    mode: str = "geminicli",
+    start_time: Optional[int] = Query(None, description="起始时间 epoch 秒"),
+    end_time: Optional[int] = Query(None, description="结束时间 epoch 秒"),
+    limit: int = Query(200, ge=1, le=500, description="最多返回的 IP 数"),
+    _=Depends(verify_panel_token),
+):
+    """获取调用方 IP 计数及各 IP 调用的模型。"""
+    try:
+        from src.storage_adapter import get_storage_adapter
+        adapter = await get_storage_adapter()
+        if hasattr(adapter._backend, "get_ip_request_stats_summary"):
+            return await adapter._backend.get_ip_request_stats_summary(
+                mode=mode,
+                start_time=start_time,
+                end_time=end_time,
+                limit=limit,
+            )
+        return {"total_ips": 0, "limit": limit, "ips": []}
+    except Exception as e:
+        log.error(f"[STATS API] Error getting IP address stats: {e}")
+        return {"total_ips": 0, "limit": limit, "ips": []}
+
+
 @router.get("/credential/{filename}")
 async def get_credential_stats(
     filename: str,
@@ -158,4 +183,3 @@ async def reset_stats(mode: str = None, _=Depends(verify_panel_token)):
     except Exception as e:
         log.error(f"[STATS API] Error resetting stats: {e}")
         return {"success": False, "message": str(e)}
-

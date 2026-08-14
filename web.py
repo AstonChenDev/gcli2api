@@ -34,6 +34,7 @@ from src.router.vertex.model_list import router as vertex_model_list_router
 from src.task_manager import shutdown_all_tasks
 from src.panel import router as panel_router
 from src.keeplive import keepalive_service
+from src.request_context import ClientIPContextMiddleware
 from src.stats_collector import stats_collector
 
 # 全局凭证管理器
@@ -198,6 +199,9 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+# 为请求级统计保存调用方 IP，覆盖流式响应的完整生命周期。
+app.add_middleware(ClientIPContextMiddleware)
 
 # CORS中间件
 app.add_middleware(

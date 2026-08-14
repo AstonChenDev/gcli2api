@@ -2160,6 +2160,19 @@
                     </div>
                 </div>
 
+                <!-- 调用方 IP 统计 -->
+                <div id="statsIpSection" style="margin-bottom: 18px;">
+                    <h4 style="margin-bottom: 8px; font-size: 14px;">🌐 调用方 IP <span id="statsIpCountInfo" style="font-size: 11px; color: var(--text-muted); font-weight: normal;">（共 0 个）</span></h4>
+                    <div style="overflow-x: auto; background: var(--card-bg); border-radius: 10px; padding: 8px 10px; border: 1px solid var(--border-color);">
+                        <table id="statsIpTable" style="width: 100%; border-collapse: collapse; font-size: 12px; min-width: 720px;">
+                            <thead><tr style="border-bottom: 2px solid var(--border-color);"></tr></thead>
+                            <tbody id="statsIpBody">
+                                <tr><td colspan="6" style="text-align: center; padding: 16px; color: var(--text-muted);">暂无 IP 调用数据</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <!-- ⚠️ 错误码分布 -->
                 <div id="statsErrorCodeSection" style="margin-bottom: 18px;">
                     <h4 style="margin-bottom: 10px; font-size: 14px;">⚠️ 错误码分布 <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">（各错误码占比）</span></h4>
@@ -2337,7 +2350,7 @@
     </div>
 
     <!-- 引入公共JavaScript模块 -->
-    <script src="./front/common.js?v=20260423"></script>
+    <script src="./front/common.js?v=20260814"></script>
 </body>
 
 </html>

@@ -1054,9 +1054,12 @@ let _statsTimeRange = '1h';
 let _statsModelsData = [];
 let _statsCredsData = [];
 let _statsReqModelsData = [];
+let _statsIpData = [];
+let _statsIpTotal = 0;
 let _statsModelSort = { key: 'total', dir: 'desc' };
 let _statsCredSort = { key: 'total', dir: 'desc' };
 let _statsReqModelSort = { key: 'total', dir: 'desc' };
+let _statsIpSort = { key: 'total', dir: 'desc' };
 let _errorCodeByModelData = [];
 let _errorCodeByModelSort = { key: 'total', dir: 'desc' };
 
@@ -1125,7 +1128,7 @@ function _getStatsTimeParams() {
 }
 
 function _sortArrow(tableType, key) {
-    const sortMap = { model: _statsModelSort, cred: _statsCredSort, reqmodel: _statsReqModelSort };
+    const sortMap = { model: _statsModelSort, cred: _statsCredSort, reqmodel: _statsReqModelSort, ip: _statsIpSort };
     const s = sortMap[tableType] || _statsModelSort;
     const isActive = s.key === key;
     const arrow = isActive ? (s.dir === 'asc' ? '▲' : '▼') : '▲';
@@ -1138,7 +1141,7 @@ function _sortableTh(tableType, key, label, align) {
 }
 
 function sortStatsTable(tableType, key) {
-    const sortMap = { model: _statsModelSort, cred: _statsCredSort, reqmodel: _statsReqModelSort };
+    const sortMap = { model: _statsModelSort, cred: _statsCredSort, reqmodel: _statsReqModelSort, ip: _statsIpSort };
     const sortState = sortMap[tableType];
     if (!sortState) return;
     if (sortState.key === key) {
@@ -1147,7 +1150,7 @@ function sortStatsTable(tableType, key) {
         sortState.key = key;
         sortState.dir = 'desc';
     }
-    const renderMap = { model: _renderModelTable, cred: _renderCredTable, reqmodel: _renderReqModelTable };
+    const renderMap = { model: _renderModelTable, cred: _renderCredTable, reqmodel: _renderReqModelTable, ip: _renderIpStatsTable };
     if (renderMap[tableType]) renderMap[tableType]();
 }
 
@@ -1157,9 +1160,9 @@ function _sortData(data, key, dir) {
         if (key === 'rate') {
             va = a.total ? a.success / a.total : -1;
             vb = b.total ? b.success / b.total : -1;
-        } else if (key === 'name' || key === 'display_name') {
-            va = (a.model_name || a.display_name || a.filename || '').toLowerCase();
-            vb = (b.model_name || b.display_name || b.filename || '').toLowerCase();
+        } else if (key === 'name' || key === 'display_name' || key === 'client_ip') {
+            va = (a.client_ip || a.model_name || a.display_name || a.filename || '').toLowerCase();
+            vb = (b.client_ip || b.model_name || b.display_name || b.filename || '').toLowerCase();
             return dir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
         } else {
             va = a[key] || 0; vb = b[key] || 0;
@@ -1240,6 +1243,70 @@ function _renderCredTable() {
     </tr>`).join('');
 }
 
+function _renderIpStatsTable(totalIps = _statsIpTotal) {
+    const body = document.getElementById('statsIpBody');
+    const thead = document.querySelector('#statsIpTable thead tr');
+    const info = document.getElementById('statsIpCountInfo');
+    if (!thead || !body) return;
+
+    thead.innerHTML =
+        _sortableTh('ip','client_ip','调用方 IP','left') +
+        '<th style="text-align:left;padding:10px 12px;">调用模型（次数）</th>' +
+        _sortableTh('ip','total','总请求','right') +
+        _sortableTh('ip','success','成功','right') +
+        _sortableTh('ip','fail','失败','right') +
+        _sortableTh('ip','rate','成功率','right');
+
+    if (info) {
+        const shown = _statsIpData.length;
+        info.textContent = totalIps > shown ? `（共 ${totalIps} 个，显示前 ${shown} 个）` : `（共 ${totalIps} 个）`;
+    }
+    if (!_statsIpData.length) {
+        body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:20px;color:var(--text-muted);">暂无 IP 调用数据</td></tr>';
+        return;
+    }
+
+    const sorted = _sortData(_statsIpData, _statsIpSort.key, _statsIpSort.dir);
+    body.innerHTML = sorted.map(item => {
+        const models = (item.models || []).map(model =>
+            `<span style="display:inline-block;margin:2px 6px 2px 0;padding:3px 7px;border-radius:10px;background:var(--hover-bg);white-space:nowrap;">${escapeHtml(String(model.model_name))} · ${formatNumber(model.total)}</span>`
+        ).join('') || '<span style="color:var(--text-muted);">--</span>';
+        return `<tr style="border-bottom:1px solid var(--border-color);">
+            <td style="padding:10px 12px;font-family:monospace;font-weight:600;white-space:nowrap;">${escapeHtml(String(item.client_ip))}</td>
+            <td style="padding:8px 12px;min-width:220px;">${models}</td>
+            <td style="text-align:right;padding:10px 12px;">${formatNumber(item.total)}</td>
+            <td style="text-align:right;padding:10px 12px;color:#28a745;">${formatNumber(item.success)}</td>
+            <td style="text-align:right;padding:10px 12px;color:${item.fail > 0 ? '#dc3545' : 'var(--text-muted)'};">${formatNumber(item.fail)}</td>
+            <td style="text-align:right;padding:10px 12px;">${calcRateHtml(item.success, item.total)}</td>
+        </tr>`;
+    }).join('');
+}
+
+async function loadIpStats() {
+    const mode = document.getElementById('statsModeSelect')?.value || 'geminicli';
+    const timeParams = _getStatsTimeParams();
+    let url = `./stats/ip-addresses?mode=${mode}`;
+    if (timeParams.start_time) url += `&start_time=${timeParams.start_time}`;
+    if (timeParams.end_time) url += `&end_time=${timeParams.end_time}`;
+
+    try {
+        const response = await fetch(url, { headers: getAuthHeaders() });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        _statsIpData = data.ips || [];
+        _statsIpTotal = data.total_ips || 0;
+        _renderIpStatsTable();
+    } catch (error) {
+        _statsIpData = [];
+        _statsIpTotal = 0;
+        _renderIpStatsTable();
+        const body = document.getElementById('statsIpBody');
+        if (body) {
+            body.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:20px;color:#dc3545;">加载 IP 统计失败：${escapeHtml(error.message)}</td></tr>`;
+        }
+    }
+}
+
 async function loadStats() {
     const mode = document.getElementById('statsModeSelect')?.value || 'geminicli';
     const timeParams = _getStatsTimeParams();
@@ -1285,6 +1352,8 @@ async function loadStats() {
         loadStatsTimeseries();
         // 加载错误码分布
         loadErrorCodeStats();
+        // 加载调用方 IP 与模型统计
+        loadIpStats();
     } catch (error) {
         showStatus(`加载统计数据失败: ${error.message}`, 'error');
     }
