@@ -5,6 +5,8 @@ Base API Client - 共用的 API 客户端基础功能
 
 import asyncio
 import json
+import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -500,12 +502,32 @@ def parse_quota_reset_timestamp(error_response: dict, mode: str = "geminicli") -
 
                     return reset_dt.astimezone(timezone.utc).timestamp()
 
-        # 如果是 RESOURCE_EXHAUSTED 错误且消息完全匹配，设置默认4小时冷却时间
+        # 解析消息中的 "Your quota will reset after Xs" / "Xh Ym Zs" 格式（RATE_LIMIT_EXCEEDED）
+        message = error_obj.get("message", "")
+        reset_match = re.search(r"Your quota will reset after (.+?)\.", message)
+        if reset_match:
+            duration_str = reset_match.group(1).strip()
+            unit_to_seconds = {
+                "s": 1,
+                "m": 60,
+                "h": 3600,
+                "d": 86400,
+            }
+            # 匹配所有 "数值+单位" 片段，支持 "6s"、"6h 30m 15s" 等组合格式
+            parts = re.findall(r"(\d+)([smhd])", duration_str)
+            if parts:
+                cooldown_seconds = sum(
+                    int(value) * unit_to_seconds[unit] for value, unit in parts
+                )
+                if cooldown_seconds > 0:
+                    cooldown_until = time.time() + cooldown_seconds
+                    return cooldown_until
+
+        # 如果是 RESOURCE_EXHAUSTED 错误且消息完全匹配，设置默认10分钟冷却时间
         if (
             error_obj.get("status") == "RESOURCE_EXHAUSTED"
             and error_obj.get("message") == "Resource has been exhausted (e.g. check quota)."
         ):
-            import time
             cooldown_until = time.time() + RESOURCE_EXHAUSTED_COOLDOWN_MINUTES * 60
             return cooldown_until
 
@@ -619,4 +641,3 @@ async def refine_cooldown_from_quota(
 
     except Exception as e:
         log.error(f"[COOLDOWN_REFINE] 异步精化冷却时间异常: {e}, 保持默认冷却")
-
