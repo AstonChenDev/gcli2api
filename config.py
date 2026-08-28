@@ -6,6 +6,7 @@ Centralizes all configuration to avoid duplication across modules.
 - 修改配置时调用 reload_config() 重新从数据库加载
 """
 
+import math
 import os
 from typing import Any, Optional
 
@@ -17,6 +18,11 @@ _config_initialized = False
 
 # 需要自动封禁的错误码 (默认值，可通过环境变量或配置覆盖)
 AUTO_BAN_ERROR_CODES = [403]
+
+# Antigravity RESOURCE_EXHAUSTED 固定冷却策略。
+# 默认恢复为本项目历史上使用的 10 分钟；显式配置为 None 时关闭冷却。
+ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_DEFAULT_MINUTES = 10.0
+ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MAX_MINUTES = 525600.0  # 最长一年，避免误配置无限占用凭证
 
 # ====================== 环境变量映射表 ======================
 # 统一维护环境变量名和配置键名的映射关系
@@ -40,6 +46,7 @@ ENV_MAPPINGS = {
     "RETURN_THOUGHTS_TO_FRONTEND": "return_thoughts_to_frontend",
     "ANTIGRAVITY_STREAM2NOSTREAM": "antigravity_stream2nostream",
     "ANTIGRAVITY_SWITCH_CREDENTIAL": "antigravity_switch_credential_enabled",
+    "ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MINUTES": "antigravity_resource_exhausted_cooldown_minutes",
     "HOST": "host",
     "PORT": "port",
     "API_PASSWORD": "api_password",
@@ -373,6 +380,76 @@ async def get_antigravity_switch_credential_enabled() -> bool:
         return env_value.lower() in ("true", "1", "yes", "on")
 
     return bool(await get_config_value("antigravity_switch_credential_enabled", False))
+
+
+def validate_antigravity_resource_exhausted_cooldown_minutes(
+    value: Any,
+) -> Optional[float]:
+    """
+    校验并规范化 Antigravity RESOURCE_EXHAUSTED 冷却分钟数。
+
+    该函数只负责值语义，不读取环境变量或数据库，便于配置接口和测试复用：
+    - None：明确关闭冷却；
+    - 正有限数：固定冷却分钟数；
+    - 布尔值、字符串、零、负数、无穷大和超长时间：拒绝。
+    """
+    if value is None:
+        return None
+
+    # bool 是 int 的子类，必须在数值判断前单独排除。
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("冷却时间必须是数字或 null")
+
+    minutes = float(value)
+    if not math.isfinite(minutes):
+        raise ValueError("冷却时间必须是有限数字")
+    if minutes <= 0:
+        raise ValueError("冷却时间必须大于0分钟；如需关闭请设置为 null")
+    if minutes > ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MAX_MINUTES:
+        raise ValueError("冷却时间不能超过525600分钟（1年）")
+
+    return minutes
+
+
+async def get_antigravity_resource_exhausted_cooldown_minutes() -> Optional[float]:
+    """
+    获取 Antigravity RESOURCE_EXHAUSTED 的固定冷却分钟数。
+
+    优先级：环境变量 > 数据库存储 > 默认 10 分钟。
+
+    环境变量 ``ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MINUTES`` 支持：
+    - 正数：启用固定时长冷却；
+    - ``none`` / ``null`` / ``off`` / ``disabled``：关闭冷却。
+
+    数据库中的 JSON ``null`` 会原样解释为关闭。这里直接检查配置键是否存在，
+    不使用通用 ``get_config_value``，因为后者会把显式 None 当成“未配置”。
+    """
+    env_name = "ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MINUTES"
+    env_value = os.getenv(env_name)
+    if env_value is not None and env_value.strip():
+        normalized_env = env_value.strip().lower()
+        if normalized_env in {"none", "null", "off", "disabled"}:
+            return None
+        try:
+            return validate_antigravity_resource_exhausted_cooldown_minutes(
+                float(normalized_env)
+            )
+        except (TypeError, ValueError):
+            # 无效环境变量不让请求链路报错，安全回退到默认冷却时间。
+            return ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_DEFAULT_MINUTES
+
+    await init_config()
+    config_key = "antigravity_resource_exhausted_cooldown_minutes"
+    if config_key not in _config_cache:
+        return ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_DEFAULT_MINUTES
+
+    try:
+        return validate_antigravity_resource_exhausted_cooldown_minutes(
+            _config_cache[config_key]
+        )
+    except (TypeError, ValueError):
+        # 数据库通常经由面板校验；若被外部工具写入非法值，仍保证服务可用。
+        return ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_DEFAULT_MINUTES
 
 
 async def get_oauth_proxy_url() -> str:

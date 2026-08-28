@@ -47,6 +47,10 @@ async def get_config(token: str = Depends(verify_panel_token)):
         current_config["retry_429_max_retries"] = await config.get_retry_429_max_retries()
         current_config["retry_429_enabled"] = await config.get_retry_429_enabled()
         current_config["retry_429_interval"] = await config.get_retry_429_interval()
+        # Antigravity 429/RESOURCE_EXHAUSTED 模型级冷却配置；None 表示关闭。
+        current_config["antigravity_resource_exhausted_cooldown_minutes"] = (
+            await config.get_antigravity_resource_exhausted_cooldown_minutes()
+        )
         # Vertex 重试配置
         current_config["vertex_max_retries"] = await config.get_vertex_max_retries()
         # 抗截断配置
@@ -123,6 +127,19 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         if "retry_429_enabled" in new_config:
             if not isinstance(new_config["retry_429_enabled"], bool):
                 raise HTTPException(status_code=400, detail="429重试开关必须是布尔值")
+
+        if "antigravity_resource_exhausted_cooldown_minutes" in new_config:
+            try:
+                new_config["antigravity_resource_exhausted_cooldown_minutes"] = (
+                    config.validate_antigravity_resource_exhausted_cooldown_minutes(
+                        new_config["antigravity_resource_exhausted_cooldown_minutes"]
+                    )
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Antigravity限额冷却配置无效：{exc}",
+                ) from exc
 
         # 验证新的配置项
         if "retry_429_interval" in new_config:

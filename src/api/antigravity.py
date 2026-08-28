@@ -31,10 +31,9 @@ from src.api.utils import (
     get_retry_config,
     record_api_call_success,
     record_api_call_error,
-    parse_and_log_cooldown,
     collect_streaming_response,
-    refine_cooldown_from_quota,
 )
+from src.api.cooldown_policy import resolve_antigravity_cooldown_until
 
 # ==================== 全局凭证管理器 ====================
 
@@ -372,23 +371,20 @@ async def stream_request(
                     if _is_retryable_status(status_code, DISABLE_ERROR_CODES):
                         log.warning(f"[ANTIGRAVITY STREAM] 流式请求失败 (status={status_code}), 模型: {model_name}, 凭证: {current_file}, 响应: {error_body[:500] if error_body else '无'}")
 
-                        # 解析冷却时间
+                        # 解析冷却时间。429 即使没有合法 JSON 响应体，也按后台配置处理。
                         cooldown_until = None
-                        if (status_code == 429 or status_code == 503) and error_body:
+                        if status_code in (429, 503):
                             try:
-                                cooldown_until = await parse_and_log_cooldown(error_body, mode="antigravity")
-                            except Exception:
-                                pass
-
-                        # 预热下一个凭证
-                        if next_cred_task is None and attempt < max_retries:
-                            next_cred_task = asyncio.create_task(
-                                credential_manager.get_valid_credential(
-                                    mode="antigravity", model_name=model_name
+                                cooldown_until = await resolve_antigravity_cooldown_until(
+                                    status_code=status_code,
+                                    error_text=error_body,
                                 )
-                            )
+                            except Exception as cooldown_error:
+                                log.warning(
+                                    f"[ANTIGRAVITY STREAM] 计算冷却时间失败: {cooldown_error}"
+                                )
 
-                        # 记录错误并切换凭证
+                        # 先持久化冷却，再预热下一个凭证，避免并发任务重新选中刚刚429的凭证。
                         await record_api_call_error(
                             credential_manager, current_file, status_code,
                             cooldown_until, mode="antigravity", model_name=model_name,
@@ -396,13 +392,12 @@ async def stream_request(
                         )
                         stats_collector.record_error_code(model_name, "antigravity", status_code, error_body)
 
-                        # 异步精化冷却时间（已禁用，直接使用默认冷却时间）
-                        # if cooldown_until is not None and access_token and model_name:
-                        #     asyncio.create_task(
-                        #         refine_cooldown_from_quota(
-                        #             credential_manager, current_file, access_token, model_name
-                        #         )
-                        #     )
+                        if next_cred_task is None and attempt < max_retries:
+                            next_cred_task = asyncio.create_task(
+                                credential_manager.get_valid_credential(
+                                    mode="antigravity", model_name=model_name
+                                )
+                            )
 
                         # 检查是否应该重试
                         should_retry = await handle_error_with_retry(
@@ -766,29 +761,33 @@ async def non_stream_request(
                 if _is_retryable_status(status_code, DISABLE_ERROR_CODES):
                     log.warning(f"[ANTIGRAVITY] 非流式请求失败 (status={status_code}), 模型: {model_name}, 凭证: {current_file}, 响应: {error_text[:500] if error_text else '无'}")
 
-                    # 解析冷却时间
+                    # 解析冷却时间。429 即使没有合法 JSON 响应体，也按后台配置处理。
                     cooldown_until = None
-                    if (status_code == 429 or status_code == 503) and error_text:
+                    if status_code in (429, 503):
                         try:
-                            cooldown_until = await parse_and_log_cooldown(error_text, mode="antigravity")
-                        except Exception:
-                            pass
-
-                    # 并行预热下一个凭证,不阻塞当前处理
-                    if next_cred_task is None and attempt < max_retries:
-                        next_cred_task = asyncio.create_task(
-                            credential_manager.get_valid_credential(
-                                mode="antigravity", model_name=model_name
+                            cooldown_until = await resolve_antigravity_cooldown_until(
+                                status_code=status_code,
+                                error_text=error_text,
                             )
-                        )
+                        except Exception as cooldown_error:
+                            log.warning(
+                                f"[ANTIGRAVITY] 计算冷却时间失败: {cooldown_error}"
+                            )
 
-                    # 记录错误并切换凭证
+                    # 先持久化冷却，再预热下一个凭证，避免并发任务重新选中刚刚429的凭证。
                     await record_api_call_error(
                         credential_manager, current_file, status_code,
                         cooldown_until, mode="antigravity", model_name=model_name,
                         error_message=error_text
                     )
                     stats_collector.record_error_code(model_name, "antigravity", status_code, error_text)
+
+                    if next_cred_task is None and attempt < max_retries:
+                        next_cred_task = asyncio.create_task(
+                            credential_manager.get_valid_credential(
+                                mode="antigravity", model_name=model_name
+                            )
+                        )
 
                     # 检查是否应该重试
                     should_retry = await handle_error_with_retry(

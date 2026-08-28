@@ -3734,6 +3734,10 @@ function populateConfigForm() {
     document.getElementById('retry429Enabled').checked = Boolean(c.retry_429_enabled);
     setConfigField('retry429MaxRetries', c.retry_429_max_retries || 20);
     setConfigField('retry429Interval', c.retry_429_interval || 0.1);
+    setConfigField(
+        'antigravityResourceExhaustedCooldownMinutes',
+        c.antigravity_resource_exhausted_cooldown_minutes ?? ''
+    );
     setConfigField('vertexMaxRetries', c.vertex_max_retries || 3);
 
     document.getElementById('compatibilityModeEnabled').checked = Boolean(c.compatibility_mode_enabled);
@@ -3783,6 +3787,22 @@ async function saveConfig() {
         const getFloat = (id, def = 0.0) => parseFloat(document.getElementById(id)?.value) || def;
         const getChecked = (id, def = false) => document.getElementById(id)?.checked || def;
 
+        // 空输入明确序列化为 null，用于关闭 Antigravity 模型冷却。
+        const cooldownInput = document.getElementById('antigravityResourceExhaustedCooldownMinutes');
+        const cooldownRawValue = cooldownInput?.value.trim() || '';
+        let antigravityResourceExhaustedCooldownMinutes = null;
+        if (cooldownRawValue !== '') {
+            antigravityResourceExhaustedCooldownMinutes = Number(cooldownRawValue);
+            if (
+                !Number.isFinite(antigravityResourceExhaustedCooldownMinutes)
+                || antigravityResourceExhaustedCooldownMinutes <= 0
+                || antigravityResourceExhaustedCooldownMinutes > 525600
+            ) {
+                showStatus('Antigravity限额冷却时间必须大于0且不超过525600分钟；留空表示关闭', 'error');
+                return;
+            }
+        }
+
         const config = {
             host: getValue('host', '0.0.0.0'),
             port: getInt('port', 7861),
@@ -3804,6 +3824,7 @@ async function saveConfig() {
             retry_429_enabled: getChecked('retry429Enabled'),
             retry_429_max_retries: getInt('retry429MaxRetries', 20),
             retry_429_interval: getFloat('retry429Interval', 0.1),
+            antigravity_resource_exhausted_cooldown_minutes: antigravityResourceExhaustedCooldownMinutes,
             vertex_max_retries: getInt('vertexMaxRetries', 3),
             compatibility_mode_enabled: getChecked('compatibilityModeEnabled'),
             return_thoughts_to_frontend: getChecked('returnThoughtsToFrontend'),

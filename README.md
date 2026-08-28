@@ -404,6 +404,7 @@ export MONGODB_URI="mongodb://localhost:27017/gcli2api?readPreference=secondaryP
 - `RETRY_429_ENABLED`: 启用 429 错误自动重试（默认：true）
 - `RETRY_429_MAX_RETRIES`: 429 错误最大重试次数（默认：3）
 - `RETRY_429_INTERVAL`: 429 错误重试间隔，秒（默认：1.0）
+- `ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MINUTES`: Antigravity 收到 429/RESOURCE_EXHAUSTED 后的模型级冷却分钟数（默认：10；设为 `none` 关闭）
 - `ANTI_TRUNCATION_MAX_ATTEMPTS`: 抗截断最大重试次数（默认：3）
 
 **网络和代理配置**
