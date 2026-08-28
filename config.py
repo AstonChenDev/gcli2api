@@ -438,7 +438,10 @@ async def get_antigravity_resource_exhausted_cooldown_minutes() -> Optional[floa
             # 无效环境变量不让请求链路报错，安全回退到默认冷却时间。
             return ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_DEFAULT_MINUTES
 
-    await init_config()
+    # 生产环境通常启用多个 worker。配置保存只会刷新处理该请求的进程，
+    # 因此这里在真正使用冷却策略前主动从共享存储重新加载，避免其他 worker
+    # 长期持有旧值，确保后台修改能够跨进程热生效。
+    await reload_config()
     config_key = "antigravity_resource_exhausted_cooldown_minutes"
     if config_key not in _config_cache:
         return ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_DEFAULT_MINUTES

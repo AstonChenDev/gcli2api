@@ -16,9 +16,14 @@ ENV_KEY = "ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MINUTES"
 @pytest.fixture(autouse=True)
 def isolate_cooldown_config(monkeypatch):
     """隔离全局配置缓存和环境变量，避免测试之间相互污染。"""
+
+    async def keep_isolated_cache():
+        return None
+
     monkeypatch.delenv(ENV_KEY, raising=False)
     monkeypatch.setattr(config, "_config_initialized", True)
     monkeypatch.setattr(config, "_config_cache", {})
+    monkeypatch.setattr(config, "reload_config", keep_isolated_cache)
 
 
 @pytest.mark.asyncio
@@ -37,6 +42,23 @@ async def test_explicit_null_config_disables_cooldown(monkeypatch):
 async def test_numeric_database_config_is_normalized(monkeypatch):
     monkeypatch.setattr(config, "_config_cache", {CONFIG_KEY: 2.5})
 
+    assert await config.get_antigravity_resource_exhausted_cooldown_minutes() == 2.5
+
+
+@pytest.mark.asyncio
+async def test_each_read_refreshes_shared_storage_to_avoid_stale_worker_cache(monkeypatch):
+    """模拟另一个 worker 已保存新值，当前 worker 必须在使用前刷新旧缓存。"""
+    shared_storage = {CONFIG_KEY: None}
+
+    async def refresh_from_shared_storage():
+        monkeypatch.setattr(config, "_config_cache", shared_storage.copy())
+
+    monkeypatch.setattr(config, "_config_cache", {CONFIG_KEY: 10.0})
+    monkeypatch.setattr(config, "reload_config", refresh_from_shared_storage)
+
+    assert await config.get_antigravity_resource_exhausted_cooldown_minutes() is None
+
+    shared_storage[CONFIG_KEY] = 2.5
     assert await config.get_antigravity_resource_exhausted_cooldown_minutes() == 2.5
 
 
