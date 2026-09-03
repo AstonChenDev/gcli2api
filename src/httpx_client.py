@@ -22,7 +22,7 @@ class HttpxClientManager:
 
         # 动态读取代理配置，支持热更新
         current_proxy_config = await get_proxy_config()
-        if current_proxy_config:
+        if current_proxy_config and "proxy" not in client_kwargs:
             client_kwargs["proxy"] = current_proxy_config
 
         return client_kwargs

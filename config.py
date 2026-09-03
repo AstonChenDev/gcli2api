@@ -47,6 +47,21 @@ ENV_MAPPINGS = {
     "ANTIGRAVITY_STREAM2NOSTREAM": "antigravity_stream2nostream",
     "ANTIGRAVITY_SWITCH_CREDENTIAL": "antigravity_switch_credential_enabled",
     "ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MINUTES": "antigravity_resource_exhausted_cooldown_minutes",
+    "ANTIGRAVITY_CAPACITY_FALLBACK_ENABLED": "antigravity_capacity_fallback_enabled",
+    "ANTIGRAVITY_CAPACITY_FALLBACK_PROXY_URL": "antigravity_capacity_fallback_proxy_url",
+    "ANTIGRAVITY_CAPACITY_FALLBACK_HTTP_STATUSES": "antigravity_capacity_fallback_http_statuses",
+    "ANTIGRAVITY_CAPACITY_FALLBACK_ERROR_STATUSES": "antigravity_capacity_fallback_error_statuses",
+    "ANTIGRAVITY_CAPACITY_FALLBACK_REASONS": "antigravity_capacity_fallback_reasons",
+    "ANTIGRAVITY_CAPACITY_FALLBACK_MODELS": "antigravity_capacity_fallback_models",
+    "ANTIGRAVITY_CAPACITY_FALLBACK_MAX_ATTEMPTS": "antigravity_capacity_fallback_max_attempts",
+    "ANTIGRAVITY_CAPACITY_FALLBACK_CONNECT_TIMEOUT_SECONDS": (
+        "antigravity_capacity_fallback_connect_timeout_seconds"
+    ),
+    "ANTIGRAVITY_CAPACITY_FALLBACK_REQUEST_TIMEOUT_SECONDS": (
+        "antigravity_capacity_fallback_request_timeout_seconds"
+    ),
+    "ANTIGRAVITY_CAPACITY_FALLBACK_STATS_ENABLED": "antigravity_capacity_fallback_stats_enabled",
+    "ANTIGRAVITY_CAPACITY_FALLBACK_ROUTE_NAME": "antigravity_capacity_fallback_route_name",
     "HOST": "host",
     "PORT": "port",
     "API_PASSWORD": "api_password",

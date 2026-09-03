@@ -34,6 +34,11 @@ from src.api.utils import (
     collect_streaming_response,
 )
 from src.api.cooldown_policy import resolve_antigravity_cooldown_until
+from src.api.capacity_fallback import (
+    CapacityFallbackState,
+    post_with_capacity_fallback,
+    stream_with_capacity_fallback,
+)
 
 # ==================== 全局凭证管理器 ====================
 
@@ -311,6 +316,7 @@ async def stream_request(
     DISABLE_ERROR_CODES = await get_auto_ban_error_codes()  # 禁用凭证的错误码
     last_error_response = None  # 记录最后一次的错误响应
     next_cred_task = None  # 预热的下一个凭证任务
+    capacity_fallback_state = CapacityFallbackState()
 
     # 内部函数：快速更新凭证(只更新token和project_id,避免重建整个请求)
     async def refresh_credential_fast():
@@ -351,11 +357,14 @@ async def stream_request(
         empty_candidate_json = None
 
         try:
-            async for chunk in stream_post_async(
+            async for chunk in stream_with_capacity_fallback(
                 url=target_url,
                 body=final_payload,
+                model_name=model_name,
+                state=capacity_fallback_state,
                 native=native,
-                headers=auth_headers
+                headers=auth_headers,
+                sender=stream_post_async,
             ):
                 # 判断是否是Response对象
                 if isinstance(chunk, Response):
@@ -645,6 +654,7 @@ async def non_stream_request(
     DISABLE_ERROR_CODES = await get_auto_ban_error_codes()  # 禁用凭证的错误码
     last_error_response = None  # 记录最后一次的错误响应
     next_cred_task = None  # 预热的下一个凭证任务
+    capacity_fallback_state = CapacityFallbackState()
 
     # 内部函数：快速更新凭证(只更新token和project_id,避免重建整个请求)
     async def refresh_credential_fast():
@@ -679,10 +689,13 @@ async def non_stream_request(
         need_retry = False  # 标记是否需要重试
         
         try:
-            response = await post_async(
+            response = await post_with_capacity_fallback(
                 url=target_url,
-                json=final_payload,
-                headers=auth_headers
+                json_body=final_payload,
+                model_name=model_name,
+                state=capacity_fallback_state,
+                headers=auth_headers,
+                sender=post_async,
             )
 
             status_code = response.status_code

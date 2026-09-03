@@ -1,0 +1,27 @@
+[Unit]
+Description=gcli2api capacity fallback SSH egress tunnel
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gcli-egress
+Group=gcli-egress
+EnvironmentFile=/etc/gcli2api/capacity-egress-tunnel.env
+ExecStart=/usr/bin/ssh -NT -D ${CAPACITY_EGRESS_LISTEN_HOST}:${CAPACITY_EGRESS_LISTEN_PORT} -p ${CAPACITY_EGRESS_SSH_PORT} -i ${CAPACITY_EGRESS_IDENTITY_FILE} -o BatchMode=yes -o ExitOnForwardFailure=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${CAPACITY_EGRESS_KNOWN_HOSTS_FILE} -o ServerAliveInterval=30 -o ServerAliveCountMax=3 ${CAPACITY_EGRESS_SSH_USER}@${CAPACITY_EGRESS_SSH_HOST}
+Restart=always
+RestartSec=5s
+TimeoutStopSec=15s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

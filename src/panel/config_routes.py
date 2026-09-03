@@ -11,6 +11,10 @@ from src.keeplive import keepalive_service
 from src.models import ConfigSaveRequest
 from src.storage_adapter import get_storage_adapter
 from src.utils import verify_panel_token
+from src.api.capacity_fallback import (
+    get_capacity_fallback_config,
+    validate_capacity_fallback_updates,
+)
 from .utils import get_env_locked_keys
 
 
@@ -51,6 +55,7 @@ async def get_config(token: str = Depends(verify_panel_token)):
         current_config["antigravity_resource_exhausted_cooldown_minutes"] = (
             await config.get_antigravity_resource_exhausted_cooldown_minutes()
         )
+        current_config.update(await get_capacity_fallback_config())
         # Vertex 重试配置
         current_config["vertex_max_retries"] = await config.get_vertex_max_retries()
         # 抗截断配置
@@ -140,6 +145,14 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                     status_code=400,
                     detail=f"Antigravity限额冷却配置无效：{exc}",
                 ) from exc
+
+        try:
+            validate_capacity_fallback_updates(new_config)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Antigravity容量回退配置无效：{exc}",
+            ) from exc
 
         # 验证新的配置项
         if "retry_429_interval" in new_config:

@@ -3763,6 +3763,7 @@ function populateConfigForm() {
             strategyEl.classList.remove('env-locked');
         }
     }
+    window.CapacityFallbackUI?.populate(c, AppState.envLockedFields);
 }
 
 function setConfigField(fieldId, value) {
@@ -3835,6 +3836,15 @@ async function saveConfig() {
             keepalive_interval: getInt('keepaliveInterval', 60),
             credential_selection_strategy: document.getElementById('credentialSelectionStrategy')?.value || 'random'
         };
+
+        if (window.CapacityFallbackUI) {
+            try {
+                Object.assign(config, window.CapacityFallbackUI.collect());
+            } catch (error) {
+                showStatus(`容量回退配置错误: ${error.message}`, 'error');
+                return;
+            }
+        }
 
         const response = await fetch('./config/save', {
             method: 'POST',
