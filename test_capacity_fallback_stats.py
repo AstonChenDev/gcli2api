@@ -2,6 +2,7 @@ import pytest
 
 from src import capacity_fallback_stats
 from src.stats_collector import StatsCollector
+from src.storage.psql_manager import PSQLManager
 
 
 class FakeStatsCollector:
@@ -59,3 +60,77 @@ def test_capacity_stats_expose_per_model_success_rate_inputs(monkeypatch):
     ]
     assert counts == {"total": 3, "success": 2, "fail": 1}
     assert counts["success"] / counts["total"] * 100 == pytest.approx(66.6666667)
+
+
+class FakeStatsConnection:
+    def __init__(self):
+        self.queries = []
+
+    async def fetchrow(self, query, *params):
+        self.queries.append(query)
+        assert params == ("capacity_fallback",)
+        return {"total": 3, "success": 2, "fail": 1}
+
+    async def fetch(self, query, *params):
+        self.queries.append(query)
+        assert params == ("capacity_fallback",)
+        if "GROUP BY model_name" in query:
+            return [
+                {
+                    "model_name": "gemini-image",
+                    "total": 3,
+                    "success": 2,
+                    "fail": 1,
+                }
+            ]
+        assert "GROUP BY filename" in query
+        return [
+            {
+                "filename": "jump-sg",
+                "user_email": None,
+                "total": 3,
+                "success": 2,
+                "fail": 1,
+            }
+        ]
+
+
+class FakeAcquireContext:
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def __aenter__(self):
+        return self.connection
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+class FakeStatsPool:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def acquire(self):
+        return FakeAcquireContext(self.connection)
+
+
+@pytest.mark.asyncio
+async def test_postgresql_summary_supports_operational_stats_mode_without_credential_table():
+    connection = FakeStatsConnection()
+    manager = PSQLManager()
+    manager._initialized = True
+    manager._pool = FakeStatsPool(connection)
+
+    summary = await manager.get_stats_summary(mode="capacity_fallback")
+
+    assert summary["global"] == {"total": 3, "success": 2, "fail": 1}
+    assert summary["models"][0]["model_name"] == "gemini-image"
+    assert summary["credentials"][0] == {
+        "filename": "jump-sg",
+        "user_email": None,
+        "display_name": "jump-sg",
+        "total": 3,
+        "success": 2,
+        "fail": 1,
+    }
+    assert not any("LEFT JOIN" in query for query in connection.queries)

@@ -1263,7 +1263,14 @@ class PSQLManager:
         支持按时间范围过滤（start_time/end_time 为 epoch 秒）
         """
         self._ensure_initialized()
-        table_name = self._get_table_name(mode)
+        # Credential modes can enrich the label from their credential table.
+        # Operational stats modes (for example capacity_fallback) deliberately
+        # have no credential table; their filename column is already a safe
+        # route label and can be aggregated directly.
+        credential_table = {
+            "geminicli": "credentials",
+            "antigravity": "antigravity_credentials",
+        }.get(mode)
 
         # 构建时间过滤条件
         time_filter = ""
@@ -1301,19 +1308,32 @@ class PSQLManager:
                     ORDER BY total DESC
                 """, *params)
 
-                # 凭证维度（JOIN 邮箱）
-                cred_rows = await conn.fetch(f"""
-                    SELECT s.filename,
-                           c.user_email,
-                           SUM(s.total_count) AS total,
-                           SUM(s.success_count) AS success,
-                           SUM(s.fail_count) AS fail
-                    FROM credential_stats s
-                    LEFT JOIN {table_name} c ON s.filename = c.filename
-                    WHERE s.mode = $1{time_filter.replace('time_bucket', 's.time_bucket')}
-                    GROUP BY s.filename, c.user_email
-                    ORDER BY total DESC
-                """, *params)
+                # 凭证模式关联邮箱；独立统计模式直接显示非敏感路由名。
+                if credential_table:
+                    cred_rows = await conn.fetch(f"""
+                        SELECT s.filename,
+                               c.user_email,
+                               SUM(s.total_count) AS total,
+                               SUM(s.success_count) AS success,
+                               SUM(s.fail_count) AS fail
+                        FROM credential_stats s
+                        LEFT JOIN {credential_table} c ON s.filename = c.filename
+                        WHERE s.mode = $1{time_filter.replace('time_bucket', 's.time_bucket')}
+                        GROUP BY s.filename, c.user_email
+                        ORDER BY total DESC
+                    """, *params)
+                else:
+                    cred_rows = await conn.fetch(f"""
+                        SELECT filename,
+                               NULL::text AS user_email,
+                               SUM(total_count) AS total,
+                               SUM(success_count) AS success,
+                               SUM(fail_count) AS fail
+                        FROM credential_stats
+                        WHERE mode = $1{time_filter}
+                        GROUP BY filename
+                        ORDER BY total DESC
+                    """, *params)
 
             return {
                 "global": {
