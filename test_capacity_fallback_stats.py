@@ -133,4 +133,5 @@ async def test_postgresql_summary_supports_operational_stats_mode_without_creden
         "success": 2,
         "fail": 1,
     }
+    assert summary["tier_models"] == []
     assert not any("LEFT JOIN" in query for query in connection.queries)

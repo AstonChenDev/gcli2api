@@ -1335,6 +1335,27 @@ class PSQLManager:
                         ORDER BY total DESC
                     """, *params)
 
+                # 按凭证当前等级聚合各模型调用结果。历史记录本身不保存等级快照，
+                # 因此已删除或无法关联的凭证统一归入 unknown。
+                tier_model_rows = []
+                if credential_table:
+                    tier_model_rows = await conn.fetch(
+                        f"""
+                        SELECT s.model_name,
+                               COALESCE(NULLIF(LOWER(c.tier), ''), 'unknown') AS tier,
+                               SUM(s.total_count) AS total,
+                               SUM(s.success_count) AS success,
+                               SUM(s.fail_count) AS fail
+                        FROM credential_stats s
+                        LEFT JOIN {credential_table} c ON s.filename = c.filename
+                        WHERE s.mode = $1{time_filter.replace('time_bucket', 's.time_bucket')}
+                        GROUP BY s.model_name,
+                                 COALESCE(NULLIF(LOWER(c.tier), ''), 'unknown')
+                        ORDER BY s.model_name, tier
+                    """,
+                        *params,
+                    )
+
             return {
                 "global": {
                     "total": global_row["total"],
@@ -1361,10 +1382,25 @@ class PSQLManager:
                     }
                     for r in cred_rows
                 ],
+                "tier_models": [
+                    {
+                        "model_name": r["model_name"],
+                        "tier": r["tier"],
+                        "total": r["total"],
+                        "success": r["success"],
+                        "fail": r["fail"],
+                    }
+                    for r in tier_model_rows
+                ],
             }
         except Exception as e:
             log.error(f"[STATS] Error getting stats summary: {e}")
-            return {"global": {"total": 0, "success": 0, "fail": 0}, "models": [], "credentials": []}
+            return {
+                "global": {"total": 0, "success": 0, "fail": 0},
+                "models": [],
+                "credentials": [],
+                "tier_models": [],
+            }
 
     async def get_stats_by_credential(
         self,

@@ -1348,6 +1348,10 @@ async function loadStats() {
         _renderModelTable();
         _renderCredTable();
 
+        document.dispatchEvent(new CustomEvent('gcli:stats-loaded', {
+            detail: { mode, tierModels: data.tier_models || [] }
+        }));
+
         // 加载时间序列图表
         loadStatsTimeseries();
         // 加载错误码分布
