@@ -1296,49 +1296,10 @@ class PSQLManager:
                     WHERE mode = $1{time_filter}
                 """, *params)
 
-                # 模型维度
-                model_rows = await conn.fetch(f"""
-                    SELECT model_name,
-                           SUM(total_count) AS total,
-                           SUM(success_count) AS success,
-                           SUM(fail_count) AS fail
-                    FROM credential_stats
-                    WHERE mode = $1{time_filter}
-                    GROUP BY model_name
-                    ORDER BY total DESC
-                """, *params)
-
                 # 凭证模式关联邮箱；独立统计模式直接显示非敏感路由名。
                 if credential_table:
-                    cred_rows = await conn.fetch(f"""
-                        SELECT s.filename,
-                               c.user_email,
-                               SUM(s.total_count) AS total,
-                               SUM(s.success_count) AS success,
-                               SUM(s.fail_count) AS fail
-                        FROM credential_stats s
-                        LEFT JOIN {credential_table} c ON s.filename = c.filename
-                        WHERE s.mode = $1{time_filter.replace('time_bucket', 's.time_bucket')}
-                        GROUP BY s.filename, c.user_email
-                        ORDER BY total DESC
-                    """, *params)
-                else:
-                    cred_rows = await conn.fetch(f"""
-                        SELECT filename,
-                               NULL::text AS user_email,
-                               SUM(total_count) AS total,
-                               SUM(success_count) AS success,
-                               SUM(fail_count) AS fail
-                        FROM credential_stats
-                        WHERE mode = $1{time_filter}
-                        GROUP BY filename
-                        ORDER BY total DESC
-                    """, *params)
-
-                # 按凭证当前等级聚合各模型调用结果。历史记录本身不保存等级快照，
-                # 因此已删除或无法关联的凭证统一归入 unknown。
-                tier_model_rows = []
-                if credential_table:
+                    # 模型汇总与等级汇总必须来自同一条 SQL。高并发写入时若分别
+                    # 查询，同一个 API 响应中的两组数字可能来自不同数据库快照。
                     tier_model_rows = await conn.fetch(
                         f"""
                         SELECT s.model_name,
@@ -1355,6 +1316,60 @@ class PSQLManager:
                     """,
                         *params,
                     )
+                    model_totals: Dict[str, Dict[str, Any]] = {}
+                    for row in tier_model_rows:
+                        totals = model_totals.setdefault(
+                            row["model_name"],
+                            {
+                                "model_name": row["model_name"],
+                                "total": 0,
+                                "success": 0,
+                                "fail": 0,
+                            },
+                        )
+                        totals["total"] += row["total"]
+                        totals["success"] += row["success"]
+                        totals["fail"] += row["fail"]
+                    model_rows = sorted(
+                        model_totals.values(),
+                        key=lambda row: row["total"],
+                        reverse=True,
+                    )
+                    cred_rows = await conn.fetch(f"""
+                        SELECT s.filename,
+                               c.user_email,
+                               SUM(s.total_count) AS total,
+                               SUM(s.success_count) AS success,
+                               SUM(s.fail_count) AS fail
+                        FROM credential_stats s
+                        LEFT JOIN {credential_table} c ON s.filename = c.filename
+                        WHERE s.mode = $1{time_filter.replace('time_bucket', 's.time_bucket')}
+                        GROUP BY s.filename, c.user_email
+                        ORDER BY total DESC
+                    """, *params)
+                else:
+                    model_rows = await conn.fetch(f"""
+                        SELECT model_name,
+                               SUM(total_count) AS total,
+                               SUM(success_count) AS success,
+                               SUM(fail_count) AS fail
+                        FROM credential_stats
+                        WHERE mode = $1{time_filter}
+                        GROUP BY model_name
+                        ORDER BY total DESC
+                    """, *params)
+                    cred_rows = await conn.fetch(f"""
+                        SELECT filename,
+                               NULL::text AS user_email,
+                               SUM(total_count) AS total,
+                               SUM(success_count) AS success,
+                               SUM(fail_count) AS fail
+                        FROM credential_stats
+                        WHERE mode = $1{time_filter}
+                        GROUP BY filename
+                        ORDER BY total DESC
+                    """, *params)
+                    tier_model_rows = []
 
             return {
                 "global": {

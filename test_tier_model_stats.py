@@ -108,6 +108,7 @@ async def test_postgres_summary_groups_each_model_by_current_credential_tier():
     assert "LEFT JOIN antigravity_credentials c" in tier_query
     assert "s.time_bucket >= $2" in tier_query
     assert "s.time_bucket <= $3" in tier_query
+    assert not any("GROUP BY model_name" in query for query, _ in connection.calls)
 
 
 def test_desktop_and_mobile_panels_load_isolated_tier_model_renderer():
