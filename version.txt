@@ -1,4 +1,4 @@
-full_hash=b7c27fc79e295f707f8c049e47b3c2b8f55e75b0
-short_hash=b7c27fc
-message=Update utils.py
-date=2026-08-28 17:38:19 +0800
+full_hash=1a506b1e0b3fa3b5d21512f57d7cdcd77700547d
+short_hash=1a506b1
+message=更新agycli版本
+date=2026-09-03 11:00:45 +0800
