@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -61,3 +62,65 @@ async def test_parse_and_log_cooldown_uses_duration_parser(monkeypatch):
     cooldown_until = await utils.parse_and_log_cooldown(error_text, mode="geminicli")
 
     assert cooldown_until == 1090.0
+
+
+def test_antigravity_parser_prefers_absolute_reset_timestamp(monkeypatch):
+    monkeypatch.setattr(utils.time, "time", lambda: 1000.0)
+    payload = {
+        "error": {
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "metadata": {
+                        "quotaResetTimeStamp": "2026-09-10T01:29:45Z",
+                        "quotaResetDelay": "10s",
+                    },
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "20s",
+                },
+            ]
+        }
+    }
+
+    cooldown_until = utils.parse_antigravity_quota_reset_timestamp(payload)
+
+    expected = datetime(2026, 9, 10, 1, 29, 45, tzinfo=timezone.utc).timestamp()
+    assert cooldown_until == expected
+
+
+def test_antigravity_parser_supports_fractional_reset_delay(monkeypatch):
+    monkeypatch.setattr(utils.time, "time", lambda: 1000.0)
+    payload = {
+        "error": {
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "metadata": {"quotaResetDelay": "6h30m15.5s"},
+                }
+            ]
+        }
+    }
+
+    cooldown_until = utils.parse_antigravity_quota_reset_timestamp(payload)
+
+    assert cooldown_until == 1000.0 + 23415.5
+
+
+def test_antigravity_parser_falls_back_to_retry_delay(monkeypatch):
+    monkeypatch.setattr(utils.time, "time", lambda: 1000.0)
+    payload = {
+        "error": {
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "63388.25s",
+                }
+            ]
+        }
+    }
+
+    cooldown_until = utils.parse_antigravity_quota_reset_timestamp(payload)
+
+    assert cooldown_until == 64388.25

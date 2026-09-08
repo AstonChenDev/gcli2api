@@ -161,6 +161,39 @@ async def test_resource_exhausted_body_uses_config_even_with_http_503(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_configured_policy_overrides_upstream_reset_metadata(monkeypatch):
+    async def configured_minutes():
+        return 10.0
+
+    monkeypatch.setattr(
+        cooldown_policy,
+        "get_antigravity_resource_exhausted_cooldown_minutes",
+        configured_minutes,
+    )
+    error_text = json.dumps(
+        {
+            "error": {
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "metadata": {"quotaResetTimeStamp": "2099-01-01T00:00:00Z"},
+                    }
+                ],
+            }
+        }
+    )
+
+    cooldown_until = await cooldown_policy.resolve_antigravity_cooldown_until(
+        status_code=429,
+        error_text=error_text,
+        now=1000.0,
+    )
+
+    assert cooldown_until == 1600.0
+
+
+@pytest.mark.asyncio
 async def test_non_quota_error_delegates_to_existing_parser(monkeypatch):
     calls = []
 
