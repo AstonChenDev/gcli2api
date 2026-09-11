@@ -410,6 +410,34 @@ async def test_invalid_grant_and_missing_project_never_store():
 
 
 @pytest.mark.asyncio
+async def test_missing_verified_email_never_stores_or_uses_backup_email():
+    adapter = FakeStorageAdapter()
+
+    async def missing_email(credentials):
+        return None
+
+    result = await import_antigravity_refresh_tokens(
+        extract_refresh_token_candidates(
+            [],
+            [
+                {
+                    "email": "untrusted-backup@example.com",
+                    "refresh_token": _refresh_token(1),
+                }
+            ],
+        ),
+        storage_adapter=adapter,
+        get_api_url=fake_api_url,
+        fetch_project=fake_project,
+        fetch_email=missing_email,
+    )
+    assert result["failed_count"] == 1
+    assert result["results"][0]["error_code"] == "email_not_found"
+    assert "email" not in result["results"][0]
+    assert not adapter.credentials
+
+
+@pytest.mark.asyncio
 async def test_oauth_errors_and_timeouts_are_safely_redacted(monkeypatch):
     sensitive_refresh = _refresh_token(1)
 
@@ -551,13 +579,13 @@ async def test_existing_verified_email_is_skipped_without_overwrite():
 
 
 @pytest.mark.asyncio
-async def test_existing_project_is_skipped_even_without_cached_email():
+async def test_shared_project_id_does_not_merge_different_accounts():
     adapter = FakeStorageAdapter()
     adapter.credentials["existing-account.json"] = {
         "refresh_token": _refresh_token(99),
         "project_id": "project-0001",
     }
-    adapter.states["existing-account.json"] = {"user_email": None}
+    adapter.states["existing-account.json"] = {"user_email": "other@example.com"}
     result = await import_antigravity_refresh_tokens(
         extract_refresh_token_candidates([_refresh_token(1)]),
         storage_adapter=adapter,
@@ -565,9 +593,25 @@ async def test_existing_project_is_skipped_even_without_cached_email():
         fetch_project=fake_project,
         fetch_email=fake_email,
     )
-    assert result["skipped_count"] == 1
-    assert result["results"][0]["error_code"] == "project_already_exists"
-    assert list(adapter.credentials) == ["existing-account.json"]
+    assert result["imported_count"] == 1
+    assert result["skipped_count"] == 0
+    assert len(adapter.credentials) == 2
+
+    async def shared_project(**kwargs):
+        return "aicode-consumers", "pro", None
+
+    adapter = FakeStorageAdapter()
+    batch = await import_antigravity_refresh_tokens(
+        extract_refresh_token_candidates([_refresh_token(1), _refresh_token(2)]),
+        storage_adapter=adapter,
+        get_api_url=fake_api_url,
+        fetch_project=shared_project,
+        fetch_email=fake_email,
+    )
+    assert batch["imported_count"] == 2
+    assert batch["skipped_count"] == 0
+    assert len(adapter.credentials) == 2
+    assert len({item["filename"] for item in batch["results"]}) == 2
 
 
 @pytest.mark.asyncio

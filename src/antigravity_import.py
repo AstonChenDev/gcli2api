@@ -50,7 +50,7 @@ class PreparedCredential:
     candidate: RefreshTokenCandidate
     credential_data: Dict[str, Any]
     project_id: str
-    email: Optional[str]
+    email: str
     tier: Optional[str]
     credit_amount: Optional[int]
 
@@ -214,14 +214,13 @@ def build_antigravity_credential_data(credentials: Credentials, project_id: str)
 
 async def _load_existing_identity_index(
     storage_adapter: StorageAdapter,
-) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
-    """Return token, verified-email, and project indexes for existing AG creds."""
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Return refresh-token and verified-email indexes for existing AG creds."""
 
     filenames = await storage_adapter.list_credentials(mode="antigravity")
     states = await storage_adapter.get_all_credential_states(mode="antigravity")
     token_index: Dict[str, str] = {}
     email_index: Dict[str, str] = {}
-    project_index: Dict[str, str] = {}
 
     for filename, state in states.items():
         if not isinstance(state, dict):
@@ -248,11 +247,8 @@ async def _load_existing_identity_index(
             refresh_token = credential_data.get("refresh_token")
             if isinstance(refresh_token, str) and refresh_token:
                 token_index[_token_digest(refresh_token)] = filename
-            project_id = credential_data.get("project_id")
-            if isinstance(project_id, str) and project_id.strip():
-                project_index[project_id.strip()] = filename
 
-    return token_index, email_index, project_index
+    return token_index, email_index
 
 
 async def _prepare_candidate(
@@ -295,6 +291,13 @@ async def _prepare_candidate(
                 # Only trust the Google userinfo response for persisted identity;
                 # Manager backup email fields are user-controlled input.
                 email = _normalize_email(await fetch_email(credentials))
+                if not email:
+                    return None, {
+                        "item": candidate.item,
+                        "status": "failed",
+                        "error_code": "email_not_found",
+                        "error": "Refresh Token 有效，但无法从 Google 获取账号邮箱",
+                    }
                 return (
                     PreparedCredential(
                         candidate=candidate,
@@ -334,9 +337,7 @@ async def import_antigravity_refresh_tokens(
     """Validate, enrich, de-duplicate, and persist AG refresh tokens."""
 
     adapter = storage_adapter or await get_storage_adapter()
-    existing_tokens, existing_emails, existing_projects = await _load_existing_identity_index(
-        adapter
-    )
+    existing_tokens, existing_emails = await _load_existing_identity_index(adapter)
     results: List[Optional[Dict[str, Any]]] = [None] * len(candidates)
     seen_request_tokens: Dict[str, int] = {}
     to_prepare: List[RefreshTokenCandidate] = []
@@ -413,7 +414,6 @@ async def import_antigravity_refresh_tokens(
             errors_by_item[error_result["item"]] = error_result
 
     seen_batch_emails: Dict[str, int] = {}
-    seen_batch_projects: Dict[str, int] = {}
     for position, candidate in enumerate(candidates):
         if results[position] is not None:
             continue
@@ -423,26 +423,17 @@ async def import_antigravity_refresh_tokens(
 
         prepared = prepared_by_item[candidate.item]
         normalized_email = _normalize_email(prepared.email)
-        if prepared.project_id in seen_batch_projects:
+        # _prepare_candidate requires a verified Google email. Keep this guard
+        # defensive in case a future caller constructs PreparedCredential itself.
+        if not normalized_email:
             results[position] = {
                 "item": candidate.item,
-                "email": normalized_email,
-                "status": "skipped",
-                "error_code": "duplicate_project_in_request",
-                "error": f"与第 {seen_batch_projects[prepared.project_id]} 项属于同一 Antigravity Project",
+                "status": "failed",
+                "error_code": "email_not_found",
+                "error": "无法确定 Google 账号身份，未保存凭证",
             }
             continue
-        if prepared.project_id in existing_projects:
-            results[position] = {
-                "item": candidate.item,
-                "email": normalized_email,
-                "status": "skipped",
-                "error_code": "project_already_exists",
-                "error": "该 Antigravity Project 已存在",
-                "filename": existing_projects[prepared.project_id],
-            }
-            continue
-        if normalized_email and normalized_email in seen_batch_emails:
+        if normalized_email in seen_batch_emails:
             results[position] = {
                 "item": candidate.item,
                 "email": normalized_email,
@@ -451,7 +442,7 @@ async def import_antigravity_refresh_tokens(
                 "error": f"与第 {seen_batch_emails[normalized_email]} 项属于同一 Google 账号",
             }
             continue
-        if normalized_email and normalized_email in existing_emails:
+        if normalized_email in existing_emails:
             results[position] = {
                 "item": candidate.item,
                 "email": normalized_email,
@@ -462,15 +453,11 @@ async def import_antigravity_refresh_tokens(
             }
             continue
 
-        # Project ID is verified, stable, and available even when userinfo is
-        # temporarily unavailable. It also makes concurrent imports of the same
-        # account converge on one filename across production workers.
-        identity_digest = hashlib.sha256(
-            f"project:{prepared.project_id}".encode("utf-8")
-        ).hexdigest()
-        seen_batch_projects[prepared.project_id] = candidate.item
-        if normalized_email:
-            seen_batch_emails[normalized_email] = candidate.item
+        # Antigravity Manager also identifies/upserts accounts by verified email.
+        # Project IDs such as "aicode-consumers" are shared by many accounts and
+        # must never be used as an account identity or duplicate key.
+        identity_digest = hashlib.sha256(f"email:{normalized_email}".encode("utf-8")).hexdigest()
+        seen_batch_emails[normalized_email] = candidate.item
         filename = f"ag_import_{identity_digest[:20]}.json"
 
         # Deterministic filenames make concurrent imports across workers
@@ -545,9 +532,7 @@ async def import_antigravity_refresh_tokens(
             }
             continue
 
-        if normalized_email:
-            existing_emails[normalized_email] = filename
-        existing_projects[prepared.project_id] = filename
+        existing_emails[normalized_email] = filename
         existing_tokens[_token_digest(candidate.refresh_token or "")] = filename
         results[position] = {
             "item": candidate.item,
