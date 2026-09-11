@@ -24,7 +24,15 @@ from src.httpx_client import get_async, post_async
 class TokenError(Exception):
     """Token相关错误"""
 
-    pass
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        oauth_error_code: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.oauth_error_code = oauth_error_code
 
 
 class Credentials:
@@ -70,7 +78,7 @@ class Credentials:
         await self.refresh()
         return True
 
-    async def refresh(self):
+    async def refresh(self, timeout: float = 900.0):
         """刷新访问令牌"""
         if not self.refresh_token:
             raise TokenError("无刷新令牌")
@@ -82,6 +90,7 @@ class Credentials:
             "grant_type": "refresh_token",
         }
 
+        response = None
         try:
             oauth_base_url = await get_oauth_proxy_url()
             token_url = f"{oauth_base_url.rstrip('/')}/token"
@@ -89,6 +98,7 @@ class Credentials:
                 token_url,
                 data=data,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=timeout,
             )
             response.raise_for_status()
 
@@ -111,18 +121,42 @@ class Credentials:
             log.debug(f"Token刷新成功，过期时间: {self.expires_at}")
 
         except Exception as e:
-            error_msg = str(e)
             status_code = None
+            oauth_error_code = None
             if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
                 status_code = e.response.status_code
-                error_msg = f"Token刷新失败 (HTTP {status_code}): {error_msg}"
-            else:
-                error_msg = f"Token刷新失败: {error_msg}"
 
+            # Preserve only Google's short OAuth error code for callers that
+            # need safe classification. Never attach the response body or the
+            # submitted refresh-token form to the exception.
+            if response is not None:
+                try:
+                    payload = response.json()
+                    candidate_code = payload.get("error") if isinstance(payload, dict) else None
+                    if (
+                        isinstance(candidate_code, str)
+                        and candidate_code
+                        and len(candidate_code) <= 64
+                        and all(ch.isalnum() or ch in "_-" for ch in candidate_code)
+                    ):
+                        oauth_error_code = candidate_code.lower()
+                except Exception:
+                    oauth_error_code = None
+
+            # Never log or propagate arbitrary transport exception text here.
+            # Some HTTP clients/proxies attach the submitted OAuth form, which
+            # contains both refresh_token and client_secret, to that text.
+            if status_code is not None:
+                suffix = f", oauth_error={oauth_error_code}" if oauth_error_code else ""
+                error_msg = f"Token刷新失败 (HTTP {status_code}{suffix})"
+            else:
+                error_msg = f"Token刷新失败 ({type(e).__name__})"
             log.error(error_msg)
-            token_error = TokenError(error_msg)
-            token_error.status_code = status_code
-            raise token_error
+            raise TokenError(
+                error_msg,
+                status_code=status_code,
+                oauth_error_code=oauth_error_code,
+            )
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Credentials":
@@ -848,5 +882,3 @@ async def _get_onboard_tier(
     else:
         log.error(f"[_get_onboard_tier] Failed to fetch tier info: HTTP {response.status_code}")
         return None
-
-

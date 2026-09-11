@@ -122,6 +122,7 @@ docker compose up -d --build
 - 凭证使用统计和配额管理
 - 支持手动启用/禁用凭证文件
 - 批量凭证文件操作（启用、禁用、删除）
+- 支持粘贴 Refresh Token 或导入 Antigravity Manager 备份，自动换取 Access Token、获取 Project ID 并生成 Antigravity 凭证
 
 **凭证状态监控**
 - 实时凭证健康检查
@@ -700,6 +701,7 @@ for part in response.candidates[0].content.parts:
 
 **凭证管理端点**（支持 `mode=geminicli` 或 `mode=antigravity` 参数）
 - `POST /creds/upload` - 批量上传凭证文件（支持 JSON 和 ZIP）
+- `POST /creds/import-antigravity-refresh-tokens` - 从 Refresh Token 或 Antigravity Manager 备份验证并生成 Antigravity 凭证（最多 100 个账号，仅接受控制面板鉴权）
 - `GET /creds/status` - 获取凭证状态列表（支持分页和筛选）
 - `GET /creds/detail/{filename}` - 获取单个凭证详情
 - `POST /creds/action` - 单个凭证操作（启用/禁用/删除）
@@ -711,6 +713,19 @@ for part in response.candidates[0].content.parts:
 - `POST /creds/deduplicate-by-email` - 按邮箱去重凭证
 - `POST /creds/verify-project/{filename}` - 检验凭证 Project ID
 - `GET /creds/quota/{filename}` - 获取凭证额度信息（仅 Antigravity）
+
+Refresh Token 导入请求示例：
+
+```json
+{
+  "refresh_tokens": ["一个或多个 Refresh Token"],
+  "manager_backup": [{"email": "可选的备份邮箱", "refresh_token": "Manager 导出的 Refresh Token"}]
+}
+```
+
+也可以只传其中一种来源。Manager 的顶层账号数组及 `{ "accounts": [...] }` 包装格式均受支持。系统只信任
+Google userinfo 返回的邮箱；必须成功获取真实 Project ID 才会写入凭证，响应不会回显 Refresh Token、Access
+Token 或 OAuth Client Secret。
 
 **配置管理端点**
 - `GET /config/get` - 获取当前配置

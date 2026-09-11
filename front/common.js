@@ -506,6 +506,190 @@ function createUploadManager(type) {
 }
 
 // =====================================================================
+// Antigravity Refresh Token / Manager backup import
+// =====================================================================
+const ANTIGRAVITY_IMPORT_MAX_BYTES = 1024 * 1024;
+
+function handleAntigravityManagerBackupSelect(event) {
+    const name = document.getElementById('antigravityManagerBackupName');
+    const file = event.target.files && event.target.files[0];
+    if (name) name.textContent = file ? file.name : '未选择文件';
+}
+
+function clearAntigravityRefreshImport(clearResults = true) {
+    const textarea = document.getElementById('antigravityRefreshTokensInput');
+    const fileInput = document.getElementById('antigravityManagerBackupInput');
+    const fileName = document.getElementById('antigravityManagerBackupName');
+    const results = document.getElementById('antigravityRefreshImportResults');
+    if (textarea) textarea.value = '';
+    if (fileInput) fileInput.value = '';
+    if (fileName) fileName.textContent = '未选择文件';
+    if (clearResults && results) {
+        results.replaceChildren();
+        results.classList.add('hidden');
+    }
+}
+
+function renderAntigravityImportError(message) {
+    const container = document.getElementById('antigravityRefreshImportResults');
+    if (!container) return;
+    container.replaceChildren();
+    container.classList.remove('hidden');
+    const error = document.createElement('div');
+    error.style.cssText = 'padding:10px 12px;border:1px solid #f5c6cb;border-radius:6px;background:#f8d7da;color:#721c24;white-space:pre-wrap;word-break:break-word;';
+    error.textContent = message || '导入失败';
+    container.appendChild(error);
+}
+
+function renderAntigravityImportResults(data) {
+    const container = document.getElementById('antigravityRefreshImportResults');
+    if (!container) return;
+    container.replaceChildren();
+    container.classList.remove('hidden');
+
+    const summary = document.createElement('div');
+    summary.style.cssText = 'padding:10px 12px;border:1px solid #c3e6cb;border-radius:6px;background:#d4edda;color:#155724;margin-bottom:10px;';
+    summary.textContent = `处理 ${data.total || 0} 项：成功 ${data.imported_count || 0}，部分成功 ${data.partial_count || 0}，跳过 ${data.skipped_count || 0}，失败 ${data.failed_count || 0}`;
+    container.appendChild(summary);
+
+    const statusLabels = {
+        success: '成功',
+        partial: '部分成功',
+        skipped: '已跳过',
+        failed: '失败'
+    };
+    const statusColors = {
+        success: ['#d4edda', '#155724', '#c3e6cb'],
+        partial: ['#fff3cd', '#856404', '#ffeeba'],
+        skipped: ['#e2e3e5', '#383d41', '#d6d8db'],
+        failed: ['#f8d7da', '#721c24', '#f5c6cb']
+    };
+
+    (Array.isArray(data.results) ? data.results : []).forEach(item => {
+        const colors = statusColors[item.status] || statusColors.failed;
+        const card = document.createElement('div');
+        card.style.cssText = `padding:10px 12px;margin-top:8px;border:1px solid ${colors[2]};border-radius:6px;background:${colors[0]};color:${colors[1]};word-break:break-word;`;
+
+        const title = document.createElement('div');
+        title.style.fontWeight = '600';
+        title.textContent = `第 ${item.item || '?'} 项 · ${statusLabels[item.status] || item.status || '未知状态'}`;
+        card.appendChild(title);
+
+        const details = [
+            item.email ? `邮箱：${item.email}` : '',
+            item.project_id ? `Project ID：${item.project_id}` : '',
+            item.tier ? `等级：${item.tier}` : '',
+            item.credit_amount !== null && item.credit_amount !== undefined ? `积分：${item.credit_amount}` : '',
+            item.filename ? `文件：${item.filename}` : '',
+            item.error_code ? `错误代码：${item.error_code}` : '',
+            item.error || ''
+        ].filter(Boolean);
+        if (details.length) {
+            const detail = document.createElement('div');
+            detail.style.cssText = 'font-size:12px;line-height:1.55;margin-top:5px;white-space:pre-wrap;';
+            detail.textContent = details.join('\n');
+            card.appendChild(detail);
+        }
+        container.appendChild(card);
+    });
+}
+
+async function importAntigravityRefreshCredentials() {
+    const textarea = document.getElementById('antigravityRefreshTokensInput');
+    const fileInput = document.getElementById('antigravityManagerBackupInput');
+    const button = document.getElementById('antigravityRefreshImportBtn');
+    const refreshTokens = (textarea ? textarea.value : '')
+        .split(/\r?\n/)
+        .map(value => value.trim())
+        .filter(Boolean);
+    const file = fileInput && fileInput.files ? fileInput.files[0] : null;
+
+    if (refreshTokens.length === 0 && !file) {
+        renderAntigravityImportError('请粘贴至少一个 Refresh Token，或选择 Manager 备份 JSON。');
+        showStatus('请提供 Refresh Token 或 Manager 备份', 'error');
+        return;
+    }
+    if (file && file.size > ANTIGRAVITY_IMPORT_MAX_BYTES) {
+        renderAntigravityImportError('Manager 备份不能超过 1 MiB。');
+        clearAntigravityRefreshImport(false);
+        showStatus('Manager 备份文件过大', 'error');
+        return;
+    }
+
+    let managerBackup = null;
+    if (file) {
+        try {
+            const fileText = (await file.text()).replace(/^\uFEFF/, '');
+            managerBackup = JSON.parse(fileText);
+        } catch (error) {
+            renderAntigravityImportError('Manager 备份不是有效的 JSON 文件。');
+            clearAntigravityRefreshImport(false);
+            showStatus('Manager 备份 JSON 无效', 'error');
+            return;
+        }
+    }
+
+    const payload = { refresh_tokens: refreshTokens, manager_backup: managerBackup };
+    const encodedPayload = JSON.stringify(payload);
+    if (new Blob([encodedPayload]).size > ANTIGRAVITY_IMPORT_MAX_BYTES) {
+        renderAntigravityImportError('导入内容合计不能超过 1 MiB。');
+        clearAntigravityRefreshImport(false);
+        showStatus('导入内容过大', 'error');
+        return;
+    }
+
+    // Clear secrets from the DOM as soon as the request payload is built. The
+    // local variables live only for this invocation and are never persisted.
+    clearAntigravityRefreshImport(false);
+
+    if (button) {
+        button.disabled = true;
+        button.textContent = '正在验证…';
+    }
+    showStatus('正在验证并生成 Antigravity 凭证…', 'info');
+
+    try {
+        const response = await fetch('./creds/import-antigravity-refresh-tokens', {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: encodedPayload
+        });
+        const responseText = await response.text();
+        let data = null;
+        try {
+            data = responseText ? JSON.parse(responseText) : null;
+        } catch (error) {
+            data = null;
+        }
+
+        if (!response.ok) {
+            renderAntigravityImportError(data && data.detail ? String(data.detail) : `导入失败（HTTP ${response.status}）`);
+            showStatus('Refresh Token 导入失败', 'error');
+            return;
+        }
+        if (!data || !Array.isArray(data.results)) {
+            renderAntigravityImportError('服务器返回了无效的导入结果。');
+            showStatus('服务器响应格式错误', 'error');
+            return;
+        }
+
+        renderAntigravityImportResults(data);
+        showStatus(
+            'Refresh Token 导入处理完成',
+            data.failed_count || data.partial_count ? 'info' : 'success'
+        );
+    } catch (error) {
+        renderAntigravityImportError('网络连接中断或服务器暂时不可用，请稍后重试。');
+        showStatus('Refresh Token 导入网络错误', 'error');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '验证并导入';
+        }
+    }
+}
+
+// =====================================================================
 // 工具函数
 // =====================================================================
 function showStatus(message, type = 'info') {

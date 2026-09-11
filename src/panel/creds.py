@@ -10,7 +10,7 @@ import time
 import zipfile
 from typing import Any, List
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, Response
 from fastapi.responses import JSONResponse
 
 from log import log
@@ -18,6 +18,12 @@ from src.credential_manager import credential_manager
 from src.models import (
     CredFileActionRequest,
     CredFileBatchActionRequest
+)
+from src.antigravity_import import (
+    AntigravityImportInputError,
+    MAX_IMPORT_BODY_BYTES,
+    import_antigravity_refresh_tokens,
+    parse_import_request_payload,
 )
 from src.storage_adapter import get_storage_adapter
 from src.utils import verify_panel_token, GEMINICLI_USER_AGENT, ANTIGRAVITY_USER_AGENT
@@ -34,6 +40,54 @@ router = APIRouter(prefix="/creds", tags=["credentials"])
 # =============================================================================
 # 工具函数 (Helper Functions)
 # =============================================================================
+
+
+@router.post("/import-antigravity-refresh-tokens")
+async def import_antigravity_refresh_token_credentials(
+    request: Request,
+    token: str = Depends(verify_panel_token),
+) -> JSONResponse:
+    """Import AG credentials after OAuth and Project ID validation.
+
+    The endpoint never returns submitted refresh tokens or generated access
+    tokens.  ``token`` is intentionally unused beyond the auth dependency.
+    """
+
+    del token
+    try:
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_IMPORT_BODY_BYTES:
+                    raise HTTPException(status_code=413, detail="导入文件不能超过 1 MiB")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Content-Length 无效")
+
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > MAX_IMPORT_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="导入文件不能超过 1 MiB")
+        try:
+            payload = json.loads(bytes(body))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise HTTPException(status_code=400, detail="请求内容不是有效的 JSON")
+
+        candidates = parse_import_request_payload(payload)
+        result = await import_antigravity_refresh_tokens(candidates)
+        return JSONResponse(content=result)
+    except AntigravityImportInputError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except HTTPException:
+        raise
+    except Exception as error:
+        log.error(
+            "Antigravity Refresh Token import aborted: "
+            f"exception={type(error).__name__}"
+        )
+        raise HTTPException(
+            status_code=500, detail="导入过程中发生内部错误，请检查服务器日志"
+        ) from error
 
 
 async def extract_json_files_from_zip(zip_file: UploadFile) -> List[dict]:

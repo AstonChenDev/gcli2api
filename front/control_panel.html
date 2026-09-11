@@ -1945,6 +1945,32 @@
                             <p id="antigravityProgressText">0%</p>
                         </div>
                     </div>
+
+                    <div style="border-top: 1px solid #cfe8d5; margin-top: 24px; padding-top: 20px;">
+                        <h4 style="margin: 0 0 8px; color: #218838;">🔑 通过 Refresh Token / Manager 备份导入</h4>
+                        <p style="color: #666; font-size: 13px; margin: 0 0 12px;">
+                            一行一个 Refresh Token，或选择 Antigravity Manager 导出的 JSON。系统会先验证令牌并获取
+                            Project ID，成功后才写入 Antigravity 凭证池。自定义 OAuth Client 生成的令牌可能无法导入。
+                        </p>
+                        <textarea id="antigravityRefreshTokensInput" rows="6" spellcheck="false" autocomplete="off"
+                            placeholder="每行粘贴一个 Refresh Token（不会在结果中回显）"
+                            style="width:100%;padding:10px 14px;border:1px solid #ced4da;border-radius:6px;box-sizing:border-box;resize:vertical;font-family:monospace;background:#fff;color:#212529;"></textarea>
+                        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;">
+                            <label class="btn" for="antigravityManagerBackupInput"
+                                style="margin:0;background-color:#5a6268;cursor:pointer;">选择 Manager 备份 JSON</label>
+                            <input id="antigravityManagerBackupInput" type="file" accept=".json,application/json"
+                                style="display:none;" onchange="handleAntigravityManagerBackupSelect(event)">
+                            <span id="antigravityManagerBackupName" style="font-size:13px;color:#666;">未选择文件</span>
+                        </div>
+                        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;">
+                            <button id="antigravityRefreshImportBtn" class="btn" style="background-color:#28a745;"
+                                onclick="importAntigravityRefreshCredentials()">验证并导入</button>
+                            <button class="btn" style="background-color:#6c757d;"
+                                onclick="clearAntigravityRefreshImport()">清空敏感内容</button>
+                        </div>
+                        <div id="antigravityRefreshImportResults" class="hidden" role="status" aria-live="polite"
+                            style="margin-top:15px;"></div>
+                    </div>
                 </div>
             </div>
 
@@ -2921,7 +2947,7 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <!-- 引入公共JavaScript模块 -->
     <script src="./front/capacity_fallback.js?v=20260903"></script>
-    <script src="./front/common.js?v=20260903-tier-stats"></script>
+    <script src="./front/common.js?v=20260911-refresh-import"></script>
     <script src="./front/tier_model_stats.js?v=20260903"></script>
 
 </body>
