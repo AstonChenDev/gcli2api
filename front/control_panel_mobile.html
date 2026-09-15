@@ -1445,6 +1445,8 @@
                             项</span>
                     </div>
                     <div class="batch-controls-grid">
+                        <button class="btn btn-small" id="batchDownloadBtn" onclick="downloadSelectedCreds()"
+                            disabled>下载所选</button>
                         <button class="btn btn-small" id="batchEnableBtn" onclick="batchAction('enable')"
                             disabled>批量启用</button>
                         <button class="btn btn-small" id="batchDisableBtn" onclick="batchAction('disable')"
@@ -1642,6 +1644,8 @@
                             项</span>
                     </div>
                     <div class="batch-controls-grid">
+                        <button class="btn btn-small" id="antigravityBatchDownloadBtn"
+                            onclick="downloadSelectedAntigravityCreds()" disabled>下载所选</button>
                         <button class="btn btn-small" id="antigravityBatchEnableBtn"
                             onclick="batchAntigravityAction('enable')" disabled>批量启用</button>
                         <button class="btn btn-small" id="antigravityBatchDisableBtn"
@@ -2385,7 +2389,7 @@
 
     <!-- 引入公共JavaScript模块 -->
     <script src="./front/capacity_fallback.js?v=20260903"></script>
-    <script src="./front/common.js?v=20260911-refresh-import"></script>
+    <script src="./front/common.js?v=20260915-selected-download"></script>
     <script src="./front/tier_model_stats.js?v=20260903"></script>
 </body>
 

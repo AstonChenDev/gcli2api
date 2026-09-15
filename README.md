@@ -708,6 +708,7 @@ for part in response.candidates[0].content.parts:
 - `POST /creds/batch-action` - 批量凭证操作
 - `GET /creds/download/{filename}` - 下载单个凭证文件
 - `GET /creds/download-all` - 打包下载所有凭证
+- `POST /creds/download-selected` - 打包下载指定的多个凭证
 - `POST /creds/fetch-email/{filename}` - 获取用户邮箱
 - `POST /creds/refresh-all-emails` - 批量刷新用户邮箱
 - `POST /creds/deduplicate-by-email` - 按邮箱去重凭证

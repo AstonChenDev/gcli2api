@@ -17,7 +17,8 @@ from log import log
 from src.credential_manager import credential_manager
 from src.models import (
     CredFileActionRequest,
-    CredFileBatchActionRequest
+    CredFileBatchActionRequest,
+    CredFileBatchDownloadRequest,
 )
 from src.antigravity_import import (
     AntigravityImportInputError,
@@ -35,6 +36,8 @@ from .utils import validate_mode
 
 # 创建路由器
 router = APIRouter(prefix="/creds", tags=["credentials"])
+
+MAX_SELECTED_DOWNLOAD_FILES = 5000
 
 
 # =============================================================================
@@ -388,6 +391,83 @@ async def download_all_creds_common(mode: str = "geminicli") -> Response:
     log.info(f"打包完成: 成功 {success_count}/{len(credential_filenames)} 个文件")
 
     zip_buffer.seek(0)
+    return Response(
+        content=zip_buffer.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={zip_filename}"},
+    )
+
+
+def normalize_download_filenames(filenames: List[str]) -> List[str]:
+    """校验并去重批量下载文件名，同时保留用户选择顺序。"""
+    if not filenames:
+        raise HTTPException(status_code=400, detail="请至少选择一个凭证文件")
+    if len(filenames) > MAX_SELECTED_DOWNLOAD_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"单次最多下载 {MAX_SELECTED_DOWNLOAD_FILES} 个凭证文件",
+        )
+
+    normalized = []
+    seen = set()
+    for filename in filenames:
+        if (
+            not filename
+            or not filename.endswith(".json")
+            or os.path.basename(filename) != filename
+            or "/" in filename
+            or "\\" in filename
+        ):
+            raise HTTPException(status_code=400, detail=f"无效的凭证文件名: {filename}")
+        if filename not in seen:
+            normalized.append(filename)
+            seen.add(filename)
+
+    return normalized
+
+
+async def download_selected_creds_common(
+    filenames: List[str], mode: str = "geminicli"
+) -> Response:
+    """仅打包下载明确选择的凭证文件。"""
+    mode = validate_mode(mode)
+    selected_filenames = normalize_download_filenames(filenames)
+    storage_adapter = await get_storage_adapter()
+
+    available_filenames = set(await storage_adapter.list_credentials(mode=mode))
+    missing_filenames = [
+        filename for filename in selected_filenames if filename not in available_filenames
+    ]
+    if missing_filenames:
+        preview = ", ".join(missing_filenames[:10])
+        suffix = " 等" if len(missing_filenames) > 10 else ""
+        raise HTTPException(
+            status_code=404,
+            detail=f"以下凭证文件不存在或已被删除: {preview}{suffix}",
+        )
+
+    credentials = []
+    for filename in selected_filenames:
+        credential_data = await storage_adapter.get_credential(filename, mode=mode)
+        if not credential_data:
+            raise HTTPException(
+                status_code=404,
+                detail=f"凭证文件不存在或已被删除: {filename}",
+            )
+        credentials.append((filename, credential_data))
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for filename, credential_data in credentials:
+            content = json.dumps(credential_data, ensure_ascii=False, indent=2)
+            zip_file.writestr(filename, content)
+
+    zip_filename = (
+        "antigravity_selected_credentials.zip"
+        if mode == "antigravity"
+        else "selected_credentials.zip"
+    )
+    log.info(f"已打包下载 {len(credentials)} 个选中的 {mode} 凭证文件")
     return Response(
         content=zip_buffer.getvalue(),
         media_type="application/zip",
@@ -1082,6 +1162,23 @@ async def download_cred_file(
     except Exception as e:
         log.error(f"下载凭证文件失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/download-selected")
+async def download_selected_creds(
+    request: CredFileBatchDownloadRequest,
+    token: str = Depends(verify_panel_token),
+    mode: str = "geminicli",
+):
+    """将用户选中的凭证文件打包为 ZIP 下载。"""
+    try:
+        mode = validate_mode(mode)
+        return await download_selected_creds_common(request.filenames, mode=mode)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"多选凭证打包下载失败: {e}")
+        raise HTTPException(status_code=500, detail="多选凭证打包下载失败")
 
 
 @router.post("/fetch-email/{filename}")

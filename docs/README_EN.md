@@ -760,6 +760,7 @@ for part in response.candidates[0].content.parts:
 - `POST /creds/batch-action` - Batch credential operations
 - `GET /creds/download/{filename}` - Download single credential file
 - `GET /creds/download-all` - Package download all credentials
+- `POST /creds/download-selected` - Package and download selected credentials
 - `POST /creds/fetch-email/{filename}` - Get user email
 - `POST /creds/refresh-all-emails` - Batch refresh user emails
 - `POST /creds/deduplicate-by-email` - Deduplicate credentials by email

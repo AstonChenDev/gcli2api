@@ -760,6 +760,7 @@ for part in response.candidates[0].content.parts:
 - `POST /creds/batch-action` - クレデンシャルの一括操作
 - `GET /creds/download/{filename}` - 単一クレデンシャルファイルのダウンロード
 - `GET /creds/download-all` - 全クレデンシャルの一括ダウンロード
+- `POST /creds/download-selected` - 選択したクレデンシャルの一括ダウンロード
 - `POST /creds/fetch-email/{filename}` - ユーザーメールの取得
 - `POST /creds/refresh-all-emails` - ユーザーメールの一括更新
 - `POST /creds/deduplicate-by-email` - メールによるクレデンシャルの重複排除

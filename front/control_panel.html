@@ -2054,6 +2054,8 @@
                             <label for="selectAllCheckbox">全选</label>
                         </div>
                         <span class="selected-count" id="selectedCount">已选择 0 项</span>
+                        <button class="batch-btn" style="background-color: #2563eb;" id="batchDownloadBtn"
+                            onclick="downloadSelectedCreds()" disabled>下载所选</button>
                         <button class="batch-btn batch-enable" id="batchEnableBtn" onclick="batchAction('enable')"
                             disabled>批量启用</button>
                         <button class="batch-btn batch-disable" id="batchDisableBtn" onclick="batchAction('disable')"
@@ -2212,6 +2214,8 @@
                             <label for="selectAllAntigravityCheckbox">全选</label>
                         </div>
                         <span class="selected-count" id="antigravitySelectedCount">已选择 0 项</span>
+                        <button class="batch-btn" style="background-color: #2563eb;" id="antigravityBatchDownloadBtn"
+                            onclick="downloadSelectedAntigravityCreds()" disabled>下载所选</button>
                         <button class="batch-btn batch-enable" id="antigravityBatchEnableBtn"
                             onclick="batchAntigravityAction('enable')" disabled>批量启用</button>
                         <button class="batch-btn batch-disable" id="antigravityBatchDisableBtn"
@@ -2947,7 +2951,7 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <!-- 引入公共JavaScript模块 -->
     <script src="./front/capacity_fallback.js?v=20260903"></script>
-    <script src="./front/common.js?v=20260911-refresh-import"></script>
+    <script src="./front/common.js?v=20260915-selected-download"></script>
     <script src="./front/tier_model_stats.js?v=20260903"></script>
 
 </body>

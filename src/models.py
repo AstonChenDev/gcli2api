@@ -374,5 +374,14 @@ class CredFileBatchActionRequest(BaseModel):
     filenames: List[str]  # 批量操作的文件名列表
 
 
+class CredFileBatchDownloadRequest(BaseModel):
+    filenames: List[str] = Field(
+        ...,
+        min_length=1,
+        max_length=5000,
+        description="需要打包下载的凭证文件名列表",
+    )
+
+
 class ConfigSaveRequest(BaseModel):
     config: dict

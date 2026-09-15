@@ -69,6 +69,7 @@ function createCredsManager(type) {
                 batchAction: `./creds/batch-action`,
                 download: `./creds/download`,
                 downloadAll: `./creds/download-all`,
+                downloadSelected: `./creds/download-selected`,
                 detail: `./creds/detail`,
                 fetchEmail: `./creds/fetch-email`,
                 refreshAllEmails: `./creds/refresh-all-emails`,
@@ -256,7 +257,7 @@ function createCredsManager(type) {
             const selectedCount = this.selectedFiles.size;
             document.getElementById(this.getElementId('SelectedCount')).textContent = `已选择 ${selectedCount} 项`;
 
-            const batchBtns = ['Enable', 'Disable', 'Delete', 'Verify', 'Preview', 'Test', 'EnableCredit', 'DisableCredit', 'ClearCooldown'].map(action =>
+            const batchBtns = ['Download', 'Enable', 'Disable', 'Delete', 'Verify', 'Preview', 'Test', 'EnableCredit', 'DisableCredit', 'ClearCooldown'].map(action =>
                 document.getElementById(this.getElementId(`Batch${action}Btn`))
             );
             batchBtns.forEach(btn => btn && (btn.disabled = selectedCount === 0));
@@ -302,6 +303,62 @@ function createCredsManager(type) {
                 }
             } catch (error) {
                 showStatus(`网络错误: ${error.message}`, 'error');
+            }
+        },
+
+        // 将当前选中的凭证打包下载
+        async downloadSelected() {
+            const selectedFiles = Array.from(this.selectedFiles);
+            if (selectedFiles.length === 0) {
+                showStatus('请先选择要下载的凭证文件', 'error');
+                return;
+            }
+
+            const button = document.getElementById(this.getElementId('BatchDownloadBtn'));
+            if (button) button.disabled = true;
+            showStatus(`正在打包 ${selectedFiles.length} 个选中的凭证文件...`, 'info');
+
+            try {
+                const response = await fetch(
+                    `${this.getEndpoint('downloadSelected')}?${this.getModeParam()}`,
+                    {
+                        method: 'POST',
+                        headers: getAuthHeaders(),
+                        body: JSON.stringify({ filenames: selectedFiles })
+                    }
+                );
+
+                if (!response.ok) {
+                    let message = `服务器返回 ${response.status}`;
+                    try {
+                        const errorData = await response.json();
+                        message = errorData.detail || errorData.error || message;
+                    } catch (_) {
+                        // 非 JSON 错误响应使用状态码提示
+                    }
+                    throw new Error(message);
+                }
+
+                const blob = await response.blob();
+                const fallbackName = this.type === 'antigravity'
+                    ? 'antigravity_selected_credentials.zip'
+                    : 'selected_credentials.zip';
+                const disposition = response.headers.get('Content-Disposition') || '';
+                const filenameMatch = disposition.match(/filename="?([^";]+)"?/i);
+                const downloadName = filenameMatch ? filenameMatch[1] : fallbackName;
+                const url = window.URL.createObjectURL(blob);
+                const anchor = document.createElement('a');
+                anchor.href = url;
+                anchor.download = downloadName;
+                document.body.appendChild(anchor);
+                anchor.click();
+                anchor.remove();
+                window.setTimeout(() => window.URL.revokeObjectURL(url), 1000);
+                showStatus(`已打包下载选中的 ${selectedFiles.length} 个凭证文件`, 'success');
+            } catch (error) {
+                showStatus(`多选打包下载失败: ${error.message}`, 'error');
+            } finally {
+                this.updateBatchControls();
             }
         },
 
@@ -2362,6 +2419,7 @@ function toggleSelectAll() {
     AppState.creds.updateBatchControls();
 }
 function batchAction(action) { AppState.creds.batchAction(action); }
+function downloadSelectedCreds() { AppState.creds.downloadSelected(); }
 function downloadCred(filename) {
     fetch(`./creds/download/${filename}`, { headers: { 'Authorization': `Bearer ${AppState.authToken}` } })
         .then(r => r.ok ? r.blob() : Promise.reject())
@@ -2422,6 +2480,7 @@ function toggleSelectAllAntigravity() {
     AppState.antigravityCreds.updateBatchControls();
 }
 function batchAntigravityAction(action) { AppState.antigravityCreds.batchAction(action); }
+function downloadSelectedAntigravityCreds() { AppState.antigravityCreds.downloadSelected(); }
 function downloadAntigravityCred(filename) {
     fetch(`./creds/download/${filename}?mode=antigravity`, { headers: getAuthHeaders() })
         .then(r => r.ok ? r.blob() : Promise.reject())

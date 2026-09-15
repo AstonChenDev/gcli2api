@@ -756,4 +756,4 @@ def test_desktop_and_mobile_pages_expose_one_shared_import_ui():
         for element_id in expected_ids:
             assert html.count(f'id="{element_id}"') == 1
         assert "importAntigravityRefreshCredentials()" in html
-        assert "common.js?v=20260911-refresh-import" in html
+        assert "common.js?v=20260915-selected-download" in html
