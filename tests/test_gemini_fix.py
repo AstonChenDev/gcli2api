@@ -1,3 +1,5 @@
+import copy
+
 import pytest
 
 from src.converter.antigravity_fix import (
@@ -140,3 +142,92 @@ def test_generation_config_accepts_both_field_styles_and_emits_camel_case(payloa
         "responseModalities": ["TEXT", "IMAGE"],
         "imageConfig": {"imageSize": "2K"},
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model",
+    ["gemini-3-pro-high", "gemini-3-pro-high-thinking", "gemini-3.1-pro-high"],
+)
+async def test_antigravity_preserves_legacy_routes_and_thoughts_setting(monkeypatch, model):
+    async def return_thoughts():
+        return False
+
+    monkeypatch.setattr("config.get_return_thoughts_to_frontend", return_thoughts)
+    request = {
+        "model": model,
+        "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        "generationConfig": {
+            "thinkingConfig": {"thinkingBudget": 8192, "thinkingLevel": "high"},
+        },
+    }
+    original = copy.deepcopy(request)
+
+    result = await normalize_antigravity_request(request)
+
+    assert result["model"] == "gemini-pro-agent"
+    assert result["generationConfig"]["thinkingConfig"] == {"includeThoughts": False}
+    assert request == original
+
+
+@pytest.mark.asyncio
+async def test_antigravity_cleans_empty_claude_text_without_mutating_history(monkeypatch):
+    async def return_thoughts():
+        return True
+
+    monkeypatch.setattr("config.get_return_thoughts_to_frontend", return_thoughts)
+    request = {
+        "model": "claude-opus-4-6-thinking",
+        "contents": [
+            {"role": "user", "parts": [{"text": "question"}]},
+            {
+                "role": "model",
+                "parts": [{"text": "\n "}, {"text": [{"type": "text", "text": "answer"}]}],
+            },
+            {"role": "user", "parts": [{"text": "continue"}]},
+            {"role": "model", "parts": [{"text": "prefill"}]},
+        ],
+    }
+    original = copy.deepcopy(request)
+
+    result = await normalize_antigravity_request(request)
+
+    assert request == original
+    assert result["contents"][-1]["role"] == "user"
+    assert result["contents"][1]["parts"][-1]["text"] == "answer"
+    assert all(part.get("text") for part in result["contents"][1]["parts"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "client_config", "expected"),
+    [
+        ("gemini-3.8-flash", {"thinkingBudget": 0}, {"thinkingLevel": "low"}),
+        ("gemini-3.8-flash-high", {"thinkingLevel": "low"}, {"thinkingLevel": "high"}),
+        ("gemini-2.5-pro", {"thinkingBudget": 0}, {"thinkingBudget": 128}),
+        ("gemini-2.5-flash", {"thinkingBudget": 100000}, {"thinkingBudget": 24576}),
+    ],
+)
+async def test_gemini_thinking_profiles_preserve_client_inputs(
+    monkeypatch, model, client_config, expected
+):
+    async def return_thoughts():
+        return False
+
+    monkeypatch.setattr("config.get_return_thoughts_to_frontend", return_thoughts)
+    request = {
+        "model": model,
+        "generationConfig": {"thinkingConfig": client_config},
+        "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        "safetySettings": [{"category": "CUSTOM", "threshold": "BLOCK_LOW_AND_ABOVE"}],
+    }
+    original = copy.deepcopy(request)
+
+    result = await normalize_gemini_request(request)
+
+    assert result["generationConfig"]["thinkingConfig"] == {
+        **expected,
+        "includeThoughts": False,
+    }
+    assert result["safetySettings"] == request["safetySettings"]
+    assert request == original
