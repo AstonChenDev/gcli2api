@@ -27,6 +27,9 @@ def extract_usage_tokens(source: Any) -> Dict[str, int]:
     Gemini 语义（与 PR#432 对齐）:
     - promptTokenCount 含缓存 token（cachedContentTokenCount）
     - completion = candidatesTokenCount + thoughtsTokenCount
+
+    同时兼容 v1internal 新版 Interactions 格式（对齐 Antigravity-Manager CanonicalUsage::from_gemini）:
+    - total_input_tokens / total_output_tokens / total_thought_tokens / total_cached_tokens
     """
     prompt_tokens = completion_tokens = total_tokens = cached_tokens = 0
 
@@ -54,13 +57,41 @@ def extract_usage_tokens(source: Any) -> Dict[str, int]:
     if not isinstance(metadata, dict):
         return {}
 
-    prompt_tokens = int(metadata.get("promptTokenCount", 0) or 0)
-    reasoning_tokens = int(metadata.get("thoughtsTokenCount", 0) or 0)
-    completion_tokens = int(metadata.get("candidatesTokenCount", 0) or 0) + reasoning_tokens
-    total_tokens = int(
-        metadata.get("totalTokenCount", prompt_tokens + completion_tokens) or 0
+    def _first_int(*keys: str) -> int:
+        for key in keys:
+            value = metadata.get(key)
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+        return 0
+
+    prompt_tokens = _first_int("promptTokenCount", "total_input_tokens", "input_tokens")
+    reasoning_tokens = _first_int("thoughtsTokenCount", "total_thought_tokens")
+    candidates_tokens = _first_int("candidatesTokenCount", "total_output_tokens")
+    completion_tokens = candidates_tokens + reasoning_tokens
+    total_tokens = _first_int("totalTokenCount", "total_tokens") or (prompt_tokens + completion_tokens)
+
+    # 缓存命中数：旧版 cachedContentTokenCount / 新版 total_cached_tokens，及 Anthropic 风格明细
+    cached_tokens = _first_int(
+        "cachedContentTokenCount",
+        "cached_content_token_count",
+        "total_cached_tokens",
+        "cached_tokens",
+        "cache_read_input_tokens",
     )
-    cached_tokens = int(metadata.get("cachedContentTokenCount", 0) or 0)
+    if not cached_tokens:
+        for details_key in ("prompt_tokens_details", "input_tokens_details"):
+            details = metadata.get(details_key)
+            if isinstance(details, dict):
+                value = details.get("cached_tokens")
+                if value is not None:
+                    try:
+                        cached_tokens = int(value)
+                    except (TypeError, ValueError):
+                        cached_tokens = 0
+                    break
 
     return {
         "prompt_tokens": prompt_tokens,

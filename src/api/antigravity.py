@@ -526,8 +526,11 @@ async def stream_request(
                         success_recorded = True
                         log.debug(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}")
 
-                    # 从流块中提取 token 用量（通常在最后一个数据块带 usageMetadata）
-                    if not usage_tokens and native is False:
+                    # 从流块中提取 token 用量。
+                    # usageMetadata 可能出现在多个块（首块可能只是部分计数），
+                    # 上游最终计数以最后出现的 usageMetadata 为准（last-wins，
+                    # 对齐 Antigravity-Manager 的流式 usage 聚合行为）
+                    if native is False:
                         from src.usage_log import extract_usage_tokens
 
                         extracted = extract_usage_tokens(chunk)
