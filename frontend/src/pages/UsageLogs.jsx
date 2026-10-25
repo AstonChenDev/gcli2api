@@ -203,7 +203,9 @@ export default function UsageLogs() {
             </div>
             <div className="min-w-0">
               <div className="text-xl font-bold">{formatTokens(stats.total_tokens)}</div>
-              <div className="text-xs text-gray-500">总 Tokens</div>
+              <div className="text-xs text-gray-500">
+                总 Tokens{stats.cached_tokens > 0 ? `（缓存 ${formatTokens(stats.cached_tokens)}）` : ""}
+              </div>
             </div>
           </div>
         </div>
@@ -331,6 +333,11 @@ export default function UsageLogs() {
                   <div className="text-gray-600">
                     ↑{formatTokens(item.prompt_tokens)} ↓{formatTokens(item.completion_tokens)}
                   </div>
+                  {item.cached_tokens > 0 && (
+                    <div className="text-emerald-500/80" title="Prompt 中命中缓存的 token">
+                      ⚡缓存 {formatTokens(item.cached_tokens)}
+                    </div>
+                  )}
                 </div>
               </div>
             </button>
@@ -385,6 +392,7 @@ export default function UsageLogs() {
                 ["Prompt Tokens", String(detail.prompt_tokens)],
                 ["Completion Tokens", String(detail.completion_tokens)],
                 ["Total Tokens", String(detail.total_tokens)],
+                ...(detail.cached_tokens > 0 ? [["缓存 Tokens", String(detail.cached_tokens)]] : []),
               ].map(([k, v]) => (
                 <div key={k} className="flex justify-between gap-4 border-b border-dark-700 pb-1.5">
                   <span className="text-gray-500 shrink-0">{k}</span>

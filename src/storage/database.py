@@ -108,6 +108,7 @@ class UsageLog(Base):
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cached_tokens: Mapped[int] = mapped_column(Integer, default=0)  # prompt 中命中缓存的 token（含在 prompt_tokens 内）
 
     # 失败时的错误摘要
     error_message: Mapped[str] = mapped_column(Text, default="")
@@ -747,6 +748,7 @@ class Database:
                     prompt_tokens=int(entry.get("prompt_tokens", 0) or 0),
                     completion_tokens=int(entry.get("completion_tokens", 0) or 0),
                     total_tokens=int(entry.get("total_tokens", 0) or 0),
+                    cached_tokens=int(entry.get("cached_tokens", 0) or 0),
                     error_message=str(entry.get("error_message", ""))[:2000],
                     request_log_file=str(entry.get("request_log_file", ""))[:512],
                 ))
@@ -831,6 +833,7 @@ class Database:
                 "prompt_tokens": r.prompt_tokens,
                 "completion_tokens": r.completion_tokens,
                 "total_tokens": r.total_tokens,
+                "cached_tokens": r.cached_tokens or 0,
                 "error_message": r.error_message or "",
                 "request_log_file": r.request_log_file or "",
             }
@@ -867,6 +870,7 @@ class Database:
             func.coalesce(func.sum(UsageLog.prompt_tokens), 0).label("prompt_tokens"),
             func.coalesce(func.sum(UsageLog.completion_tokens), 0).label("completion_tokens"),
             func.coalesce(func.sum(UsageLog.total_tokens), 0).label("total_tokens"),
+            func.coalesce(func.sum(UsageLog.cached_tokens), 0).label("cached_tokens"),
             func.coalesce(func.avg(UsageLog.use_time), 0).label("avg_use_time"),
         ).where(*conditions)
 
@@ -893,6 +897,7 @@ class Database:
             "prompt_tokens": row.prompt_tokens or 0,
             "completion_tokens": row.completion_tokens or 0,
             "total_tokens": row.total_tokens or 0,
+            "cached_tokens": row.cached_tokens or 0,
             "avg_use_time": round(float(row.avg_use_time or 0), 2),
             "by_model": [
                 {"model_name": m.model_name or "(unknown)", "count": m.count, "total_tokens": m.total_tokens}

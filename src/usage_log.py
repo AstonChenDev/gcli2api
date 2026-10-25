@@ -25,10 +25,10 @@ def extract_usage_tokens(source: Any) -> Dict[str, int]:
     - 流式块: data 字符串内的 usageMetadata（通常只在最后一个块出现）
 
     Gemini 语义（与 PR#432 对齐）:
-    - promptTokenCount 含缓存 token
+    - promptTokenCount 含缓存 token（cachedContentTokenCount）
     - completion = candidatesTokenCount + thoughtsTokenCount
     """
-    prompt_tokens = completion_tokens = total_tokens = 0
+    prompt_tokens = completion_tokens = total_tokens = cached_tokens = 0
 
     if isinstance(source, (str, bytes)):
         # 流式 SSE 块：解析 JSON 提取 usageMetadata
@@ -60,11 +60,13 @@ def extract_usage_tokens(source: Any) -> Dict[str, int]:
     total_tokens = int(
         metadata.get("totalTokenCount", prompt_tokens + completion_tokens) or 0
     )
+    cached_tokens = int(metadata.get("cachedContentTokenCount", 0) or 0)
 
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
+        "cached_tokens": cached_tokens,
     }
 
 
@@ -74,7 +76,7 @@ async def record_usage_log(entry: Dict[str, Any]) -> None:
 
     必要字段: model_name, success
     可选字段: api_format, client_ip, request_id, credential_email, is_stream,
-              status_code, use_time, prompt_tokens, completion_tokens, total_tokens, error_message,
+              status_code, use_time, prompt_tokens, completion_tokens, total_tokens, cached_tokens, error_message,
               request_log_file（请求体详细日志的磁盘文件索引，空=未记录）
     """
     try:
