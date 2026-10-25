@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Optional
 
 import httpx
 
@@ -69,18 +69,6 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 # 回调服务器配置
 CALLBACK_HOST = "localhost"
 
-# Model name lists for different features
-BASE_MODELS = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-3-flash-preview",
-    "gemini-3.1-pro-preview",
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.8-flash",
-]
-
-
 # ====================== Model Helper Functions ======================
 
 # 抗截断模型前缀
@@ -97,59 +85,6 @@ def get_base_model_from_feature_model(model_name: str) -> str:
     if model_name.startswith(_ANTI_TRUNCATION_PREFIX):
         return model_name[len(_ANTI_TRUNCATION_PREFIX) :]
     return model_name
-
-def get_available_models(router_type: str = "openai") -> List[str]:
-    """
-    Get available models with feature prefixes.
-
-    Args:
-        router_type: "openai" or "gemini"
-
-    Returns:
-        List of model names with feature prefixes
-    """
-    models = []
-
-    for base_model in BASE_MODELS:
-        # 基础模型
-        models.append(base_model)
-
-        # 抗截断模型 (前缀格式)
-        models.append(f"抗截断-{base_model}")
-
-        # 定义思考后缀（根据模型系列不同）
-        thinking_suffixes = []
-
-        # Gemini 2.5 系列: 使用思考预算后缀
-        if "gemini-2.5" in base_model:
-            thinking_suffixes = ["-max", "-high", "-medium", "-low", "-minimal"]
-        # Gemini 3 系列: 使用思考等级后缀
-        elif "gemini-3" in base_model:
-            if "flash" in base_model:
-                # 3-flash-preview: 支持 high/medium/low/minimal
-                thinking_suffixes = ["-high", "-medium", "-low", "-minimal"]
-            elif "pro" in base_model:
-                # 3-pro-preview: 支持 high/low
-                thinking_suffixes = ["-high", "-low"]
-
-        search_suffix = "-search"
-
-        # 1. 单独的 thinking 后缀
-        for thinking_suffix in thinking_suffixes:
-            models.append(f"{base_model}{thinking_suffix}")
-            models.append(f"抗截断-{base_model}{thinking_suffix}")
-
-        # 2. 单独的 search 后缀
-        models.append(f"{base_model}{search_suffix}")
-        models.append(f"抗截断-{base_model}{search_suffix}")
-
-        # 3. thinking + search 组合后缀
-        for thinking_suffix in thinking_suffixes:
-            combined_suffix = f"{thinking_suffix}{search_suffix}"
-            models.append(f"{base_model}{combined_suffix}")
-            models.append(f"抗截断-{base_model}{combined_suffix}")
-
-    return models
 
 
 # ====================== Authentication Functions ======================
