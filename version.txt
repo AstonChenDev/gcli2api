@@ -1,4 +1,4 @@
-full_hash=bb2b405b1c0c3bedbdaee6a271ea16c7d1de5807
-short_hash=bb2b405
-message=Update utils.py
-date=2026-10-25 11:11:22 +0800
+full_hash=42858711f64cd1a00ca3687ffcb609d72d7d89d5
+short_hash=4285871
+message=自动获取最新版本号
+date=2026-10-25 11:28:26 +0800
