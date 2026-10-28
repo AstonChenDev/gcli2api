@@ -7,7 +7,7 @@ import asyncio
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from config import get_usage_log_enabled
@@ -20,6 +20,39 @@ from src.utils import verify_panel_token
 
 # 创建路由器
 router = APIRouter(prefix="/usage-logs", tags=["usage-logs"])
+
+
+@router.get("/credential-stats")
+async def get_credential_usage_stats(
+    token: str = Depends(verify_panel_token),
+    offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200),
+    start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None,
+    model_name: str = "", credential_email: Optional[str] = None,
+):
+    if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
+        raise HTTPException(400, "开始时间不能晚于结束时间")
+    database = await get_database()
+    result = await database.credential_usage_stats(offset=offset, limit=limit,
+        start_timestamp=start_timestamp, end_timestamp=end_timestamp,
+        model_name=model_name.strip(), credential_email=credential_email.strip() if credential_email is not None else None)
+    result["logging_enabled"] = await get_usage_log_enabled()
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/credential-errors")
+async def get_credential_usage_errors(
+    credential_email: str, model_name: str,
+    token: str = Depends(verify_panel_token),
+    offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100),
+    start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None,
+    status_code: Optional[int] = None,
+):
+    if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
+        raise HTTPException(400, "开始时间不能晚于结束时间")
+    database = await get_database()
+    return JSONResponse(content=await database.credential_usage_errors(offset=offset, limit=limit,
+        status_code=status_code, start_timestamp=start_timestamp, end_timestamp=end_timestamp,
+        model_name=model_name.strip(), credential_email=credential_email.strip()), headers={"Cache-Control": "no-store"})
 
 
 @router.get("/list")

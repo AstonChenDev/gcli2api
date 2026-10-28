@@ -6,7 +6,7 @@
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def model_to_dict(model: BaseModel) -> Dict[str, Any]:
@@ -215,6 +215,10 @@ class CredFileActionRequest(BaseModel):
 class CredFileBatchActionRequest(BaseModel):
     action: str  # "enable", "disable", "delete"
     emails: List[str]
+
+
+class CredentialSelectionRequest(BaseModel):
+    emails: List[str] = Field(min_length=1, max_length=1000)
 
 
 class ConfigSaveRequest(BaseModel):

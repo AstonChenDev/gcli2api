@@ -15,6 +15,7 @@ import { useCallback, useEffect, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
+import CredentialUsageStats from "../components/CredentialUsageStats";
 
 const PAGE_SIZES = [20, 50, 100, 200].map((n) => ({ value: n, label: `每页 ${n}` }));
 
@@ -41,6 +42,17 @@ function formatMaybeJson(text) {
 }
 
 export default function UsageLogs() {
+  const [view, setView] = useState("logs");
+  return <div className="space-y-4">
+    <div className="flex gap-2" role="tablist" aria-label="请求日志视图">
+      <button role="tab" aria-selected={view === "logs"} onClick={() => setView("logs")} className={`btn text-sm ${view === "logs" ? "btn-primary" : "btn-secondary"}`}>请求明细</button>
+      <button role="tab" aria-selected={view === "stats"} onClick={() => setView("stats")} className={`btn text-sm ${view === "stats" ? "btn-primary" : "btn-secondary"}`}>数据统计（凭证 / 模型）</button>
+    </div>
+    {view === "logs" ? <UsageLogDetails /> : <CredentialUsageStats />}
+  </div>;
+}
+
+function UsageLogDetails() {
   const [items, setItems] = useState([]);
   const [total, setTotal] = useState(0);
   const [stats, setStats] = useState(null);
@@ -172,38 +184,38 @@ export default function UsageLogs() {
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           <div className="card p-4 flex items-center gap-3">
             <div className="p-2.5 bg-purple-600/20 rounded-lg">
-              <Database size={20} className="text-purple-400" />
+              <Database size={20} className="text-purple-700" />
             </div>
             <div className="min-w-0">
               <div className="text-xl font-bold">{stats.total_requests}</div>
-              <div className="text-xs text-gray-500">总请求</div>
+              <div className="text-xs text-slate-500">总请求</div>
             </div>
           </div>
           <div className="card p-4 flex items-center gap-3">
             <div className="p-2.5 bg-green-600/20 rounded-lg">
-              <CheckCircle size={20} className="text-green-400" />
+              <CheckCircle size={20} className="text-green-700" />
             </div>
             <div className="min-w-0">
-              <div className="text-xl font-bold text-green-400">{stats.success_count}</div>
-              <div className="text-xs text-gray-500">成功</div>
+              <div className="text-xl font-bold text-green-700">{stats.success_count}</div>
+              <div className="text-xs text-slate-500">成功</div>
             </div>
           </div>
           <div className="card p-4 flex items-center gap-3">
             <div className="p-2.5 bg-red-600/20 rounded-lg">
-              <XCircle size={20} className="text-red-400" />
+              <XCircle size={20} className="text-red-700" />
             </div>
             <div className="min-w-0">
-              <div className="text-xl font-bold text-red-400">{stats.error_count}</div>
-              <div className="text-xs text-gray-500">失败</div>
+              <div className="text-xl font-bold text-red-700">{stats.error_count}</div>
+              <div className="text-xs text-slate-500">失败</div>
             </div>
           </div>
           <div className="card p-4 flex items-center gap-3">
             <div className="p-2.5 bg-blue-600/20 rounded-lg">
-              <Cpu size={20} className="text-blue-400" />
+              <Cpu size={20} className="text-blue-700" />
             </div>
             <div className="min-w-0">
               <div className="text-xl font-bold">{formatTokens(stats.total_tokens)}</div>
-              <div className="text-xs text-gray-500">
+              <div className="text-xs text-slate-500">
                 总 Tokens{stats.cached_tokens > 0 ? `（缓存 ${formatTokens(stats.cached_tokens)}）` : ""}
               </div>
             </div>
@@ -274,14 +286,14 @@ export default function UsageLogs() {
           value={modelFilter}
           onChange={(e) => { setModelFilter(e.target.value); setPage(1); }}
           placeholder="模型名筛选"
-          className="w-full sm:w-40 bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-gray-200 text-xs sm:text-sm placeholder-gray-500"
+          className="w-full sm:w-40 bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-slate-800 text-xs sm:text-sm placeholder-slate-400"
         />
         <input
           value={statusCodeFilter}
           onChange={(e) => { setStatusCodeFilter(e.target.value); setPage(1); }}
           placeholder="错误码筛选"
           inputMode="numeric"
-          className="w-full sm:w-28 bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-gray-200 text-xs sm:text-sm placeholder-gray-500"
+          className="w-full sm:w-28 bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-slate-800 text-xs sm:text-sm placeholder-slate-400"
         />
         <Select
           value={pageSize}
@@ -297,7 +309,7 @@ export default function UsageLogs() {
           <Loader2 className="animate-spin text-purple-500" size={28} />
         </div>
       ) : items.length === 0 ? (
-        <div className="card p-8 text-center text-gray-500">暂无请求日志</div>
+        <div className="card p-8 text-center text-slate-500">暂无请求日志</div>
       ) : (
         <div className="space-y-2">
           {items.map((item) => (
@@ -309,28 +321,28 @@ export default function UsageLogs() {
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className={`text-xs px-1.5 py-0.5 rounded ${item.success ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"}`}>
+                    <span className={`text-xs px-1.5 py-0.5 rounded ${item.success ? "bg-green-500/15 text-green-700" : "bg-red-500/15 text-red-700"}`}>
                       {item.success ? "✓ 成功" : `✗ ${item.status_code || "失败"}`}
                     </span>
-                    <span className="text-sm font-medium text-gray-200 truncate">{item.model_name || "(unknown)"}</span>
+                    <span className="text-sm font-medium text-slate-800 truncate">{item.model_name || "(unknown)"}</span>
                       {item.upstream_model_name && item.upstream_model_name !== item.model_name && (
-                        <span className="text-xs text-gray-500 truncate" title="后端真实模型名">→ {item.upstream_model_name}</span>
+                        <span className="text-xs text-slate-500 truncate" title="后端真实模型名">→ {item.upstream_model_name}</span>
                       )}
-                      <span className="text-xs px-1.5 py-0.5 rounded bg-dark-700 text-gray-400">
+                      <span className="text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
                         {item.api_format === "openai" ? "OpenAI" : item.api_format === "gemini" ? "Gemini" : item.api_format === "anthropic" ? "Claude" : item.api_format || "?"}
                       </span>
-                      {item.is_stream && <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400">流式</span>}
-                      {item.request_log_file && <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400">详细</span>}
+                      {item.is_stream && <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-700">流式</span>}
+                      {item.request_log_file && <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-700">详细</span>}
                     </div>
-                  <div className="text-xs text-gray-500 mt-1 flex flex-wrap gap-x-3 gap-y-0.5">
+                  <div className="text-xs text-slate-500 mt-1 flex flex-wrap gap-x-3 gap-y-0.5">
                     <span className="flex items-center gap-1"><Clock size={11} />{formatTime(item.created_at)}</span>
                     <span>{(item.use_time || 0).toFixed(1)}s</span>
                     <span>{item.credential_email || "-"}</span>
                   </div>
                 </div>
-                <div className="text-right shrink-0 text-xs text-gray-400">
+                <div className="text-right shrink-0 text-xs text-slate-600">
                   <div>{formatTokens(item.total_tokens)} tokens</div>
-                  <div className="text-gray-600">
+                  <div className="text-slate-500">
                     ↑{formatTokens(item.prompt_tokens)} ↓{formatTokens(item.completion_tokens)}
                   </div>
                   {item.cached_tokens > 0 && (
@@ -347,7 +359,7 @@ export default function UsageLogs() {
 
       {/* 分页 */}
       {total > 0 && (
-        <div className="flex items-center justify-between text-sm text-gray-400">
+        <div className="flex items-center justify-between text-sm text-slate-600">
           <span>共 {total} 条</span>
           <div className="flex items-center gap-2">
             <button
@@ -371,11 +383,11 @@ export default function UsageLogs() {
 
       {/* 详情弹窗 */}
       {detail && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60" onClick={() => setDetail(null)}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/30" onClick={() => setDetail(null)}>
           <div className="card max-w-lg w-full max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-base font-semibold text-purple-400">请求详情</h3>
-              <button onClick={() => setDetail(null)} className="text-gray-400 hover:text-white">✕</button>
+              <h3 className="text-base font-semibold text-purple-700">请求详情</h3>
+              <button onClick={() => setDetail(null)} className="text-slate-600 hover:text-slate-900">✕</button>
             </div>
             <div className="space-y-2 text-sm">
               {[
@@ -394,15 +406,15 @@ export default function UsageLogs() {
                 ["Total Tokens", String(detail.total_tokens)],
                 ...(detail.cached_tokens > 0 ? [["缓存 Tokens", String(detail.cached_tokens)]] : []),
               ].map(([k, v]) => (
-                <div key={k} className="flex justify-between gap-4 border-b border-dark-700 pb-1.5">
-                  <span className="text-gray-500 shrink-0">{k}</span>
-                  <span className="text-gray-200 text-right break-all">{v}</span>
+                <div key={k} className="flex justify-between gap-4 border-b border-slate-200 pb-1.5">
+                  <span className="text-slate-500 shrink-0">{k}</span>
+                  <span className="text-slate-800 text-right break-all">{v}</span>
                 </div>
               ))}
               {detail.error_message && (
                 <div>
-                  <div className="text-gray-500 mb-1">错误信息</div>
-                  <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-2.5 text-xs text-red-300 break-all">
+                  <div className="text-slate-500 mb-1">错误信息</div>
+                  <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-2.5 text-xs text-red-700 break-all">
                     {detail.error_message}
                   </div>
                 </div>
@@ -410,7 +422,7 @@ export default function UsageLogs() {
               {detail.request_log_file && (
                 <div className="pt-2">
                   <div className="flex items-center justify-between gap-2">
-                    <div className="text-gray-500">请求体详细日志</div>
+                    <div className="text-slate-500">请求体详细日志</div>
                     <button
                       onClick={openRequestBody}
                       disabled={detailBodyLoading}
@@ -420,7 +432,7 @@ export default function UsageLogs() {
                       查看详细内容
                     </button>
                   </div>
-                  <p className="text-xs text-gray-500 mt-1.5">
+                  <p className="text-xs text-slate-500 mt-1.5">
                     命中指定错误码时保存了发往上游的完整请求头与请求体，用于排查请求体错误（如 400）
                   </p>
                 </div>
@@ -432,51 +444,51 @@ export default function UsageLogs() {
 
       {/* 请求体详细日志弹窗 */}
       {detailBody && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/70" onClick={() => setDetailBody(null)}>
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-slate-900/40" onClick={() => setDetailBody(null)}>
           <div className="card max-w-4xl w-full max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             {detailBody.__missing ? (
-              <div className="py-8 text-center text-sm text-gray-400">
-                <AlertTriangle size={28} className="mx-auto mb-3 text-amber-400" />
+              <div className="py-8 text-center text-sm text-slate-600">
+                <AlertTriangle size={28} className="mx-auto mb-3 text-amber-700" />
                 <div>{detailBody.__message}</div>
-                <div className="text-xs text-gray-500 mt-2">磁盘上的详细日志文件可能已被清理或手动删除</div>
+                <div className="text-xs text-slate-500 mt-2">磁盘上的详细日志文件可能已被清理或手动删除</div>
               </div>
             ) : (
               <>
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-base font-semibold text-purple-400">请求体详细日志</h3>
+              <h3 className="text-base font-semibold text-purple-700">请求体详细日志</h3>
               <div className="flex items-center gap-2">
                 <button onClick={copyDetailBody} className="btn btn-secondary text-xs px-3 py-1.5">
                   复制 JSON
                 </button>
-                <button onClick={() => setDetailBody(null)} className="text-gray-400 hover:text-white">✕</button>
+                <button onClick={() => setDetailBody(null)} className="text-slate-600 hover:text-slate-900">✕</button>
               </div>
             </div>
-            <p className="text-xs text-gray-500 mb-3">
+            <p className="text-xs text-slate-500 mb-3">
               命中指定错误码时保存，用于排查请求体错误：完整记录发往上游的请求头（已脱敏）与请求体。响应体为上游返回的原始错误。
             </p>
             <div className="space-y-3 text-xs">
               <div>
-                <div className="text-gray-400 mb-1">请求 URL</div>
-                <pre className="bg-dark-800 border border-dark-600 rounded-lg p-2.5 overflow-x-auto text-gray-200 whitespace-pre-wrap break-all">{detailBody.url || "-"}</pre>
+                <div className="text-slate-600 mb-1">请求 URL</div>
+                <pre className="bg-slate-50 border border-slate-300 rounded-lg p-2.5 overflow-x-auto text-slate-800 whitespace-pre-wrap break-all">{detailBody.url || "-"}</pre>
               </div>
               <div>
-                <div className="text-gray-400 mb-1">请求头（已脱敏）</div>
-                <pre className="bg-dark-800 border border-dark-600 rounded-lg p-2.5 overflow-x-auto text-gray-200">{JSON.stringify(detailBody.request_headers || {}, null, 2)}</pre>
+                <div className="text-slate-600 mb-1">请求头（已脱敏）</div>
+                <pre className="bg-slate-50 border border-slate-300 rounded-lg p-2.5 overflow-x-auto text-slate-800">{JSON.stringify(detailBody.request_headers || {}, null, 2)}</pre>
               </div>
               <div>
-                <div className="text-gray-400 mb-1">请求体</div>
-                <pre className="bg-dark-800 border border-dark-600 rounded-lg p-2.5 overflow-x-auto text-gray-200">{JSON.stringify(detailBody.request_body ?? {}, null, 2)}</pre>
+                <div className="text-slate-600 mb-1">请求体</div>
+                <pre className="bg-slate-50 border border-slate-300 rounded-lg p-2.5 overflow-x-auto text-slate-800">{JSON.stringify(detailBody.request_body ?? {}, null, 2)}</pre>
               </div>
               {detailBody.response_body && (
                 <div>
-                  <div className="text-gray-400 mb-1">上游响应</div>
-                  <pre className="bg-dark-800 border border-dark-600 rounded-lg p-2.5 overflow-x-auto text-gray-200 whitespace-pre-wrap break-all">{formatMaybeJson(detailBody.response_body)}</pre>
+                  <div className="text-slate-600 mb-1">上游响应</div>
+                  <pre className="bg-slate-50 border border-slate-300 rounded-lg p-2.5 overflow-x-auto text-slate-800 whitespace-pre-wrap break-all">{formatMaybeJson(detailBody.response_body)}</pre>
                 </div>
               )}
               {detailBody.error_message && (
                 <div>
-                  <div className="text-gray-400 mb-1">错误摘要</div>
-                  <pre className="bg-red-500/10 border border-red-500/30 rounded-lg p-2.5 overflow-x-auto text-red-300 whitespace-pre-wrap break-all">{detailBody.error_message}</pre>
+                  <div className="text-slate-600 mb-1">错误摘要</div>
+                  <pre className="bg-red-500/10 border border-red-500/30 rounded-lg p-2.5 overflow-x-auto text-red-700 whitespace-pre-wrap break-all">{detailBody.error_message}</pre>
                 </div>
               )}
             </div>

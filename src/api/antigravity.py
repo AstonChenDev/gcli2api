@@ -27,6 +27,8 @@ from src.credential_manager import (
 )
 from src.httpx_client import stream_post_async, post_async
 from src.models import Model, model_to_dict
+from src.stream_metadata import StreamMetadata
+from src.thought_boundary import prepare_thought_boundary, ThoughtBoundaryGuard, ERROR_CODE as BOUNDARY_ERROR
 from src.utils import ANTIGRAVITY_USER_AGENT
 
 # 导入共同的基础功能
@@ -373,6 +375,9 @@ async def stream_request(
 
     # 构建 CLI 格式请求体
     inner_request = body.get("request", body)
+    boundary_marker = None
+    if native is False:
+        inner_request, boundary_marker = prepare_thought_boundary(model_name, inner_request)
     final_payload, _ = await wrap_cli_request(inner_request, model_name, project_id)
 
     # 3. 调用stream_post_async进行请求
@@ -419,6 +424,10 @@ async def stream_request(
         need_retry = False  # 标记是否需要重试
         usage_tokens: Dict[str, int] = {}  # 从流中提取的 token 用量
         attempt_start_time = time.time()  # 本次上游调用开始时间
+        stream_metadata = StreamMetadata()
+        thought_guard = (ThoughtBoundaryGuard(boundary_marker,
+            (inner_request.get("generationConfig", {}).get("thinkingConfig") or {}).get("includeThoughts", True))
+            if boundary_marker else None)
 
         async def _log_stream_result(status_code: int, success: bool, error_message: str = "") -> None:
             """
@@ -426,6 +435,14 @@ async def stream_request(
             重试会在后续 attempt 各自再记一条，属于正常行为）。
             """
             from src.usage_log import record_usage_log
+
+            if stream_metadata.response_id:
+                log.info("[UPSTREAM_STREAM_METADATA] " + json.dumps({
+                    "request_id": log_entry.get("request_id", ""),
+                    "model": model_name, "status": status_code,
+                    **stream_metadata.as_dict(),
+                    **(thought_guard.metadata() if thought_guard else {}),
+                }, ensure_ascii=True))
 
             # 请求体详细日志：命中配置错误码时写盘，数据库只存文件索引
             request_log_file = await _record_request_body_detail(
@@ -531,6 +548,7 @@ async def stream_request(
                     # 上游最终计数以最后出现的 usageMetadata 为准（last-wins，
                     # 对齐 Antigravity-Manager 的流式 usage 聚合行为）
                     if native is False:
+                        stream_metadata.observe(chunk)
                         from src.usage_log import extract_usage_tokens
 
                         extracted = extract_usage_tokens(chunk)
@@ -543,10 +561,24 @@ async def stream_request(
                     else:
                         log.debug(f"[ANTIGRAVITY STREAM RAW] chunk(str): {chunk}")
 
-                    yield chunk
+                    if thought_guard:
+                        protected = thought_guard.feed(chunk)
+                        if protected is not None:
+                            yield protected
+                        if thought_guard.failed:
+                            await _log_stream_result(502, False, BOUNDARY_ERROR)
+                            yield thought_guard.error_response()
+                            return
+                    else:
+                        yield chunk
 
             # 流式请求完成，检查结果
             if success_recorded:
+                if thought_guard and not thought_guard.complete:
+                    thought_guard.failed = True
+                    await _log_stream_result(502, False, BOUNDARY_ERROR)
+                    yield thought_guard.error_response()
+                    return
                 log.debug(f"[ANTIGRAVITY STREAM] 流式响应完成，模型: {model_name}")
                 await _log_stream_result(200, True)
                 return

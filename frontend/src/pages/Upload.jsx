@@ -51,14 +51,14 @@ export default function UploadPage() {
 
   return (
     <div className="space-y-6">
-      <div className="bg-gradient-to-br from-emerald-900/30 to-emerald-800/10 border border-emerald-700/30 rounded-xl p-5">
-        <h3 className="text-lg font-semibold text-emerald-400 mb-2">批量导入凭证</h3>
-        <p className="text-sm text-gray-400">
+      <div className="bg-gradient-to-br from-emerald-50 to-white border border-emerald-700/30 rounded-xl p-5">
+        <h3 className="text-lg font-semibold text-emerald-700 mb-2">批量导入凭证</h3>
+        <p className="text-sm text-slate-600">
           支持批量导入 Antigravity 凭证（.json 或包含 JSON 文件的 .zip）。
         </p>
-        <div className="mt-3 text-xs text-gray-500 bg-dark-800/60 rounded-lg p-3">
-          <p className="mb-1 font-medium text-gray-400">规范 JSON 格式：</p>
-          <pre className="text-emerald-300/80 whitespace-pre-wrap font-mono">{`{
+        <div className="mt-3 text-xs text-slate-500 bg-slate-50/60 rounded-lg p-3">
+          <p className="mb-1 font-medium text-slate-600">规范 JSON 格式：</p>
+          <pre className="text-emerald-700/80 whitespace-pre-wrap font-mono">{`{
   "refresh_token": "必填",
   "email": "可选，缺失自动获取",
   "tier": "可选，缺失自动获取",
@@ -73,7 +73,7 @@ export default function UploadPage() {
         className={`border-2 border-dashed rounded-xl p-10 text-center cursor-pointer transition-colors ${
           dragOver
             ? "border-purple-500 bg-purple-500/10"
-            : "border-dark-600 hover:border-dark-500"
+            : "border-slate-300 hover:border-slate-400"
         }`}
         onClick={() => inputRef.current?.click()}
         onDragOver={(e) => {
@@ -87,9 +87,9 @@ export default function UploadPage() {
           addFiles(e.dataTransfer.files);
         }}
       >
-        <Upload className="mx-auto text-purple-400 mb-3" size={32} />
-        <p className="text-gray-300">点击选择文件或拖拽文件到此区域</p>
-        <p className="text-gray-500 text-sm mt-1">支持 .json 和 .zip 格式，ZIP 会自动提取其中的 JSON 凭证</p>
+        <Upload className="mx-auto text-purple-700 mb-3" size={32} />
+        <p className="text-slate-700">点击选择文件或拖拽文件到此区域</p>
+        <p className="text-slate-500 text-sm mt-1">支持 .json 和 .zip 格式，ZIP 会自动提取其中的 JSON 凭证</p>
         <input
           ref={inputRef}
           type="file"
@@ -107,7 +107,7 @@ export default function UploadPage() {
       {files.length > 0 && (
         <div className="card space-y-3">
           <div className="flex items-center justify-between">
-            <h4 className="text-sm font-medium text-gray-300">
+            <h4 className="text-sm font-medium text-slate-700">
               已选择 {files.length} 个文件
             </h4>
             <div className="flex gap-2">
@@ -136,19 +136,19 @@ export default function UploadPage() {
             {files.map((f) => (
               <div
                 key={f.name}
-                className="flex items-center justify-between bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm"
+                className="flex items-center justify-between bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-sm"
               >
-                <div className="flex items-center gap-2 text-gray-300 min-w-0">
-                  <FileJson size={15} className="text-purple-400 flex-shrink-0" />
+                <div className="flex items-center gap-2 text-slate-700 min-w-0">
+                  <FileJson size={15} className="text-purple-700 flex-shrink-0" />
                   <span className="truncate">{f.name}</span>
                 </div>
                 <div className="flex items-center gap-3 flex-shrink-0">
-                  <span className="text-gray-500 text-xs">
+                  <span className="text-slate-500 text-xs">
                     {(f.size / 1024).toFixed(1)} KB
                   </span>
                   <button
                     onClick={() => removeFile(f.name)}
-                    className="text-gray-500 hover:text-red-400"
+                    className="text-slate-500 hover:text-red-700"
                   >
                     <X size={14} />
                   </button>
@@ -163,25 +163,25 @@ export default function UploadPage() {
       {results && (
         <div className="card space-y-3">
           {results.error ? (
-            <div className="bg-red-500/10 border border-red-500/30 text-red-400 px-4 py-3 rounded-lg">
+            <div className="bg-red-500/10 border border-red-500/30 text-red-700 px-4 py-3 rounded-lg">
               {results.error}
             </div>
           ) : (
             <>
-              <div className="bg-green-500/10 border border-green-500/30 text-green-400 px-4 py-3 rounded-lg flex items-center gap-2">
+              <div className="bg-green-500/10 border border-green-500/30 text-green-700 px-4 py-3 rounded-lg flex items-center gap-2">
                 <CheckCircle size={16} />
                 {results.message ||
                   `上传完成: 成功 ${successCount}/${totalCount} 个文件`}
               </div>
               {results.results?.some((r) => r.status === "error") && (
                 <div className="space-y-1.5">
-                  <div className="text-sm text-gray-400">失败详情:</div>
+                  <div className="text-sm text-slate-600">失败详情:</div>
                   {results.results
                     .filter((r) => r.status === "error")
                     .map((r, i) => (
                       <div
                         key={i}
-                        className="bg-red-500/10 border border-red-500/20 text-red-400 text-xs px-3 py-2 rounded-lg"
+                        className="bg-red-500/10 border border-red-500/20 text-red-700 text-xs px-3 py-2 rounded-lg"
                       >
                         <span className="font-medium">{r.filename}</span>: {r.message}
                       </div>

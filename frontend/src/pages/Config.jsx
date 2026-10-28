@@ -196,7 +196,7 @@ export default function Config() {
 
     if (isLocked) {
       return (
-        <div className="text-xs text-amber-400/80 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
+        <div className="text-xs text-amber-700/80 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
           该配置已被环境变量锁定，修改环境变量后重启生效
         </div>
       );
@@ -209,7 +209,7 @@ export default function Config() {
             type="button"
             onClick={() => setField(field.key, !value)}
             className={`relative w-11 h-6 rounded-full transition-colors ${
-              value ? "bg-purple-600" : "bg-dark-600"
+              value ? "bg-purple-600" : "bg-slate-200"
             }`}
           >
             <span
@@ -218,7 +218,7 @@ export default function Config() {
               }`}
             />
           </button>
-          <span className="text-sm text-gray-300">{value ? "已启用" : "已禁用"}</span>
+          <span className="text-sm text-slate-700">{value ? "已启用" : "已禁用"}</span>
         </label>
       );
     }
@@ -234,7 +234,7 @@ export default function Config() {
             className="w-full sm:w-64"
           />
           {field.descriptions && current && (
-            <div className="bg-dark-800/60 border border-dark-600 rounded-lg p-3 text-xs sm:text-sm text-gray-300 leading-relaxed">
+            <div className="bg-slate-50/60 border border-slate-300 rounded-lg p-3 text-xs sm:text-sm text-slate-700 leading-relaxed">
               {field.descriptions[current.value]}
             </div>
           )}
@@ -256,7 +256,7 @@ export default function Config() {
             setField(field.key, [...new Set(nums)]);
           }}
           placeholder={field.placeholder}
-          className="w-full sm:w-64 px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500 font-mono"
+          className="w-full sm:w-64 px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder-slate-400 font-mono"
         />
       );
     }
@@ -279,7 +279,7 @@ export default function Config() {
       return (
         <div className="space-y-2">
           {rules.length === 0 && (
-            <div className="text-xs text-gray-500 bg-dark-800/60 border border-dark-700 rounded-lg px-3 py-2">
+            <div className="text-xs text-slate-500 bg-slate-50/60 border border-slate-200 rounded-lg px-3 py-2">
               暂无规则，点击下方按钮新增
             </div>
           )}
@@ -290,20 +290,20 @@ export default function Config() {
                 value={rule[0]}
                 onChange={(e) => updateRule(idx, 0, e.target.value)}
                 placeholder="匹配正则，如 ^gpt-4$"
-                className="flex-1 min-w-0 px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500 font-mono"
+                className="flex-1 min-w-0 px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder-slate-400 font-mono"
               />
-              <span className="text-gray-500 text-sm shrink-0">→</span>
+              <span className="text-slate-500 text-sm shrink-0">→</span>
               <input
                 type="text"
                 value={rule[1]}
                 onChange={(e) => updateRule(idx, 1, e.target.value)}
                 placeholder="替换模型名，如 gemini-2.5-pro"
-                className="flex-1 min-w-0 px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500 font-mono"
+                className="flex-1 min-w-0 px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder-slate-400 font-mono"
               />
               <button
                 type="button"
                 onClick={() => removeRule(idx)}
-                className="shrink-0 p-2 text-gray-500 hover:text-red-400 transition-colors"
+                className="shrink-0 p-2 text-slate-500 hover:text-red-700 transition-colors"
                 title="删除该规则"
               >
                 <Trash2 size={16} />
@@ -332,7 +332,7 @@ export default function Config() {
           }}
           placeholder={field.placeholder}
           rows={6}
-          className="w-full px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500 font-mono"
+          className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder-slate-400 font-mono"
         />
       );
     }
@@ -348,7 +348,7 @@ export default function Config() {
           )
         }
         placeholder={field.placeholder}
-        className="w-full px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500"
+        className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder-slate-400"
       />
     );
   };
@@ -356,7 +356,7 @@ export default function Config() {
   return (
     <div className="space-y-6">
       {/* 操作按钮（sticky 常驻视口顶部） */}
-      <div className="sticky top-0 z-30 -mx-1 px-1 py-2 bg-dark-950/95 backdrop-blur border-b border-dark-700 rounded-lg">
+      <div className="sticky top-0 z-30 -mx-1 px-1 py-2 bg-slate-50/95 backdrop-blur border-b border-slate-200 rounded-lg">
         <div className="flex items-center gap-2">
         <button
           onClick={loadConfig}
@@ -392,7 +392,7 @@ export default function Config() {
         <div className="space-y-6">
           {CONFIG_GROUPS.map((group) => (
             <div key={group.title} className="card">
-              <h3 className="text-base font-semibold text-purple-400 mb-4 border-b border-dark-700 pb-3">
+              <h3 className="text-base font-semibold text-purple-700 mb-4 border-b border-slate-200 pb-3">
                 {group.title}
               </h3>
 
@@ -420,12 +420,12 @@ export default function Config() {
                   .filter((field) => !field.showIf || field.showIf(config))
                   .map((field) => (
                     <div key={field.key}>
-                      <label className="block text-sm font-medium text-gray-300 mb-1.5">
+                      <label className="block text-sm font-medium text-slate-700 mb-1.5">
                         {field.label}
                       </label>
                       {renderField(field)}
                       {field.note && (
-                        <p className="text-xs text-gray-500 mt-1.5">{field.note}</p>
+                        <p className="text-xs text-slate-500 mt-1.5">{field.note}</p>
                       )}
                     </div>
                   ))}

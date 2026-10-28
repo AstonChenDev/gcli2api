@@ -649,9 +649,10 @@ class AntiTruncationStreamProcessor:
                                 # 已有合成工具调用：带 finishReason 的控制 chunk 透传
                                 # （Gemini 客户端靠 finishReason 判断流正常结束），
                                 # 但需清空其中的 text 避免重复内容；纯 text 内容 chunk 丢弃（防拼接）
-                                if self._has_finish_reason(data):
-                                    last_finish_reason = self._get_finish_reason(data)
-                                    finish_reason_forwarded = True
+                                if self._has_finish_reason(data) or self._has_thought_parts(data):
+                                    if self._has_finish_reason(data):
+                                        last_finish_reason = self._get_finish_reason(data)
+                                        finish_reason_forwarded = True
                                     stripped = self._strip_text_parts(data)
                                     json_str = json.dumps(
                                         stripped, separators=(",", ":"), ensure_ascii=False
@@ -665,26 +666,17 @@ class AntiTruncationStreamProcessor:
                                 if text:
                                     side_buffer.write(text)
                                     self.forwarded_any_text = True
-                                    if self._has_finish_reason(data):
-                                        # 文本与 finishReason 同 chunk：透传剥离
-                                        # finishReason 后的文本，收尾信号由流结束
-                                        # 逻辑统一决定补发
-                                        stripped = self._strip_finish_reason(data)
-                                        json_str = json.dumps(
-                                            stripped, separators=(",", ":"), ensure_ascii=False
-                                        )
-                                        yield f"data: {json_str}\n\n".encode("utf-8")
-                                    else:
-                                        # 纯文本内容 chunk：原样透传
-                                        yield line
                                 chunk_finish = self._get_finish_reason(data)
                                 if chunk_finish:
+                                    # Thought-only terminal chunks must also keep their parts.
+                                    stripped = self._strip_finish_reason(data)
+                                    yield f"data: {json.dumps(stripped, separators=(',', ':'), ensure_ascii=False)}\n\n".encode("utf-8")
                                     last_finish_reason = chunk_finish
                                     # 收尾控制信号先暂扣，流结束后决定续传或补发
                                     continue
-                                if not text:
-                                    # 无文本无工具调用的空 chunk：透传（usage 等）
-                                    yield line
+                                # Preserve thought flags, signatures and usage; only answer text
+                                # belongs in the continuation history / fallback answer.
+                                yield line
                                 continue
 
                     else:
@@ -886,9 +878,16 @@ class AntiTruncationStreamProcessor:
         for candidate in data.get("candidates", []):
             content = candidate.get("content", {})
             for part in content.get("parts", []):
-                if isinstance(part, dict) and "text" in part:
+                if isinstance(part, dict) and "text" in part and part.get("thought") is not True:
                     text += part["text"]
         return text
+
+    @staticmethod
+    def _has_thought_parts(data: Dict[str, Any]) -> bool:
+        inner = data.get("response", data)
+        return any(isinstance(part, dict) and part.get("thought") is True
+            for candidate in inner.get("candidates", [])
+            for part in candidate.get("content", {}).get("parts", []))
 
     @staticmethod
     def _has_finish_reason(data: Dict[str, Any]) -> bool:
@@ -929,7 +928,7 @@ class AntiTruncationStreamProcessor:
             # 过滤掉所有 text part（保留 functionCall 等其他 part，虽然此处通常为空）
             new_parts = [
                 part for part in parts
-                if not (isinstance(part, dict) and "text" in part)
+                if not (isinstance(part, dict) and "text" in part and part.get("thought") is not True)
             ]
             modified_content = content.copy()
             modified_content["parts"] = new_parts

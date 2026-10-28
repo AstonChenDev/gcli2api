@@ -1012,6 +1012,16 @@ async def gemini_stream_to_anthropic_stream(
                 log.warning(f"[GEMINI_TO_ANTHROPIC] 收到 Response 对象，状态码: {chunk.status_code}，直接转发错误")
                 # 直接转发错误响应内容，不做格式转换
                 error_content = chunk.body if isinstance(chunk.body, bytes) else chunk.body.encode('utf-8')
+                try:
+                    boundary_error = json.loads(error_content).get("error", {})
+                    if isinstance(boundary_error, dict) and boundary_error.get("status") == "UPSTREAM_OUTPUT_BOUNDARY_MISSING":
+                        yield _sse_event("error", {"type": "error", "error": {
+                            "type": "api_error", "message": boundary_error["message"],
+                            "code": boundary_error["status"],
+                        }})
+                        return
+                except (ValueError, AttributeError):
+                    pass
                 yield error_content
                 return
 

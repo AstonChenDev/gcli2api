@@ -55,21 +55,21 @@ export default function Select({ value, onChange, options, className = "", disab
         aria-haspopup="listbox"
         aria-expanded={open}
         onClick={toggle}
-        className={`w-full flex items-center justify-between gap-1 text-left bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-gray-200 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50 ${
+        className={`w-full flex items-center justify-between gap-1 text-left bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-slate-800 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50 ${
           open ? "ring-2 ring-purple-500/50 border-purple-500/50" : ""
         } ${disabled ? "opacity-40 cursor-not-allowed" : "cursor-pointer"}`}
       >
         <span className="truncate">{current ? current.label : ""}</span>
         <ChevronDown
           size={14}
-          className={`shrink-0 text-gray-400 transition-transform duration-200 ${open ? "rotate-180" : ""}`}
+          className={`shrink-0 text-slate-600 transition-transform duration-200 ${open ? "rotate-180" : ""}`}
         />
       </button>
       {open && (
         <div
           role="listbox"
           style={{ maxHeight: Math.max(placement.maxHeight, 96) }}
-          className={`absolute left-0 right-0 z-20 overflow-y-auto rounded-lg border border-dark-600 bg-dark-800 py-1 shadow-xl ${
+          className={`absolute left-0 right-0 z-20 overflow-y-auto rounded-lg border border-slate-300 bg-slate-50 py-1 shadow-xl ${
             placement.dropUp ? "bottom-full mb-1" : "top-full mt-1"
           }`}
         >
@@ -85,8 +85,8 @@ export default function Select({ value, onChange, options, className = "", disab
               }}
               className={`flex w-full items-center justify-between gap-2 px-3 py-2.5 sm:py-2 text-left text-xs sm:text-sm ${
                 o.value === value
-                  ? "bg-purple-600/20 text-purple-300"
-                  : "text-gray-200 hover:bg-dark-700"
+                  ? "bg-purple-600/20 text-purple-700"
+                  : "text-slate-800 hover:bg-slate-100"
               }`}
             >
               <span className="truncate">{o.label}</span>

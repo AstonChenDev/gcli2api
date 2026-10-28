@@ -9,9 +9,10 @@ import io
 import json
 import time
 import zipfile
+from urllib.parse import quote
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Response
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Response, Query, Request
 from fastapi.responses import JSONResponse
 
 from log import log
@@ -22,7 +23,14 @@ from src.credential_manager import (
 )
 from src.models import (
     CredFileActionRequest,
-    CredFileBatchActionRequest
+    CredFileBatchActionRequest,
+    CredentialSelectionRequest,
+)
+from src.antigravity_import import (
+    AntigravityImportInputError,
+    MAX_IMPORT_BODY_BYTES,
+    import_antigravity_refresh_tokens,
+    parse_import_request_payload,
 )
 from src.storage.database import get_database
 from src.utils import (
@@ -446,6 +454,54 @@ async def verify_credential_project_common(email: str) -> JSONResponse:
 # =============================================================================
 
 
+@router.post("/import-antigravity-refresh-tokens")
+async def import_antigravity_refresh_token_credentials(
+    request: Request,
+    token: str = Depends(verify_panel_token),
+) -> JSONResponse:
+    """Import AG credentials after OAuth and Project ID validation.
+
+    The endpoint never returns submitted refresh tokens or generated access
+    tokens.  ``token`` is intentionally unused beyond the auth dependency.
+    """
+
+    del token
+    try:
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_IMPORT_BODY_BYTES:
+                    raise HTTPException(status_code=413, detail="导入文件不能超过 1 MiB")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Content-Length 无效")
+
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > MAX_IMPORT_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="导入文件不能超过 1 MiB")
+        try:
+            payload = json.loads(bytes(body))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise HTTPException(status_code=400, detail="请求内容不是有效的 JSON")
+
+        candidates = parse_import_request_payload(payload)
+        result = await import_antigravity_refresh_tokens(candidates)
+        return JSONResponse(content=result)
+    except AntigravityImportInputError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except HTTPException:
+        raise
+    except Exception as error:
+        log.error(
+            "Antigravity Refresh Token import aborted: "
+            f"exception={type(error).__name__}"
+        )
+        raise HTTPException(
+            status_code=500, detail="导入过程中发生内部错误，请检查服务器日志"
+        ) from error
+
+
 @router.post("/upload")
 async def upload_credentials( files: List[UploadFile] = File(...),
     token: str = Depends(verify_panel_token),
@@ -633,6 +689,39 @@ async def download_all_creds(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/download-selected")
+async def download_selected_credentials(
+    request: CredentialSelectionRequest,
+    token: str = Depends(verify_panel_token),
+):
+    """Export exactly the selected credentials; fail instead of silently omitting missing rows."""
+    database = await get_database()
+    selected = list(dict.fromkeys(request.emails))
+    entries = []
+    for email in selected:
+        cred = await database.get_credential(email)
+        if not cred:
+            raise HTTPException(status_code=404, detail=f"凭证不存在，请刷新列表后重试：{email}")
+        entries.append((email, {
+            "email": email,
+            "refresh_token": cred.get("refresh_token", ""),
+            "project_id": cred.get("project_id", ""),
+            "tier": cred.get("tier", "pro"),
+        }))
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for email, data in entries:
+            archive.writestr(f"{quote(email, safe='@._+-')}.json", json.dumps(data, ensure_ascii=False, indent=2))
+    return Response(
+        content=buffer.getvalue(), media_type="application/zip",
+        headers={
+            "Content-Disposition": 'attachment; filename="antigravity_selected_credentials.zip"',
+            "Cache-Control": "no-store",
+            "X-Credential-Count": str(len(entries)),
+        },
+    )
+
+
 @router.post("/verify-project/{email}")
 async def verify_credential_project(
     email: str,
@@ -678,10 +767,9 @@ async def get_credential_quota(
 
         creds = Credentials.from_dict(credential_data)
 
-        await creds.refresh_if_needed()
-
-        updated_data = creds.to_dict()
-        if updated_data != credential_data:
+        if creds.is_expired():
+            await asyncio.wait_for(creds.refresh(), timeout=30.0)
+            updated_data = creds.to_dict()
             log.info(f"Token已自动刷新: {email}")
             await database.store_credential(email, updated_data)
             credential_data = updated_data
@@ -722,6 +810,7 @@ async def get_credential_quota(
 @router.post("/test/{email}")
 async def test_credential(
     email: str,
+    model: str = Query("gemini-4-argon-medium", min_length=1, max_length=128),
     _token: str = Depends(verify_panel_token)
 ):
     """
@@ -740,7 +829,9 @@ async def test_credential(
             raise HTTPException(status_code=404, detail="凭证不存在")
 
         credentials = Credentials.from_dict(credential_data)
-        token_refreshed = await credentials.refresh_if_needed()
+        token_refreshed = credentials.is_expired()
+        if token_refreshed:
+            await asyncio.wait_for(credentials.refresh(), timeout=30.0)
 
         if token_refreshed:
             log.info(f"Token已自动刷新: {email}")
@@ -757,7 +848,9 @@ async def test_credential(
         if not project_id:
             raise HTTPException(status_code=400, detail="凭证中没有项目ID")
 
-        test_model = "gemini-2.5-flash-lite"
+        test_model = model.strip()
+        if not test_model:
+            raise HTTPException(status_code=422, detail="测试模型不能为空")
 
         api_base_url = await get_antigravity_api_url()
         headers = build_antigravity_headers(access_token)
@@ -768,7 +861,8 @@ async def test_credential(
                 "model": test_model,
                 "project": project_id,
                 "request": {
-                    "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+                    "contents": [{"role": "user", "parts": [{"text": "Reply OK."}]}],
+                    "generationConfig": {"maxOutputTokens": 8},
                 }
             },
             headers=headers,
@@ -790,7 +884,7 @@ async def test_credential(
                 content={
                     "success": True,
                     "status_code": status_code,
-                    "message": "测试成功",
+                    "message": "测试成功" if status_code == 200 else "凭证有效，但模型请求被限流",
                     "email": email
                 }
             )

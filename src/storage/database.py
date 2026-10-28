@@ -9,6 +9,7 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import (
@@ -18,10 +19,12 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    case,
     func,
     inspect,
     select,
     text,
+    tuple_,
 )
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
@@ -302,6 +305,25 @@ class Database:
 
     # ---------- 凭证管理 ----------
 
+    async def get_import_identities(self):
+        """Import-only identity index; never expose this result through an API."""
+        async with self.session() as s:
+            return (await s.execute(select(AntigravityCredential.email, AntigravityCredential.refresh_token))).all()
+
+    async def insert_imported_credential(self, email, credential_data):
+        """Atomic insert-only import: concurrent duplicates preserve all existing fields."""
+        if self.backend_type == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert
+        values = {k: credential_data[k] for k in (
+            "access_token", "refresh_token", "client_id", "client_secret", "project_id", "expiry", "tier"
+        )}
+        stmt = insert(AntigravityCredential).values(email=email, last_success=time.time(), **values)
+        stmt = stmt.on_conflict_do_nothing(index_elements=["email"]).returning(AntigravityCredential.id)
+        async with self.session() as s:
+            return (await s.scalar(stmt)) is not None
+
     async def store_credential(
         self, email: str, credential_data: Dict[str, Any]
     ) -> bool:
@@ -316,6 +338,8 @@ class Database:
             client_secret = credential_data.get("client_secret") or ""
             project_id = credential_data.get("project_id") or ""
             expiry = credential_data.get("expiry") or ""
+            if isinstance(expiry, datetime):
+                expiry = expiry.isoformat()
             tier = credential_data.get("tier")
 
             if row:
@@ -904,6 +928,73 @@ class Database:
                 for m in model_rows
             ],
         }
+
+    def _credential_usage_filters(self, start_timestamp=None, end_timestamp=None, model_name="", credential_email=None):
+        email = func.coalesce(UsageLog.credential_email, "")
+        model = func.coalesce(func.nullif(UsageLog.upstream_model_name, ""), func.nullif(UsageLog.model_name, ""), "(unknown)")
+        conditions = []
+        if start_timestamp is not None:
+            conditions.append(UsageLog.created_at >= start_timestamp)
+        if end_timestamp is not None:
+            conditions.append(UsageLog.created_at <= end_timestamp)
+        if model_name:
+            conditions.append(model == model_name)
+        if credential_email is not None:
+            conditions.append(email == credential_email)
+        return email, model, conditions
+
+    async def credential_usage_stats(self, offset=0, limit=50, **filters):
+        """Aggregate retained request logs by credential and actual upstream model."""
+        email, model, conditions = self._credential_usage_filters(**filters)
+        succeeded = case((UsageLog.success.is_(True), 1), else_=0)
+        grouped = select(
+            email.label("credential_email"), model.label("model_name"),
+            func.count().label("total_requests"), func.sum(succeeded).label("success_count"),
+            func.max(UsageLog.created_at).label("last_request"),
+        ).where(*conditions).group_by(email, model)
+        summary_query = select(func.count(), func.coalesce(func.sum(succeeded), 0),
+            func.min(UsageLog.created_at), func.max(UsageLog.created_at)).where(*conditions)
+        async with self.session() as s:
+            total = await s.scalar(select(func.count()).select_from(grouped.subquery()))
+            summary = (await s.execute(summary_query)).one()
+            rows = (await s.execute(grouped.order_by(func.count().desc(), email, model).offset(offset).limit(limit))).all()
+            errors = []
+            tiers = {}
+            if rows:
+                # Enrich after aggregation: deleted credentials must retain their log counts.
+                credential_rows = (await s.execute(select(AntigravityCredential.email, AntigravityCredential.tier)
+                    .where(AntigravityCredential.email.in_({r.credential_email for r in rows if r.credential_email})))).all()
+                tiers = {e: t.strip().lower() if t and t.strip().lower() in {"ultra", "pro", "free"} else None
+                    for e, t in credential_rows}
+                errors = (await s.execute(select(email, model, UsageLog.status_code, func.count())
+                    .where(*conditions, UsageLog.success.is_not(True), tuple_(email, model).in_([(r.credential_email, r.model_name) for r in rows]))
+                    .group_by(email, model, UsageLog.status_code).order_by(UsageLog.status_code))).all()
+        error_map = {}
+        for e, m, code, count in errors:
+            error_map.setdefault((e, m), []).append({"status_code": code or 0, "count": count})
+        return {"total": total, "summary": {
+            "total_requests": summary[0], "success_count": summary[1], "failure_count": summary[0] - summary[1],
+            "first_request": summary[2], "last_request": summary[3],
+        }, "items": [{"credential_email": r.credential_email, "model_name": r.model_name,
+            "credential_tier": tiers.get(r.credential_email),
+            "total_requests": r.total_requests, "success_count": r.success_count,
+            "failure_count": r.total_requests - r.success_count, "last_request": r.last_request,
+            "errors": error_map.get((r.credential_email, r.model_name), [])} for r in rows]}
+
+    async def credential_usage_errors(self, offset=0, limit=20, status_code=None, **filters):
+        """Paginate distinct failure messages, so no error types are silently dropped."""
+        _, _, conditions = self._credential_usage_filters(**filters)
+        conditions.append(UsageLog.success.is_not(True))
+        if status_code is not None:
+            conditions.append(UsageLog.status_code == status_code)
+        message = func.coalesce(UsageLog.error_message, "")
+        grouped = select(UsageLog.status_code.label("status_code"), message.label("error_message"),
+            func.count().label("count"), func.max(UsageLog.created_at).label("last_seen"))
+        grouped = grouped.where(*conditions).group_by(UsageLog.status_code, message)
+        async with self.session() as s:
+            total = await s.scalar(select(func.count()).select_from(grouped.subquery()))
+            rows = (await s.execute(grouped.order_by(func.count().desc(), UsageLog.status_code, message).offset(offset).limit(limit))).all()
+        return {"total": total, "items": [dict(r._mapping) for r in rows]}
 
     async def delete_usage_logs_before(self, before_timestamp: float) -> int:
         """删除指定时间之前的日志，返回删除条数"""

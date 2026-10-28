@@ -866,8 +866,12 @@ async def normalize_antigravity_request(
     model = result.get("model", "")
     generation_config = (result.get("generationConfig") or {}).copy()
 
-    # 项目固定为 True（原版从 config 读取 return_thoughts，本项目无此配置项）
-    return_thoughts = True
+    # The panel controls the default; an explicit per-request opt-out must survive.
+    from config import get_return_thoughts_to_frontend
+    return_thoughts = await get_return_thoughts_to_frontend()
+    requested_thinking = generation_config.get("thinkingConfig") or {}
+    if requested_thinking.get("includeThoughts") is False:
+        return_thoughts = False
 
     # ========== 0.5 模型名复写（面板可配，热更新） ==========
     # 在抗截断前缀剥离之后、profile 解析之前应用：

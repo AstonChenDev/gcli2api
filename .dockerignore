@@ -15,3 +15,11 @@ creds/
 log.txt
 .env
 tests/
+
+.env.*
+*.env
+data/
+*.pem
+*.key
+*.p12
+*.pfx

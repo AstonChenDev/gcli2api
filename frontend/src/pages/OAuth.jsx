@@ -96,12 +96,12 @@ export default function OAuth() {
   return (
     <div className="space-y-6">
       {/* 说明卡片 */}
-      <div className="bg-gradient-to-br from-orange-900/30 to-orange-800/10 border border-orange-700/30 rounded-xl p-5">
+      <div className="bg-gradient-to-br from-orange-50 to-white border border-orange-700/30 rounded-xl p-5">
         <div className="flex items-center gap-2 mb-2">
-          <Rocket className="w-5 h-5 text-orange-400" />
-          <h3 className="text-lg font-semibold text-orange-400">Antigravity 认证模式</h3>
+          <Rocket className="w-5 h-5 text-orange-700" />
+          <h3 className="text-lg font-semibold text-orange-700">Antigravity 认证模式</h3>
         </div>
-        <p className="text-sm text-gray-400">
+        <p className="text-sm text-slate-600">
           通过 Google OAuth 获取 Antigravity 凭证。授权成功后系统会自动获取 Project ID
           和订阅等级，并保存凭证到数据库。
         </p>
@@ -136,12 +136,12 @@ export default function OAuth() {
       {authUrl && (
         <div className="card space-y-4">
           <h3 className="font-semibold">认证链接</h3>
-          <div className="bg-dark-800 border border-purple-500/30 rounded-lg p-4 flex items-center justify-between gap-3">
+          <div className="bg-slate-50 border border-purple-500/30 rounded-lg p-4 flex items-center justify-between gap-3">
             <a
               href={authUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-purple-400 hover:text-purple-300 break-all text-sm flex items-center gap-1"
+              className="text-purple-700 hover:text-purple-700 break-all text-sm flex items-center gap-1"
             >
               点击此链接进行 Google 认证 <ExternalLink size={14} />
             </a>
@@ -154,8 +154,8 @@ export default function OAuth() {
             </button>
           </div>
 
-          <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-4 text-sm text-gray-400">
-            <p className="font-medium text-blue-400 mb-2">使用说明</p>
+          <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-4 text-sm text-slate-600">
+            <p className="font-medium text-blue-700 mb-2">使用说明</p>
             <ol className="list-decimal list-inside space-y-1">
               <li>点击上方认证链接，在新窗口中完成 Google 账号授权</li>
               <li>授权成功后会跳转到 localhost 显示成功页面</li>
@@ -165,10 +165,10 @@ export default function OAuth() {
           </div>
 
           {/* 快捷回调URL */}
-          <div className="border border-dark-600 rounded-lg">
+          <div className="border border-slate-300 rounded-lg">
             <button
               onClick={() => setShowCallbackInput(!showCallbackInput)}
-              className="w-full flex items-center justify-between px-4 py-3 text-sm text-gray-400 hover:text-gray-200"
+              className="w-full flex items-center justify-between px-4 py-3 text-sm text-slate-600 hover:text-slate-800"
             >
               <span>🚀 无法回源？试试快捷方式（粘贴回调URL）</span>
               <ChevronDown
@@ -178,7 +178,7 @@ export default function OAuth() {
             </button>
             {showCallbackInput && (
               <div className="px-4 pb-4 space-y-3">
-                <p className="text-xs text-gray-500">
+                <p className="text-xs text-slate-500">
                   适用场景：云服务器/VPS、Docker 容器、防火墙阻止回调端口等。
                   完成 Google 授权后，复制浏览器地址栏的完整 URL 粘贴到下方。
                 </p>
@@ -186,7 +186,7 @@ export default function OAuth() {
                   value={callbackUrl}
                   onChange={(e) => setCallbackUrl(e.target.value)}
                   placeholder="http://localhost:11451/?state=xxx&code=xxx&scope=xxx..."
-                  className="w-full px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500"
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder-slate-400"
                   rows={3}
                 />
                 <button
@@ -217,7 +217,7 @@ export default function OAuth() {
       {credsContent && (
         <div className="card space-y-4">
           <h3 className="font-semibold">凭证内容</h3>
-          <pre className="bg-dark-800 border border-dark-600 rounded-lg p-4 text-xs text-gray-300 overflow-x-auto max-h-96 overflow-y-auto">
+          <pre className="bg-slate-50 border border-slate-300 rounded-lg p-4 text-xs text-slate-700 overflow-x-auto max-h-96 overflow-y-auto">
             {credsContent}
           </pre>
           <button onClick={downloadCreds} className="btn btn-secondary text-sm">

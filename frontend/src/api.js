@@ -1,13 +1,13 @@
 import axios from "axios";
 
 const api = axios.create({
-  baseURL: "",
+  baseURL: window.location.pathname.startsWith("/preview/") ? "/preview" : "",
   timeout: 120000,
 });
 
 // 请求拦截器 - 添加token
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem("panelToken");
+  const token = localStorage.getItem("agy2apiPreviewPanelToken");
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
   }
@@ -18,9 +18,10 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (error.response?.status === 401) {
-      localStorage.removeItem("panelToken");
-      window.location.href = "/";
+    const credentialTestFailure = error.config?.url?.startsWith("/creds/test/") && error.response?.data?.email;
+    if (error.response?.status === 401 && !credentialTestFailure) {
+      localStorage.removeItem("agy2apiPreviewPanelToken");
+      window.location.href = window.location.pathname.startsWith("/preview/") ? "/preview/" : "/";
     }
     return Promise.reject(error);
   }

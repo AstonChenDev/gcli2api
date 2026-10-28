@@ -13,12 +13,13 @@ import Login from "./pages/Login";
 import OAuth from "./pages/OAuth";
 import Credentials from "./pages/Credentials";
 import UploadPage from "./pages/Upload";
+import RefreshTokenImport from "./pages/RefreshTokenImport";
 import Config from "./pages/Config";
 import About from "./pages/About";
 import UsageLogs from "./pages/UsageLogs";
 
 export default function App() {
-  const [loggedIn, setLoggedIn] = useState(() => !!localStorage.getItem("panelToken"));
+  const [loggedIn, setLoggedIn] = useState(() => !!localStorage.getItem("agy2apiPreviewPanelToken"));
   const [activeTab, setActiveTab] = useState("oauth");
   const [version, setVersion] = useState(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -40,7 +41,7 @@ export default function App() {
   }, []);
 
   const logout = () => {
-    localStorage.removeItem("panelToken");
+    localStorage.removeItem("agy2apiPreviewPanelToken");
     setLoggedIn(false);
   };
 
@@ -51,6 +52,7 @@ export default function App() {
   const tabs = [
     { id: "oauth", label: "OAuth 认证", icon: Rocket },
     { id: "credentials", label: "凭证管理", icon: KeyRound },
+    { id: "rt-import", label: "RT 导入", icon: KeyRound },
     { id: "upload", label: "批量导入", icon: Upload },
     { id: "usage-logs", label: "请求日志", icon: BarChart3 },
     { id: "config", label: "配置管理", icon: Settings },
@@ -60,14 +62,14 @@ export default function App() {
   return (
     <div className="min-h-screen">
       {/* 导航栏 */}
-      <nav className="bg-dark-900 border-b border-dark-700 sticky top-0 z-10">
+      <nav className="bg-white border-b border-slate-200 sticky top-0 z-10">
         <div className="max-w-6xl mx-auto px-4 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div>
                 <span className="text-xl font-bold">AGY2API</span>
                 {version?.version && (
-                  <span className="ml-2 text-xs text-gray-500">v{version.version}</span>
+                  <span className="ml-2 text-xs text-slate-500">v{version.version}</span>
                 )}
               </div>
             </div>
@@ -91,7 +93,7 @@ export default function App() {
                   className={`px-3 sm:px-4 py-2 text-xs sm:text-sm font-medium rounded-lg whitespace-nowrap flex items-center gap-1.5 transition-colors ${
                     activeTab === tab.id
                       ? "bg-purple-600 text-white"
-                      : "text-gray-400 hover:text-white hover:bg-dark-700"
+                      : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
                   }`}
                 >
                   <Icon size={15} />
@@ -106,6 +108,7 @@ export default function App() {
       <div className="max-w-6xl mx-auto px-4 py-6">
         {activeTab === "oauth" && <OAuth />}
         {activeTab === "credentials" && <Credentials />}
+        {activeTab === "rt-import" && <RefreshTokenImport />}
         {activeTab === "upload" && <UploadPage />}
         {activeTab === "usage-logs" && <UsageLogs />}
         {activeTab === "config" && <Config />}
