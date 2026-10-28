@@ -29,7 +29,7 @@ from src.credential_manager import (
 from src.httpx_client import stream_post_async, post_async
 from src.models import Model, model_to_dict
 from anyio import CancelScope
-from src.stream_metadata import StreamMetadata
+from src.stream_metadata import StreamMetadata, StreamCompletion
 from src.converter.request_fields import normalize_gemini_request_fields
 from src.usage_log import extract_response_id
 from src.thought_boundary import prepare_thought_boundary, ThoughtBoundaryGuard, ERROR_CODE as BOUNDARY_ERROR
@@ -435,16 +435,18 @@ async def stream_request(
     for attempt in range(max_retries + 1):
         last_error_body = ""
         result_logged = False
+        selected_result = None
         success_recorded = False  # 标记是否已记录成功
         need_retry = False  # 标记是否需要重试
         usage_tokens: Dict[str, int] = {}  # 从流中提取的 token 用量
         attempt_start_time = time.time()  # 本次上游调用开始时间
         stream_metadata = StreamMetadata()
+        completion = StreamCompletion((inner_request.get("generationConfig") or {}).get("candidateCount", 1))
         thought_guard = (ThoughtBoundaryGuard(boundary_marker,
             (inner_request.get("generationConfig", {}).get("thinkingConfig") or {}).get("includeThoughts", True))
             if boundary_marker else None)
 
-        async def _log_stream_result(status_code: int, success: bool, error_message: str = "") -> None:
+        async def _write_stream_result(status_code: int, success: bool, error_message: str = "") -> None:
             """
             写入一次上游调用的请求日志（调用一次谷歌 API 产生一条日志；
             重试会在后续 attempt 各自再记一条，属于正常行为）。
@@ -458,7 +460,7 @@ async def stream_request(
                 log.info("[UPSTREAM_STREAM_METADATA] " + json.dumps({
                     "request_id": log_entry.get("request_id", ""),
                     "model": model_name, "status": status_code,
-                    **stream_metadata.as_dict(),
+                    **stream_metadata.as_dict(), **completion.as_dict(),
                     **(thought_guard.metadata() if thought_guard else {}),
                 }, ensure_ascii=True))
 
@@ -490,6 +492,22 @@ async def stream_request(
                 **usage_tokens,
             })
             result_logged = True
+
+        async def _log_stream_result(status_code: int, success: bool, error_message: str = "") -> None:
+            nonlocal selected_result
+            # Preserve an already decided outcome if cancellation races log I/O.
+            if selected_result is None:
+                selected_result = (status_code, success, error_message)
+            with CancelScope(shield=True):
+                await _write_stream_result(*selected_result)
+
+        async def _log_interrupted() -> None:
+            if thought_guard and thought_guard.failed:
+                await _log_stream_result(502, False, BOUNDARY_ERROR)
+            elif completion.complete and (not thought_guard or thought_guard.complete):
+                await _log_stream_result(200, True)
+            else:
+                await _log_stream_result(499, False, "请求被取消或客户端断开，未完整接收响应")
 
         try:
             async for chunk in stream_post_async(
@@ -587,14 +605,17 @@ async def stream_request(
                     if thought_guard:
                         protected = thought_guard.feed(chunk)
                         if protected is not None:
+                            completion.observe(protected)
                             yield protected
                         if thought_guard.failed:
                             await _log_stream_result(502, False, BOUNDARY_ERROR)
                             yield thought_guard.error_response()
                             return
                     else:
+                        completion.observe(chunk)
                         yield chunk
 
+            completion.eof = not need_retry
             # 流式请求完成，检查结果
             if success_recorded:
                 if thought_guard and not thought_guard.complete:
@@ -647,20 +668,11 @@ async def stream_request(
                     return
                 continue  # 重试
 
-        except asyncio.CancelledError:
-            # Starlette cancels the upstream task on client disconnect. Shield the
-            # final accounting from its cancellation scope, then propagate it.
+        except (asyncio.CancelledError, GeneratorExit):
+            # A client may close immediately after the final protocol event.
+            # Preserve completed/error outcomes; only unfinished streams are 499.
             with CancelScope(shield=True):
-                await _log_stream_result(499, False, "请求被取消或客户端断开，未完整接收响应")
-            raise
-
-        except GeneratorExit:
-            # aclose() may follow a yielded error; never count that attempt twice.
-            with CancelScope(shield=True):
-                if thought_guard and not thought_guard.complete:
-                    await _log_stream_result(499, False, "响应提前关闭，尚未完成正文分界")
-                elif success_recorded:
-                    await _log_stream_result(200, True)
+                await _log_interrupted()
             raise
 
         except Exception as e:
