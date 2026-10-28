@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 import api from "../api";
 import Modal from "./Modal";
+import { formatMillions } from "../utils/tokens";
 
 const time = value => value ? new Date(value * 1000).toLocaleString("zh-CN") : "—";
 function rangeParams(range) {
@@ -61,6 +62,7 @@ export default function CredentialUsageStats() {
       <h3 className="font-semibold text-blue-800">凭证 × 模型调用统计</h3>
       <p>每个凭证、每个实际调用模型单独计数。上游重试分别计数，成功和失败按请求日志记录汇总。</p>
       <p className="text-xs text-slate-600">凭证级别显示当前保存的 Ultra / Pro / Free；已删除或缺少级别信息的凭证显示“未知”。</p>
+      <p className="text-xs text-slate-600">1 M = 1,000,000 Tokens。输入包含缓存命中，输出包含思考 Tokens；上游未返回的用量无法计入。</p>
       <p className="text-xs text-slate-600">统计仅包含保留的请求日志；清理日志会同步减少统计，关闭日志后不会新增统计。后台凭证测试不计入这里。</p>
     </div>
     <form onSubmit={apply} className="flex flex-wrap gap-2">
@@ -75,23 +77,26 @@ export default function CredentialUsageStats() {
     {data?.logging_enabled === false && <p role="alert" className="text-sm text-amber-800 bg-amber-50 rounded-lg p-3">请求日志当前已关闭，以下仅为历史保留数据。</p>}
     {error && <p role="alert" className="text-sm text-red-700">{error}</p>}
     {summary && <>
-      <div className="grid grid-cols-3 gap-3">
-        {[['调用总数', summary.total_requests, 'text-slate-900'], ['成功', summary.success_count, 'text-emerald-700'], ['失败', summary.failure_count, 'text-red-700']].map(([label, count, color]) =>
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+        {[['调用总数', summary.total_requests, 'text-slate-900'], ['成功', summary.success_count, 'text-emerald-700'], ['失败', summary.failure_count, 'text-red-700'], ['输入 Tokens', formatMillions(summary.prompt_tokens), 'text-blue-700'], ['输出 Tokens', formatMillions(summary.completion_tokens), 'text-purple-700']].map(([label, count, color]) =>
           <div key={label} className="card p-4 text-center"><div className={`text-xl font-bold ${color}`}>{count}</div><div className="text-xs text-slate-500 mt-1">{label}</div></div>)}
       </div>
       <p className="text-xs text-slate-500">匹配日志实际覆盖：{time(summary.first_request)} 至 {time(summary.last_request)} · {data.total} 个凭证 / 模型组合</p>
     </>}
     {loading ? <div role="status" className="py-10 flex justify-center"><Loader2 className="animate-spin text-purple-700" /></div> : data?.items?.length ? <>
       <div className="table-container"><table>
-        <thead><tr>{['凭证', '模型', '调用总数', '成功', '失败', '失败错误码 / 详情'].map(h => <th key={h} className="whitespace-nowrap">{h}</th>)}</tr></thead>
+        <thead><tr>{['凭证', '模型', '调用总数', '成功', '失败', '输入 Tokens (M)', '输出 Tokens (M)', '失败错误码 / 详情'].map(h => <th key={h} className="whitespace-nowrap">{h}</th>)}</tr></thead>
         <tbody>{data.items.map(row => <tr key={JSON.stringify([row.credential_email, row.model_name])}>
           <td className="break-all min-w-48"><div>{row.credential_email || "未分配凭证"}</div>
             {row.credential_email && <span className={`inline-block mt-1 rounded px-2 py-0.5 text-xs font-medium ${tierStyles[row.credential_tier] || "bg-slate-100 text-slate-500"}`}>
               级别：{({ ultra: "Ultra", ultra_lite: "Ultra Lite", pro: "Pro", free: "Free" })[row.credential_tier] || "未知"}
             </span>}
+            {row.credential_note && <p className="text-xs text-slate-500 whitespace-pre-wrap mt-1">备注：{row.credential_note}</p>}
           </td>
           <td className="break-all min-w-44">{row.model_name}</td>
           <td>{row.total_requests}</td><td className="text-emerald-700">{row.success_count}</td><td className="text-red-700">{row.failure_count}</td>
+          <td title={`${row.prompt_tokens || 0} Tokens`} className="whitespace-nowrap">{formatMillions(row.prompt_tokens)}</td>
+          <td title={`${row.completion_tokens || 0} Tokens`} className="whitespace-nowrap">{formatMillions(row.completion_tokens)}</td>
           <td className="min-w-44"><div className="text-xs space-y-1">{row.errors.map(e => <div key={e.status_code}>{e.status_code ? `HTTP ${e.status_code}` : "无状态码"}：{e.count} 次</div>)}</div>
             {row.failure_count > 0 ? <button onClick={() => { setErrorPage(1); setDetail(row); }} className="text-purple-700 text-xs mt-2 underline">查看报错详情</button> : <span className="text-slate-400">—</span>}
           </td>

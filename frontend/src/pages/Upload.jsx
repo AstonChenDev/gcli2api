@@ -1,6 +1,6 @@
-import { CheckCircle, FileJson, Loader2, Trash2, Upload, X } from "lucide-react";
-import { useRef, useState } from "react";
-import api from "../api";
+import { FileJson, Loader2, Upload, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { uploadCredentialFiles } from "../utils/credentialUpload";
 
 export default function UploadPage() {
   const [files, setFiles] = useState([]);
@@ -8,10 +8,17 @@ export default function UploadPage() {
   const [results, setResults] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef(null);
+  const controllerRef = useRef(null);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; controllerRef.current?.abort(); };
+  }, []);
 
   const addFiles = (fileList) => {
+    if (uploading) return;
     const valid = Array.from(fileList).filter(
-      (f) => f.name.endsWith(".json") || f.name.endsWith(".zip")
+      (f) => f.name.toLowerCase().endsWith(".json") || f.name.toLowerCase().endsWith(".zip")
     );
     setFiles((prev) => {
       const names = new Set(prev.map((f) => f.name));
@@ -25,24 +32,30 @@ export default function UploadPage() {
   };
 
   const upload = async () => {
-    if (files.length === 0) return;
+    if (files.length === 0 || uploading) return;
+    const controller = new AbortController();
+    controllerRef.current = controller;
     setUploading(true);
     setResults(null);
-
     try {
       const formData = new FormData();
-      files.forEach((f) => formData.append("files", f));
-
-      const res = await api.post("/creds/upload", formData, {
-        headers: { "Content-Type": "multipart/form-data" },
+      files.forEach(f => formData.append("files", f));
+      await uploadCredentialFiles(formData, {
+        signal: controller.signal,
+        onEvent: event => {
+          if (!mounted.current || event.type === "heartbeat") return;
+          if (event.type === "start") setResults({ ...event, results: [] });
+          if (event.type === "progress") setResults(previous => ({ ...event, results: [...(previous?.results || []), event.result] }));
+          if (event.type === "complete") setResults(event);
+        },
       });
-      setResults(res.data);
     } catch (err) {
-      setResults({
-        error: err.response?.data?.detail || "上传失败",
-      });
+      if (mounted.current) setResults(previous => ({ ...previous,
+        error: controller.signal.aborted ? "已停止导入。已保存的凭证保留，未完成项可重新导入。" : (err.message || "导入连接失败，请检查网络后重试"),
+      }));
     } finally {
-      setUploading(false);
+      if (mounted.current) setUploading(false);
+      if (controllerRef.current === controller) controllerRef.current = null;
     }
   };
 
@@ -64,7 +77,7 @@ export default function UploadPage() {
   "tier": "可选，缺失自动获取",
   "project_id": "可选，缺失自动获取"
 }`}</pre>
-          <p className="mt-2">refresh_token 无效的凭证将导入失败；同邮箱凭证自动去重（覆盖更新）。</p>
+          <p className="mt-2">每次最多同时验证 3 个凭证，逐项显示结果；同邮箱凭证自动去重（覆盖更新）。网络失败会自动重试一次。</p>
         </div>
       </div>
 
@@ -147,6 +160,7 @@ export default function UploadPage() {
                     {(f.size / 1024).toFixed(1)} KB
                   </span>
                   <button
+                    disabled={uploading}
                     onClick={() => removeFile(f.name)}
                     className="text-slate-500 hover:text-red-700"
                   >
@@ -159,39 +173,25 @@ export default function UploadPage() {
         </div>
       )}
 
-      {/* 上传结果 */}
-      {results && (
-        <div className="card space-y-3">
-          {results.error ? (
-            <div className="bg-red-500/10 border border-red-500/30 text-red-700 px-4 py-3 rounded-lg">
-              {results.error}
-            </div>
-          ) : (
-            <>
-              <div className="bg-green-500/10 border border-green-500/30 text-green-700 px-4 py-3 rounded-lg flex items-center gap-2">
-                <CheckCircle size={16} />
-                {results.message ||
-                  `上传完成: 成功 ${successCount}/${totalCount} 个文件`}
-              </div>
-              {results.results?.some((r) => r.status === "error") && (
-                <div className="space-y-1.5">
-                  <div className="text-sm text-slate-600">失败详情:</div>
-                  {results.results
-                    .filter((r) => r.status === "error")
-                    .map((r, i) => (
-                      <div
-                        key={i}
-                        className="bg-red-500/10 border border-red-500/20 text-red-700 text-xs px-3 py-2 rounded-lg"
-                      >
-                        <span className="font-medium">{r.filename}</span>: {r.message}
-                      </div>
-                    ))}
-                </div>
-              )}
-            </>
-          )}
+      {uploading && <div className="card space-y-3" role="status">
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-sm">{results ? `正在验证：${results.completed_count || 0} / ${results.total_count}，成功 ${results.uploaded_count || 0}，失败 ${(results.completed_count || 0) - (results.uploaded_count || 0)}` : "正在上传并读取文件…"}</p>
+          <button onClick={() => controllerRef.current?.abort()} className="btn btn-secondary text-sm">停止导入</button>
         </div>
-      )}
+        {results && <progress aria-label="凭证导入进度" max={results.total_count || 1} value={results.completed_count || 0} className="w-full accent-purple-600" />}
+        <p className="text-xs text-slate-500">单个凭证验证最多 90 秒；离开此页面会停止未完成的导入，已成功保存的凭证保留。</p>
+      </div>}
+      {/* 上传结果 */}
+      {results && <div className="card space-y-3">
+        {results.error && <p role="alert" className="bg-amber-50 border border-amber-300 text-amber-800 px-4 py-3 rounded-lg">{results.error}</p>}
+        {!uploading && <p className="text-sm text-slate-700">{results.message || `已处理 ${results.completed_count || 0}/${totalCount}，成功保存 ${successCount} 个凭证`}</p>}
+        {results.results?.length > 0 && <div className="space-y-1.5 max-h-96 overflow-y-auto">
+          {results.results.map((row, index) => <div key={row.item_index ?? index} className={`text-xs px-3 py-2 rounded-lg border break-words ${row.status === "success" ? "bg-green-50 border-green-200 text-green-800" : "bg-red-50 border-red-200 text-red-800"}`}>
+            <span className="font-medium">{row.status === "success" ? "✓" : "✗"} {row.filename}</span>：{row.message}
+          </div>)}
+        </div>}
+      </div>}
+
     </div>
   );
 }

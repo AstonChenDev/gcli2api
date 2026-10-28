@@ -5,7 +5,7 @@
 
 import asyncio
 import time
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -20,6 +20,23 @@ from src.utils import verify_panel_token
 
 # 创建路由器
 router = APIRouter(prefix="/usage-logs", tags=["usage-logs"])
+
+
+@router.get("/lookup")
+async def lookup_request(
+    identifier: str = Query(min_length=1, max_length=160),
+    id_type: Literal["auto", "request_id", "response_id", "log_id"] = "auto",
+    offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100),
+    token: str = Depends(verify_panel_token),
+):
+    identifier = identifier.strip()
+    if not identifier:
+        raise HTTPException(400, "请输入要查询的 ID")
+    if id_type == "log_id" and not (identifier.isascii() and identifier.isdecimal() and len(identifier) <= 19 and 0 < int(identifier) <= 9223372036854775807):
+        raise HTTPException(400, "日志 ID 必须是有效的正整数")
+    database = await get_database()
+    items, total = await database.query_usage_logs(identifier=identifier, id_type=id_type, offset=offset, limit=limit)
+    return JSONResponse(content={"items": items, "total": total, "offset": offset, "limit": limit}, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/credential-stats")
@@ -200,7 +217,7 @@ async def get_request_body_log(
         data = await asyncio.to_thread(read_request_body_log, path)
         if data is None:
             raise HTTPException(status_code=404, detail="详细日志文件不存在或已清理")
-        return JSONResponse(content=data)
+        return JSONResponse(content=data, headers={"Cache-Control": "no-store"})
     except HTTPException:
         raise
     except Exception as e:

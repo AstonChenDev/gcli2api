@@ -22,6 +22,7 @@ from sqlalchemy import (
     case,
     func,
     inspect,
+    or_,
     select,
     text,
     tuple_,
@@ -65,6 +66,7 @@ class AntigravityCredential(Base):
 
     # tier 状态 (free/pro/ultra/ultra_lite)
     tier: Mapped[Optional[str]] = mapped_column(String(32), default="pro")
+    note: Mapped[str] = mapped_column(Text, default="")
 
     # 时间戳
     created_at: Mapped[float] = mapped_column(Float, default=time.time)
@@ -95,6 +97,7 @@ class UsageLog(Base):
     api_format: Mapped[str] = mapped_column(String(16), default="")        # openai / gemini / anthropic
     client_ip: Mapped[str] = mapped_column(String(64), default="")
     request_id: Mapped[str] = mapped_column(String(64), default="")
+    response_id: Mapped[str] = mapped_column(String(160), default="")
 
     # 调用信息
     model_name: Mapped[str] = mapped_column(String(128), default="")             # 客户端请求的模型名（原始，可能带功能前缀）
@@ -122,6 +125,8 @@ class UsageLog(Base):
     __table_args__ = (
         Index("idx_ul_created_model", "created_at", "model_name"),
         Index("idx_ul_created_email", "created_at", "credential_email"),
+        Index("idx_ul_request_id", "request_id"),
+        Index("idx_ul_response_id", "response_id"),
     )
 
 
@@ -149,6 +154,8 @@ def _row_to_credential_dict(row: AntigravityCredential) -> Dict[str, Any]:
         "client_secret": row.client_secret or "",
         "project_id": row.project_id or "",
         "expiry": row.expiry or "",
+        "tier": row.tier or "pro",
+        "note": row.note or "",
     }
 
 
@@ -251,7 +258,8 @@ class Database:
                 sync_conn.execute(text(f"DROP TABLE {table_name}"))
 
         # 已存在的表补齐缺失列（ALTER TABLE ADD COLUMN，保留数据）
-        for orm_model in (UsageLog,):
+        inspector = inspect(sync_conn)
+        for orm_model in (AntigravityCredential, UsageLog):
             table = orm_model.__table__
             if not inspector.has_table(table.name):
                 continue
@@ -274,6 +282,8 @@ class Database:
                 log.info(f"表 {table.name} 补充列 {column.name} ({column_type})")
 
         Base.metadata.create_all(sync_conn)
+        for index in UsageLog.__table__.indexes:
+            index.create(sync_conn, checkfirst=True)
 
     async def close(self) -> None:
         if self._engine:
@@ -349,6 +359,8 @@ class Database:
                 row.client_secret = client_secret
                 row.project_id = project_id
                 row.expiry = expiry
+                if "note" in credential_data:
+                    row.note = credential_data["note"]
                 if tier:
                     row.tier = tier
                 row.updated_at = time.time()
@@ -362,6 +374,7 @@ class Database:
                     project_id=project_id,
                     expiry=expiry,
                     tier=tier or "pro",
+                    note=credential_data.get("note", ""),
                     last_success=time.time(),
                 ))
             log.debug(f"Stored credential: {email}")
@@ -451,7 +464,7 @@ class Database:
         """更新凭证状态字段"""
         json_fields = {"error_codes", "error_messages", "model_cooldowns"}
         float_fields = {"last_success"}
-        str_fields = {"user_email", "tier", "project_id"}
+        str_fields = {"user_email", "tier", "project_id", "note"}
         bool_fields = {"disabled"}
         async with self.session() as s:
             values: Dict[str, Any] = {}
@@ -491,6 +504,7 @@ class Database:
                 "email": row.email,
                 "model_cooldowns": _load_json(row.model_cooldowns, {}),
                 "tier": row.tier or "pro",
+                "note": row.note or "",
                 "project_id": row.project_id or "",
             }
 
@@ -510,6 +524,7 @@ class Database:
                     "email": row.email,
                     "model_cooldowns": cooldowns,
                     "tier": row.tier or "pro",
+                    "note": row.note or "",
                     "project_id": row.project_id or "",
                 }
             return states
@@ -583,6 +598,7 @@ class Database:
                     "last_success": row.last_success or current_time,
                     "model_cooldowns": active_cooldowns,
                     "tier": row.tier or "pro",
+                    "note": row.note or "",
                     "project_id": row.project_id or "",
                 }
                 if tier_filter and tier_filter in ("free", "pro", "ultra", "ultra_lite"):
@@ -763,6 +779,7 @@ class Database:
                     api_format=str(entry.get("api_format", "")),
                     client_ip=str(entry.get("client_ip", "")),
                     request_id=str(entry.get("request_id", "")),
+                    response_id=str(entry.get("response_id", ""))[:160],
                     model_name=str(entry.get("model_name", "")),
                     upstream_model_name=str(entry.get("upstream_model_name", "")),
                     credential_email=str(entry.get("credential_email", "")),
@@ -794,10 +811,24 @@ class Database:
         status: str = "all",  # all / success / error
         is_stream: Optional[bool] = None,
         status_code: Optional[int] = None,
+        identifier: str = "",
+        id_type: str = "auto",
     ) -> Tuple[List[Dict[str, Any]], int]:
         """分页查询请求日志，返回 (日志列表, 总数)，新 -> 旧"""
         stmt = select(UsageLog)
         count_stmt = select(func.count()).select_from(UsageLog)
+
+        if identifier:
+            matches = []
+            if id_type in ("auto", "request_id"):
+                matches.append(UsageLog.request_id == identifier)
+            if id_type in ("auto", "response_id"):
+                matches.append(UsageLog.response_id == identifier)
+            if id_type in ("auto", "log_id") and identifier.isascii() and identifier.isdecimal() and len(identifier) <= 19 and int(identifier) <= 9223372036854775807:
+                matches.append(UsageLog.id == int(identifier))
+            condition = or_(*matches) if matches else UsageLog.id == -1
+            stmt = stmt.where(condition)
+            count_stmt = count_stmt.where(condition)
 
         if start_timestamp:
             stmt = stmt.where(UsageLog.created_at >= start_timestamp)
@@ -848,6 +879,7 @@ class Database:
                 "api_format": r.api_format or "",
                 "client_ip": r.client_ip or "",
                 "request_id": r.request_id or "",
+                "response_id": r.response_id or "",
                 "model_name": r.model_name or "",
                 "upstream_model_name": r.upstream_model_name or "",
                 "credential_email": r.credential_email or "",
@@ -952,21 +984,29 @@ class Database:
             email.label("credential_email"), model.label("model_name"),
             func.count().label("total_requests"), func.sum(succeeded).label("success_count"),
             func.max(UsageLog.created_at).label("last_request"),
+            func.coalesce(func.sum(UsageLog.prompt_tokens), 0).label("prompt_tokens"),
+            func.coalesce(func.sum(UsageLog.completion_tokens), 0).label("completion_tokens"),
+            func.coalesce(func.sum(UsageLog.cached_tokens), 0).label("cached_tokens"),
         ).where(*conditions).group_by(email, model)
         summary_query = select(func.count(), func.coalesce(func.sum(succeeded), 0),
-            func.min(UsageLog.created_at), func.max(UsageLog.created_at)).where(*conditions)
+            func.min(UsageLog.created_at), func.max(UsageLog.created_at),
+            func.coalesce(func.sum(UsageLog.prompt_tokens), 0),
+            func.coalesce(func.sum(UsageLog.completion_tokens), 0),
+            func.coalesce(func.sum(UsageLog.cached_tokens), 0)).where(*conditions)
         async with self.session() as s:
             total = await s.scalar(select(func.count()).select_from(grouped.subquery()))
             summary = (await s.execute(summary_query)).one()
             rows = (await s.execute(grouped.order_by(func.count().desc(), email, model).offset(offset).limit(limit))).all()
             errors = []
             tiers = {}
+            notes = {}
             if rows:
                 # Enrich after aggregation: deleted credentials must retain their log counts.
-                credential_rows = (await s.execute(select(AntigravityCredential.email, AntigravityCredential.tier)
+                credential_rows = (await s.execute(select(AntigravityCredential.email, AntigravityCredential.tier, AntigravityCredential.note)
                     .where(AntigravityCredential.email.in_({r.credential_email for r in rows if r.credential_email})))).all()
                 tiers = {e: t.strip().lower() if t and t.strip().lower() in {"ultra", "ultra_lite", "pro", "free"} else None
-                    for e, t in credential_rows}
+                    for e, t, _ in credential_rows}
+                notes = {e: note or "" for e, _, note in credential_rows}
                 errors = (await s.execute(select(email, model, UsageLog.status_code, func.count())
                     .where(*conditions, UsageLog.success.is_not(True), tuple_(email, model).in_([(r.credential_email, r.model_name) for r in rows]))
                     .group_by(email, model, UsageLog.status_code).order_by(UsageLog.status_code))).all()
@@ -976,8 +1016,11 @@ class Database:
         return {"total": total, "summary": {
             "total_requests": summary[0], "success_count": summary[1], "failure_count": summary[0] - summary[1],
             "first_request": summary[2], "last_request": summary[3],
+            "prompt_tokens": summary[4], "completion_tokens": summary[5], "cached_tokens": summary[6],
         }, "items": [{"credential_email": r.credential_email, "model_name": r.model_name,
             "credential_tier": tiers.get(r.credential_email),
+            "credential_note": notes.get(r.credential_email, ""),
+            "prompt_tokens": r.prompt_tokens, "completion_tokens": r.completion_tokens, "cached_tokens": r.cached_tokens,
             "total_requests": r.total_requests, "success_count": r.success_count,
             "failure_count": r.total_requests - r.success_count, "last_request": r.last_request,
             "errors": error_map.get((r.credential_email, r.model_name), [])} for r in rows]}

@@ -17,6 +17,7 @@ from config import (
     get_antigravity_api_url,
     get_auto_ban_error_codes,
     get_request_log_enabled,
+    get_request_log_all_requests,
     get_request_log_error_codes,
 )
 from log import log
@@ -27,7 +28,10 @@ from src.credential_manager import (
 )
 from src.httpx_client import stream_post_async, post_async
 from src.models import Model, model_to_dict
+from anyio import CancelScope
 from src.stream_metadata import StreamMetadata
+from src.converter.request_fields import normalize_gemini_request_fields
+from src.usage_log import extract_response_id
 from src.thought_boundary import prepare_thought_boundary, ThoughtBoundaryGuard, ERROR_CODE as BOUNDARY_ERROR
 from src.utils import ANTIGRAVITY_USER_AGENT
 
@@ -117,7 +121,7 @@ async def wrap_cli_request(
     将 Gemini 格式请求包装成 Antigravity CLI 格式。
     返回 (payload, request_id)。
     """
-    inner = copy.deepcopy(gemini_request)
+    inner = copy.deepcopy(normalize_gemini_request_fields(gemini_request))
     first_user_text = _extract_first_user_text(inner)
 
     # 移除 safetySettings（CLI 不发送）
@@ -270,19 +274,20 @@ async def _record_request_body_detail(
     is_stream: bool,
 ) -> str:
     """
-    请求体详细日志：开关开启且状态码命中配置错误码时写盘（JSON 文件），
+    请求体详细日志：开关开启后按全部请求或指定状态码写盘（JSON 文件），
     数据库只保存文件索引路径。任何异常不影响主流程。
     """
     try:
         if not await get_request_log_enabled():
             return ""
-        if status_code not in await get_request_log_error_codes():
+        if not await get_request_log_all_requests() and status_code not in await get_request_log_error_codes():
             return ""
 
         from src.request_body_log import record_request_body
 
         rel_path = await record_request_body(
             request_id=str(log_entry.get("request_id", "")),
+            response_id=str(log_entry.get("response_id", "")),
             model_name=str(log_entry.get("model_name", "")),
             upstream_model_name=str(log_entry.get("upstream_model_name", "")),
             credential_email=str(log_entry.get("credential_email", "")),
@@ -339,6 +344,10 @@ async def stream_request(
             "error_message": "当前无可用凭证", "use_time": time.time() - log_start_time,
         })
         from src.usage_log import record_usage_log
+        log_entry["request_log_file"] = await _record_request_body_detail(
+            500, log_entry["error_message"], log_entry,
+            url="", headers=None, payload=body, response_body="", is_stream=True,
+        )
         await record_usage_log(log_entry)
         yield Response(
             content=json.dumps({"error": "当前无可用凭证"}),
@@ -360,6 +369,10 @@ async def stream_request(
             "error_message": "凭证中没有访问令牌", "use_time": time.time() - log_start_time,
         })
         from src.usage_log import record_usage_log
+        log_entry["request_log_file"] = await _record_request_body_detail(
+            500, log_entry["error_message"], log_entry,
+            url="", headers=None, payload=body, response_body="", is_stream=True,
+        )
         await record_usage_log(log_entry)
         yield Response(
             content=json.dumps({"error": "凭证中没有访问令牌"}),
@@ -420,6 +433,8 @@ async def stream_request(
         return True
 
     for attempt in range(max_retries + 1):
+        last_error_body = ""
+        result_logged = False
         success_recorded = False  # 标记是否已记录成功
         need_retry = False  # 标记是否需要重试
         usage_tokens: Dict[str, int] = {}  # 从流中提取的 token 用量
@@ -434,6 +449,9 @@ async def stream_request(
             写入一次上游调用的请求日志（调用一次谷歌 API 产生一条日志；
             重试会在后续 attempt 各自再记一条，属于正常行为）。
             """
+            nonlocal result_logged
+            if result_logged:
+                return
             from src.usage_log import record_usage_log
 
             if stream_metadata.response_id:
@@ -444,11 +462,15 @@ async def stream_request(
                     **(thought_guard.metadata() if thought_guard else {}),
                 }, ensure_ascii=True))
 
-            # 请求体详细日志：命中配置错误码时写盘，数据库只存文件索引
+            attempt_entry = {
+                **log_entry, "credential_email": current_file,
+                "response_id": stream_metadata.response_id or extract_response_id(last_error_body),
+            }
+            # 请求体详细日志与数据库条目关联本次尝试。
             request_log_file = await _record_request_body_detail(
                 status_code,
                 error_message,
-                log_entry,
+                attempt_entry,
                 url=target_url,
                 headers=auth_headers,
                 payload=final_payload,
@@ -458,7 +480,7 @@ async def stream_request(
 
             # 每条日志记录本次调用实际使用的凭证
             await record_usage_log({
-                **log_entry,
+                **attempt_entry,
                 "credential_email": current_file,
                 "status_code": status_code,
                 "success": success,
@@ -467,6 +489,7 @@ async def stream_request(
                 "request_log_file": request_log_file,
                 **usage_tokens,
             })
+            result_logged = True
 
         try:
             async for chunk in stream_post_async(
@@ -624,13 +647,20 @@ async def stream_request(
                     return
                 continue  # 重试
 
+        except asyncio.CancelledError:
+            # Starlette cancels the upstream task on client disconnect. Shield the
+            # final accounting from its cancellation scope, then propagate it.
+            with CancelScope(shield=True):
+                await _log_stream_result(499, False, "请求被取消或客户端断开，未完整接收响应")
+            raise
+
         except GeneratorExit:
-            # 下游提前关闭了本生成器（转换器断流、抗截断续传、客户端断开等）。
-            # 已收到上游数据却未走到正常收尾时，补记一条成功日志，避免请求
-            # 日志丢失（issue #438）；GeneratorExit 不可吞，必须 re-raise
-            if success_recorded:
-                log.debug("[ANTIGRAVITY STREAM] 生成器被提前关闭，补记成功日志")
-                await _log_stream_result(200, True)
+            # aclose() may follow a yielded error; never count that attempt twice.
+            with CancelScope(shield=True):
+                if thought_guard and not thought_guard.complete:
+                    await _log_stream_result(499, False, "响应提前关闭，尚未完成正文分界")
+                elif success_recorded:
+                    await _log_stream_result(200, True)
             raise
 
         except Exception as e:
@@ -706,14 +736,18 @@ async def non_stream_request(
         """
         from src.usage_log import record_usage_log, extract_usage_tokens
 
-        # 请求体详细日志：命中配置错误码时写盘，数据库只存文件索引
+        attempt_entry = {
+            **log_entry, "credential_email": current_file,
+            "response_id": extract_response_id(response_content) or extract_response_id(last_error_body),
+        }
+        # 请求体详细日志与数据库条目关联本次尝试。
         request_log_file = await _record_request_body_detail(
             status_code,
             error_message,
-            log_entry,
+            attempt_entry,
             url=target_url,
             headers=auth_headers,
-            payload=final_payload,
+            payload=final_payload or body,
             response_body=last_error_body,
             is_stream=False,
         )
@@ -721,7 +755,7 @@ async def non_stream_request(
         tokens = extract_usage_tokens(response_content) if success else {}
         # 每条日志记录本次调用实际使用的凭证
         await record_usage_log({
-            **log_entry,
+            **attempt_entry,
             "credential_email": current_file,
             "status_code": status_code,
             "success": success,
@@ -812,6 +846,7 @@ async def non_stream_request(
         return True
 
     for attempt in range(max_retries + 1):
+        last_error_body = ""
         need_retry = False  # 标记是否需要重试
         attempt_start_time = time.time()  # 本次上游调用开始时间
         

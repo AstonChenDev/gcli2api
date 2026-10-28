@@ -9,11 +9,14 @@ import io
 import json
 import time
 import zipfile
+
+import httpx
 from urllib.parse import quote
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Response, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from log import log
 from src.credential_manager import (
@@ -52,6 +55,19 @@ from config import get_antigravity_api_url
 router = APIRouter(prefix="/creds", tags=["credentials"])
 
 
+class CredentialNoteRequest(BaseModel):
+    note: str = Field(max_length=1000, strict=True)
+
+
+@router.patch("/note/{email}")
+async def update_credential_note(email: str, request: CredentialNoteRequest, token: str = Depends(verify_panel_token)):
+    database = await get_database()
+    note = request.note.strip()
+    if not await database.update_credential_state(email, {"note": note}):
+        raise HTTPException(404, "凭证不存在")
+    return {"email": email, "note": note}
+
+
 # =============================================================================
 # 凭证导入核心
 # =============================================================================
@@ -81,10 +97,21 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
             client_id=ANTIGRAVITY_CLIENT_ID,
             client_secret=ANTIGRAVITY_CLIENT_SECRET,
         )
-        try:
-            await creds.refresh()
-        except Exception as e:
-            return {"status": "error", "message": f"refresh_token 无效: {str(e)[:200]}"}
+        for attempt in range(2):
+            try:
+                await asyncio.wait_for(creds.refresh(), timeout=IMPORT_REFRESH_TIMEOUT)
+                break
+            except Exception as exc:
+                # Credentials.refresh wraps transport errors in TokenError; keep the cause.
+                network_error = isinstance(exc, (TimeoutError, httpx.RequestError)) or isinstance(exc.__context__, httpx.RequestError)
+                status = getattr(exc, "status_code", None)
+                retryable = network_error or status in (429, 500, 502, 503, 504)
+                if retryable and attempt == 0:
+                    await asyncio.sleep(0.5)
+                    continue
+                if network_error:
+                    return {"status": "error", "code": "network_error", "message": "连接 Google 验证服务超时或网络异常（已重试），请检查代理后重试；不代表凭证无效"}
+                return {"status": "error", "code": "oauth_rejected", "message": f"Google 令牌验证失败（HTTP {status}）" if status else "令牌验证失败，请检查凭证格式后重试"}
 
         if not creds.access_token:
             return {"status": "error", "message": "refresh_token 无效: 未获取到 access_token"}
@@ -92,9 +119,9 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
         # 自动获取缺失的 email
         if not email:
             try:
-                email = await get_user_email(creds)
+                email = await asyncio.wait_for(get_user_email(creds), timeout=15.0)
             except Exception as e:
-                log.warning(f"自动获取邮箱失败: {e}")
+                log.warning(f"自动获取邮箱失败: {type(e).__name__}")
         if not email:
             return {"status": "error", "message": "无法获取邮箱（JSON 中未提供且自动获取失败）"}
 
@@ -102,11 +129,11 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
         if not project_id or not tier:
             try:
                 api_base_url = await get_antigravity_api_url()
-                fetched_project, fetched_tier = await fetch_project_id_and_tier(
+                fetched_project, fetched_tier = await asyncio.wait_for(fetch_project_id_and_tier(
                     access_token=creds.access_token,
                     user_agent=ANTIGRAVITY_USER_AGENT,
                     api_base_url=api_base_url,
-                )
+                ), timeout=20.0)
                 if not project_id:
                     project_id = fetched_project
                 if not tier:
@@ -129,6 +156,8 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
             "tier": tier,
         }
 
+        if "note" in data:
+            credential_data["note"] = data["note"].strip()
         await add_credential(email, credential_data)
         return {
             "status": "success",
@@ -138,7 +167,7 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        return {"status": "error", "message": f"处理失败: {str(e)[:200]}"}
+        return {"status": "error", "message": f"凭证处理失败（{type(e).__name__}），请稍后重试"}
 
 
 # =============================================================================
@@ -146,161 +175,157 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
 # =============================================================================
 
 
-async def extract_json_files_from_zip(zip_file: UploadFile) -> List[dict]:
-    """从ZIP文件中提取JSON文件"""
+# File imports use a separate short validation budget, not the model POST timeout.
+IMPORT_CONCURRENCY = 3
+IMPORT_REFRESH_TIMEOUT = 20.0
+IMPORT_ITEM_TIMEOUT = 90.0
+IMPORT_HEARTBEAT_SECONDS = 10.0
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_EXPANDED_BYTES = 64 * 1024 * 1024
+MAX_IMPORT_FILES = 1000
+_import_slots = asyncio.Semaphore(IMPORT_CONCURRENCY)
+
+
+def _extract_zip_content(content: bytes) -> List[dict]:
+    """Decode off the event loop; preserve invalid entries as visible failures."""
     try:
-        zip_content = await zip_file.read()
-        files_data = []
-
-        with zipfile.ZipFile(io.BytesIO(zip_content), "r") as zip_ref:
-            file_list = zip_ref.namelist()
-            json_files = [
-                f for f in file_list if f.endswith(".json") and not f.startswith("__MACOSX/")
-            ]
-
-            if not json_files:
-                raise HTTPException(status_code=400, detail="ZIP文件中没有找到JSON文件")
-
-            log.info(f"从ZIP文件 {zip_file.filename} 中找到 {len(json_files)} 个JSON文件")
-
-            for json_filename in json_files:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            entries = [entry for entry in archive.infolist()
+                       if not entry.is_dir() and entry.filename.lower().endswith(".json")
+                       and not entry.filename.startswith("__MACOSX/")]
+            if not entries:
+                raise HTTPException(400, "ZIP 文件中没有找到 JSON 文件")
+            if len(entries) > MAX_IMPORT_FILES or sum(entry.file_size for entry in entries) > MAX_EXPANDED_BYTES:
+                raise HTTPException(400, "ZIP 最多包含 1000 个 JSON，解压后总大小不能超过 64 MB")
+            result = []
+            for entry in entries:
                 try:
-                    with zip_ref.open(json_filename) as json_file:
-                        content = json_file.read()
-
-                        try:
-                            content_str = content.decode("utf-8")
-                        except UnicodeDecodeError:
-                            log.warning(f"跳过编码错误的文件: {json_filename}")
-                            continue
-
-                        filename = json_filename.rsplit("/", 1)[-1]
-                        files_data.append({"filename": filename, "content": content_str})
-
-                except Exception as e:
-                    log.warning(f"处理ZIP中的文件 {json_filename} 时出错: {e}")
-                    continue
-
-        log.info(f"成功从ZIP文件中提取 {len(files_data)} 个有效的JSON文件")
-        return files_data
-
+                    value = archive.read(entry).decode("utf-8-sig")
+                    result.append({"filename": entry.filename, "content": value})
+                except Exception:
+                    result.append({"filename": entry.filename, "error": "文件无法读取：请检查 ZIP 完整性、加密状态和 UTF-8 编码"})
+            return result
     except zipfile.BadZipFile:
-        raise HTTPException(status_code=400, detail="无效的ZIP文件格式")
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise
-        log.error(f"处理ZIP文件失败: {e}")
-        raise HTTPException(status_code=500, detail=f"处理ZIP文件失败: {str(e)}")
+        raise HTTPException(400, "无效或损坏的 ZIP 文件")
 
 
-async def upload_credentials_common( files: List[UploadFile] ) -> JSONResponse:
-    """批量导入凭证文件（规范 JSON：refresh_token 必填，email/tier/project_id 可选自动获取）"""
+async def extract_json_files_from_zip(zip_file: UploadFile) -> List[dict]:
+    content = await zip_file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, "单次上传不能超过 20 MB")
+    return await asyncio.to_thread(_extract_zip_content, content)
 
-    if not files:
-        raise HTTPException(status_code=400, detail="请选择要上传的文件")
 
-    if len(files) > 100:
-        raise HTTPException(
-            status_code=400, detail=f"文件数量过多，最多支持100个文件，当前：{len(files)}个"
-        )
-
-    files_data = []
+async def _read_credential_files(files: List[UploadFile]) -> List[dict]:
+    if not files or len(files) > 100:
+        raise HTTPException(400, "请选择 1 至 100 个 JSON 或 ZIP 文件")
+    entries = []
+    total_bytes = expanded_bytes = 0
     for file in files:
-        if file.filename.endswith(".zip"):
-            zip_files_data = await extract_json_files_from_zip(file)
-            files_data.extend(zip_files_data)
-            log.info(f"从ZIP文件 {file.filename} 中提取了 {len(zip_files_data)} 个JSON文件")
-
-        elif file.filename.endswith(".json"):
-            content_chunks = []
-            while True:
-                chunk = await file.read(8192)
-                if not chunk:
-                    break
-                content_chunks.append(chunk)
-
-            content = b"".join(content_chunks)
+        content = await file.read(MAX_UPLOAD_BYTES + 1)
+        total_bytes += len(content)
+        if total_bytes > MAX_UPLOAD_BYTES:
+            raise HTTPException(400, "单次上传不能超过 20 MB")
+        filename = file.filename or "unknown"
+        if filename.lower().endswith(".zip"):
+            extracted = await asyncio.to_thread(_extract_zip_content, content)
+            for entry in extracted:
+                entry["filename"] = f"{filename}/{entry['filename']}"
+            entries.extend(extracted)
+            expanded_bytes += sum(len(entry.get("content", "").encode("utf-8")) for entry in extracted)
+        elif filename.lower().endswith(".json"):
             try:
-                content_str = content.decode("utf-8")
+                entries.append({"filename": filename, "content": content.decode("utf-8-sig")})
             except UnicodeDecodeError:
-                raise HTTPException(
-                    status_code=400, detail=f"文件 {file.filename} 编码格式不支持"
-                )
-
-            files_data.append({"filename": file.filename, "content": content_str})
+                entries.append({"filename": filename, "error": "JSON 文件必须使用 UTF-8 编码"})
+            expanded_bytes += len(content)
         else:
-            raise HTTPException(
-                status_code=400, detail=f"文件 {file.filename} 格式不支持，只支持JSON和ZIP文件"
-            )
+            raise HTTPException(400, "仅支持 JSON 和 ZIP 文件")
+        if len(entries) > MAX_IMPORT_FILES or expanded_bytes > MAX_EXPANDED_BYTES:
+            raise HTTPException(400, "单次最多导入 1000 个凭证，JSON 总大小不能超过 64 MB")
+    return entries
 
-    batch_size = 100
-    all_results = []
-    total_success = 0
 
-    for i in range(0, len(files_data), batch_size):
-        batch_files = files_data[i : i + batch_size]
+async def _process_credential_file(entry: dict) -> dict:
+    if entry.get("error"):
+        return {"status": "error", "message": entry["error"]}
+    try:
+        data = json.loads(entry["content"])
+    except (ValueError, TypeError):
+        return {"status": "error", "message": "JSON 格式错误"}
+    if not isinstance(data, dict):
+        return {"status": "error", "message": "JSON 顶层必须是对象"}
+    for key in ("refresh_token", "email", "tier", "project_id", "note"):
+        if data.get(key) is not None and not isinstance(data[key], str):
+            return {"status": "error", "message": f"{key} 必须是字符串"}
+    if "note" in data and (not isinstance(data["note"], str) or len(data["note"]) > 1000):
+        return {"status": "error", "message": "备注必须是最多 1000 字的字符串"}
+    # Include queueing outside the per-item timeout so a large valid ZIP is not discarded.
+    async with _import_slots:
+        try:
+            async with asyncio.timeout(IMPORT_ITEM_TIMEOUT):
+                return await _import_single_credential(data)
+        except TimeoutError:
+            return {"status": "error", "code": "import_timeout", "message": "单个凭证验证超过 90 秒，已跳过；其他凭证继续导入，可稍后重试此项"}
+        except Exception as exc:
+            return {"status": "error", "message": f"导入失败（{type(exc).__name__}），请稍后重试"}
 
-        async def process_single_file(file_data):
+
+async def _credential_import_events(entries: List[dict]):
+    """Bounded workers report each committed item; disconnect cancels unfinished work."""
+    total = len(entries)
+    queue = asyncio.Queue()
+    pending = iter(enumerate(entries))
+    results = []
+    success = 0
+
+    async def worker():
+        for index, entry in pending:
+            result = await _process_credential_file(entry)
+            await queue.put({**result, "filename": entry["filename"], "item_index": index})
+
+    workers = [asyncio.create_task(worker()) for _ in range(min(IMPORT_CONCURRENCY, total))]
+    try:
+        yield {"type": "start", "total_count": total, "completed_count": 0, "uploaded_count": 0}
+        while len(results) < total:
             try:
-                data = json.loads(file_data["content"])
-                if not isinstance(data, dict):
-                    return {
-                        "filename": file_data["filename"],
-                        "status": "error",
-                        "message": "JSON格式错误: 顶层必须是对象",
-                    }
-                result = await _import_single_credential(data)
-                result["filename"] = file_data["filename"]
-                return result
-            except json.JSONDecodeError as e:
-                return {
-                    "filename": file_data["filename"],
-                    "status": "error",
-                    "message": f"JSON格式错误: {str(e)}",
-                }
-            except Exception as e:
-                return {
-                    "filename": file_data["filename"],
-                    "status": "error",
-                    "message": f"处理失败: {str(e)[:200]}",
-                }
+                result = await asyncio.wait_for(queue.get(), timeout=IMPORT_HEARTBEAT_SECONDS)
+            except TimeoutError:
+                yield {"type": "heartbeat"}
+                continue
+            results.append(result)
+            success += result["status"] == "success"
+            yield {"type": "progress", "result": result, "total_count": total,
+                   "completed_count": len(results), "uploaded_count": success}
+        yield {"type": "complete", "uploaded_count": success, "total_count": total,
+               "completed_count": total, "results": sorted(results, key=lambda row: row["item_index"]),
+               "message": f"导入完成：成功 {success}，失败 {total - success}，共 {total} 个凭证"}
+        log.info(f"文件导入完成: 成功 {success}/{total} 个凭证")
+    finally:
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
-        log.info(f"开始并发处理 {len(batch_files)} 个凭证...")
-        concurrent_tasks = [process_single_file(file_data) for file_data in batch_files]
-        batch_results = await asyncio.gather(*concurrent_tasks, return_exceptions=True)
 
-        batch_uploaded_count = 0
-        for result in batch_results:
-            if isinstance(result, Exception):
-                all_results.append(
-                    {
-                        "filename": "unknown",
-                        "status": "error",
-                        "message": f"处理异常: {str(result)[:200]}",
-                    }
-                )
-            else:
-                all_results.append(result)
-                if result["status"] == "success":
-                    batch_uploaded_count += 1
+async def upload_credentials_common(files: List[UploadFile]) -> JSONResponse:
+    """Backward-compatible JSON endpoint using the same bounded importer."""
+    entries = await _read_credential_files(files)
+    async for event in _credential_import_events(entries):
+        if event["type"] == "complete":
+            return JSONResponse(content={key: value for key, value in event.items() if key != "type"})
 
-        total_success += batch_uploaded_count
 
-        batch_num = (i // batch_size) + 1
-        total_batches = (len(files_data) + batch_size - 1) // batch_size
-        log.info(
-            f"批次 {batch_num}/{total_batches} 完成: 成功 "
-            f"{batch_uploaded_count}/{len(batch_files)} 个凭证"
-        )
+@router.post("/upload-stream")
+async def upload_credentials_stream(files: List[UploadFile] = File(...), token: str = Depends(verify_panel_token)):
+    entries = await _read_credential_files(files)
 
-    return JSONResponse(
-        content={
-            "uploaded_count": total_success,
-            "total_count": len(files_data),
-            "results": all_results,
-            "message": f"批量导入完成: 成功 {total_success}/{len(files_data)} 个凭证",
-        }
-    )
+    async def stream():
+        async for event in _credential_import_events(entries):
+            yield json.dumps(event, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson", headers={
+        "Cache-Control": "no-store", "X-Accel-Buffering": "no",
+    })
 
 
 async def get_creds_status_common(
@@ -371,6 +396,8 @@ async def download_all_creds_common() -> Response:
                 else:
                     continue
 
+                if cred.get("note"):
+                    export_data["note"] = cred["note"]
                 content = json.dumps(export_data, ensure_ascii=False, indent=2)
                 zip_file.writestr(f"{email}.json", content)
                 success_count += 1
@@ -661,6 +688,8 @@ async def export_credential(
             "project_id": cred.get("project_id", ""),
         }
 
+        if cred.get("note"):
+            export_data["note"] = cred["note"]
         content = json.dumps(export_data, ensure_ascii=False, indent=2)
 
         return Response(
@@ -707,6 +736,7 @@ async def download_selected_credentials(
             "refresh_token": cred.get("refresh_token", ""),
             "project_id": cred.get("project_id", ""),
             "tier": cred.get("tier", "pro"),
+            **({"note": cred["note"]} if cred.get("note") else {}),
         }))
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:

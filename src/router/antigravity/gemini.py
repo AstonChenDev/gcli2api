@@ -39,6 +39,7 @@ from src.router.stream_passthrough import (
 
 # 本地模块 - 数据模型
 from src.models import GeminiRequest, model_to_dict
+from src.converter.request_fields import normalize_gemini_request_fields
 
 
 # ==================== 路由器初始化 ====================
@@ -67,7 +68,7 @@ async def generate_content(
     log.debug(f"[ANTIGRAVITY] Non-streaming request for model: {model}")
 
     # 转换为字典
-    normalized_dict = model_to_dict(gemini_request)
+    normalized_dict = normalize_gemini_request_fields(model_to_dict(gemini_request))
 
     # 健康检查
     if is_health_check_request(normalized_dict, format="gemini"):
@@ -141,7 +142,7 @@ async def stream_generate_content(
     log.debug(f"[ANTIGRAVITY] Streaming request for model: {model}")
 
     # 转换为字典
-    normalized_dict = model_to_dict(gemini_request)
+    normalized_dict = normalize_gemini_request_fields(model_to_dict(gemini_request))
 
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(model)

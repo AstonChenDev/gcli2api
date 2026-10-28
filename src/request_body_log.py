@@ -1,7 +1,7 @@
 """
 请求体详细日志服务（磁盘 JSON 文件）
-- 开关 request_log_enabled 控制；仅记录命中指定错误码的请求
-- 文件保存在 data/request_logs/<YYYY-MM-DD>/<毫秒时间戳>_<request_id>.json
+- request_log_enabled 控制；可记录全部请求或仅指定状态码
+- 文件保存在 data/request_logs/<YYYY-MM-DD>/<毫秒时间戳>_<随机ID>.json
 - usage_log 数据库行只保存相对路径索引（request_log_file 字段）
 - 前端查看详情时按索引从磁盘读取；清理/清空日志时同步删除对应文件
 """
@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import time
+import uuid
 from typing import Any, Dict, Optional
 
 from log import log
@@ -42,6 +43,7 @@ async def record_request_body(
     url: str,
     headers: Optional[Dict[str, str]],
     payload: Any,
+    response_id: str = "",
     response_body: str = "",
     error_message: str = "",
 ) -> Optional[str]:
@@ -54,7 +56,7 @@ async def record_request_body(
     ts = time.time()
     date_dir = time.strftime("%Y-%m-%d", time.localtime(ts))
     rel_dir = os.path.join(REQUEST_LOG_DIR, date_dir)
-    file_name = f"{int(ts * 1000)}_{request_id or 'unknown'}.json"
+    file_name = f"{int(ts * 1000)}_{uuid.uuid4().hex}.json"
     # 数据库索引：相对 request_logs 根目录的路径（正斜杠）
     rel_path = f"{date_dir}/{file_name}"
     full_path = os.path.join(rel_dir, file_name)
@@ -62,6 +64,7 @@ async def record_request_body(
     entry = {
         "created_at": ts,
         "request_id": request_id,
+        "response_id": response_id,
         "model_name": model_name,
         "upstream_model_name": upstream_model_name,
         "credential_email": credential_email,

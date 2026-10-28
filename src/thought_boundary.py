@@ -11,6 +11,7 @@ import json
 import os
 
 from fastapi import Response
+from src.converter.request_fields import normalize_gemini_request_fields
 
 
 ERROR_CODE = "UPSTREAM_OUTPUT_BOUNDARY_MISSING"
@@ -18,6 +19,7 @@ ERROR_CODE = "UPSTREAM_OUTPUT_BOUNDARY_MISSING"
 
 def prepare_thought_boundary(model, request):
     """Return a private copy of a plain-text request plus its framing marker."""
+    request = normalize_gemini_request_fields(request)
     if os.environ.get("ARGON_THOUGHT_BOUNDARY_ENABLED", "true").lower() == "false":
         return request, None
     config = request.get("generationConfig") or {}

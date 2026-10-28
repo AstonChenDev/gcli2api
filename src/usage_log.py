@@ -16,6 +16,25 @@ def new_request_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
+def extract_response_id(source: Any) -> str:
+    """从上游 JSON 或单个 SSE 事件提取 responseId。"""
+    if isinstance(source, (str, bytes)):
+        try:
+            text = source.decode("utf-8") if isinstance(source, bytes) else source
+            if text.startswith("data:"):
+                text = text[5:].strip()
+            source = __import__("json").loads(text)
+        except (ValueError, UnicodeError):
+            return ""
+    if not isinstance(source, dict):
+        return ""
+    response = source.get("response", source)
+    if not isinstance(response, dict):
+        return ""
+    value = response.get("responseId")
+    return value[:160] if isinstance(value, str) else ""
+
+
 def extract_usage_tokens(source: Any) -> Dict[str, int]:
     """
     从 Gemini 响应结构中提取 token 用量。

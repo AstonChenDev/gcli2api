@@ -108,8 +108,9 @@ const CONFIG_GROUPS = [
     title: "请求日志",
     fields: [
       { key: "usage_log_enabled", label: "启用请求日志", type: "bool", note: "记录每次 API 请求（模型、凭证、token 用量、耗时、状态）到数据库，在\"请求日志\"页面查看。日志不自动清理，可在该页面手动清理或清空" },
-      { key: "request_log_enabled", label: "启用请求体详细日志", type: "bool", note: "开启后，当请求命中下方错误码时，把发往上游的完整请求头（已脱敏）与请求体保存为 JSON 文件（data/request_logs/）。主要用于请求体错误时排查 debug；清理/清空日志时会同步删除这些文件" },
-      { key: "request_log_error_codes", label: "详细日志错误码", type: "csv_numbers", showIf: (cfg) => !!cfg.request_log_enabled, note: "仅当最终响应状态码命中此列表时记录详细日志，逗号分隔，如 400, 429。留空默认只记录 400", placeholder: "400, 429" },
+      { key: "request_log_enabled", label: "启用请求体详细日志", type: "bool", note: "保存发往上游的请求头（敏感头已脱敏）和完整请求体，供按 ID 查询。清理请求日志时同步删除详细 JSON 文件" },
+      { key: "request_log_all_requests", label: "保存全部新请求体", type: "bool", showIf: (cfg) => !!cfg.request_log_enabled, note: "包括成功和失败的模型调用，每次上游重试分别保存；需要同时开启请求日志。历史未保存的内容无法补回" },
+      { key: "request_log_error_codes", label: "详细日志错误码", type: "csv_numbers", showIf: (cfg) => !!cfg.request_log_enabled && !cfg.request_log_all_requests, note: "仅当最终响应状态码命中此列表时记录详细日志，逗号分隔，如 400, 429。留空默认只记录 400", placeholder: "400, 429" },
     ],
   },
 ];

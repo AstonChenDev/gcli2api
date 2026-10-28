@@ -47,6 +47,7 @@ ENV_MAPPINGS = {
     "MODEL_REWRITE_RULES": "model_rewrite_rules",
     "USAGE_LOG_ENABLED": "usage_log_enabled",
     "REQUEST_LOG_ENABLED": "request_log_enabled",
+    "REQUEST_LOG_ALL_REQUESTS": "request_log_all_requests",
     "REQUEST_LOG_ERROR_CODES": "request_log_error_codes",
     "CREDENTIAL_SELECT_MODE": "credential_select_mode",
     "HOST": "host",
@@ -690,6 +691,14 @@ async def get_request_log_enabled() -> bool:
         return env_value.lower() in ("true", "1", "yes", "on")
 
     return bool(await get_config_value("request_log_enabled", False))
+
+
+async def get_request_log_all_requests() -> bool:
+    """保存所有新模型调用的请求体（包括成功与失败）。"""
+    value = os.getenv("REQUEST_LOG_ALL_REQUESTS")
+    if value is not None:
+        return value.lower() in ("true", "1", "yes")
+    return bool(await get_config_value("request_log_all_requests", False))
 
 
 async def get_request_log_error_codes() -> list:

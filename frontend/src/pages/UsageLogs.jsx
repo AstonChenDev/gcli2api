@@ -16,6 +16,8 @@ import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
 import CredentialUsageStats from "../components/CredentialUsageStats";
+import RequestLookup from "../components/RequestLookup";
+import { formatMillions } from "../utils/tokens";
 import { copyText } from "../utils/clipboard";
 
 const PAGE_SIZES = [20, 50, 100, 200].map((n) => ({ value: n, label: `每页 ${n}` }));
@@ -163,12 +165,12 @@ function UsageLogDetails() {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   // 请求体详细日志：按索引从磁盘读取
-  const openRequestBody = async () => {
-    if (!detail?.request_log_file) return;
+  const openRequestBody = async (row = detail) => {
+    if (!row?.request_log_file) return;
     setDetailCopyState("");
     setDetailBodyLoading(true);
     try {
-      const res = await api.get("/usage-logs/request-body", { params: { path: detail.request_log_file } });
+      const res = await api.get("/usage-logs/request-body", { params: { path: row.request_log_file } });
       setDetailBody(res.data);
     } catch (err) {
       // 文件可能已被清理或手动删除，仅在详情弹窗内提示，不弹全局错误
@@ -236,6 +238,11 @@ function UsageLogDetails() {
         </div>
       )}
 
+      {stats && <div className="grid grid-cols-2 gap-3">
+        <div className="card p-4"><div className="text-xl font-bold text-blue-700" title={`${stats.prompt_tokens || 0} Tokens`}>{formatMillions(stats.prompt_tokens)}</div><div className="text-xs text-slate-500">输入 Tokens（含缓存）</div></div>
+        <div className="card p-4"><div className="text-xl font-bold text-purple-700" title={`${stats.completion_tokens || 0} Tokens`}>{formatMillions(stats.completion_tokens)}</div><div className="text-xs text-slate-500">输出 Tokens（含思考）</div></div>
+      </div>}
+      <RequestLookup onOpen={row => { setDetail(row); setDetailBody(null); }} />
       {/* 操作栏 */}
       <div className="flex flex-wrap items-center gap-2">
         <button onClick={refresh} disabled={loading} className="btn btn-secondary text-xs sm:text-sm px-3 py-1.5 sm:px-4 sm:py-2 flex items-center gap-1.5">
@@ -405,7 +412,9 @@ function UsageLogDetails() {
             <div className="space-y-2 text-sm">
               {[
                 ["时间", formatTime(detail.created_at)],
+                ["日志数字 ID", String(detail.id)],
                 ["请求 ID", detail.request_id || "-"],
+                ["上游 responseId", detail.response_id || "未记录 / 上游未返回"],
                 ["状态", detail.success ? "成功" : `失败 (${detail.status_code})`],
                 ["API 格式", detail.api_format || "-"],
                 ["客户端 IP", detail.client_ip || "-"],
@@ -432,12 +441,13 @@ function UsageLogDetails() {
                   </div>
                 </div>
               )}
+              {!detail.request_log_file && <p className="text-xs text-amber-700">此记录没有保存请求体 JSON，历史未保存的内容无法补回。</p>}
               {detail.request_log_file && (
                 <div className="pt-2">
                   <div className="flex items-center justify-between gap-2">
                     <div className="text-slate-500">请求体详细日志</div>
                     <button
-                      onClick={openRequestBody}
+                      onClick={() => openRequestBody()}
                       disabled={detailBodyLoading}
                       className="btn btn-secondary text-xs px-3 py-1.5 flex items-center gap-1.5"
                     >
@@ -446,7 +456,7 @@ function UsageLogDetails() {
                     </button>
                   </div>
                   <p className="text-xs text-slate-500 mt-1.5">
-                    命中指定错误码时保存了发往上游的完整请求头与请求体，用于排查请求体错误（如 400）
+                    已保存发往上游的请求头（敏感头已脱敏）与完整请求体。
                   </p>
                 </div>
               )}
@@ -477,7 +487,7 @@ function UsageLogDetails() {
               </div>
             </div>
             <p className="text-xs text-slate-500 mb-3">
-              命中指定错误码时保存，用于排查请求体错误：完整记录发往上游的请求头（已脱敏）与请求体。响应体为上游返回的原始错误。
+              记录本次调用发往上游的请求头（敏感头已脱敏）与完整请求体。若调用未派发，则保存本次请求参数。错误响应在上游返回时保存。
             </p>
             {detailCopyState === "copied" && <p role="status" className="text-sm text-green-700 mb-3">已复制详细日志 JSON 到本机剪贴板</p>}
             {detailCopyState === "manual" && (

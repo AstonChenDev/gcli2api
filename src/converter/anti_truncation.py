@@ -19,6 +19,7 @@ from fastapi import Response as FastAPIResponse
 from fastapi.responses import StreamingResponse
 
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
+from src.converter.request_fields import normalize_gemini_request_fields
 
 # ==================== 合成工具配置 ====================
 
@@ -120,7 +121,7 @@ def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
     modified_payload = payload.copy()
     # 拷贝 request 层，避免注入原地污染调用方的原始请求体
     # （shallow copy 下 request_data 与调用方共享同一个 dict）
-    request_data = dict(modified_payload.get("request") or {})
+    request_data = normalize_gemini_request_fields(modified_payload.get("request") or {})
 
     # 1. 注入合成工具到 tools 列表
     tools = list(request_data.get("tools") or [])

@@ -22,6 +22,19 @@ import QuotaSummary, { quotaGroups } from "../components/QuotaSummary";
 
 export default function Credentials() {
   const [items, setItems] = useState([]);
+  const [noteCredential, setNoteCredential] = useState(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteSaving, setNoteSaving] = useState(false);
+  const [noteError, setNoteError] = useState("");
+  const saveNote = async (event) => {
+    event.preventDefault(); setNoteSaving(true); setNoteError("");
+    try {
+      const { data } = await api.patch(`/creds/note/${encodeURIComponent(noteCredential.email)}`, { note: noteDraft });
+      setItems(rows => rows.map(row => row.email === data.email ? { ...row, note: data.note } : row));
+      setNoteCredential(null);
+    } catch (err) { setNoteError(err.response?.data?.detail || "保存备注失败"); }
+    finally { setNoteSaving(false); }
+  };
   const [stats, setStats] = useState({ total: 0, normal: 0, disabled: 0 });
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -599,6 +612,10 @@ export default function Credentials() {
                   </div>
                 </div>
 
+                <div className="text-xs text-slate-600 space-y-1">
+                  <div className="whitespace-pre-wrap break-words">备注：{cred.note || "未设置"}</div>
+                  <button className="text-purple-700 underline" onClick={() => { setNoteCredential(cred); setNoteDraft(cred.note || ""); setNoteError(""); }}>{cred.note ? "编辑备注" : "添加备注"}</button>
+                </div>
                 {/* 信息区 */}
                 <div className="space-y-1 text-xs">
                   <div className="flex items-center justify-between gap-2">
@@ -735,6 +752,15 @@ export default function Credentials() {
 
 
       {/* 额度弹窗 */}
+      {noteCredential && <Modal title="凭证备注" onClose={() => { if (!noteSaving) setNoteCredential(null); }}>
+        <form onSubmit={saveNote} className="space-y-3">
+          <p className="text-sm break-all">{noteCredential.email}</p>
+          <textarea aria-label="凭证备注" value={noteDraft} onChange={e => setNoteDraft(e.target.value)} maxLength={1000} rows={5} className="w-full rounded-lg border border-slate-300 bg-white p-3 text-sm" placeholder="填写备注；留空保存可删除备注" />
+          <p className="text-xs text-slate-500">{noteDraft.length} / 1000</p>
+          {noteError && <p role="alert" className="text-red-700 text-sm">{noteError}</p>}
+          <button disabled={noteSaving} className="btn btn-primary">{noteSaving ? "保存中…" : "保存备注"}</button>
+        </form>
+      </Modal>}
       {quotaModal && (
         <Modal
           type="info"

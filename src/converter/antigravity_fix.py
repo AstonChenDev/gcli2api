@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
+from src.converter.request_fields import normalize_gemini_request_fields
 
 # ==================== 常量配置 ====================
 
@@ -862,7 +863,7 @@ async def normalize_antigravity_request(
     Returns:
         规范化后的请求
     """
-    result = request.copy()
+    result = normalize_gemini_request_fields(request)
     model = result.get("model", "")
     generation_config = (result.get("generationConfig") or {}).copy()
 

@@ -68,6 +68,7 @@ async def get_config(token: str = Depends(verify_panel_token)):
 
         # 请求体详细日志配置
         current_config["request_log_enabled"] = await config.get_request_log_enabled()
+        current_config["request_log_all_requests"] = await config.get_request_log_all_requests()
         current_config["request_log_error_codes"] = await config.get_request_log_error_codes()
 
         # 凭证选择模式
@@ -227,6 +228,10 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         if "request_log_enabled" in new_config:
             if not isinstance(new_config["request_log_enabled"], bool):
                 raise HTTPException(status_code=400, detail="请求体详细日志开关必须是布尔值")
+
+        if "request_log_all_requests" in new_config:
+            if not isinstance(new_config["request_log_all_requests"], bool):
+                raise HTTPException(status_code=400, detail="全部请求体记录开关必须是布尔值")
 
         if "request_log_error_codes" in new_config:
             codes = new_config["request_log_error_codes"]
