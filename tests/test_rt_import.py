@@ -121,15 +121,21 @@ class RTImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("synthetic-sensitive", response.text + str(warning.call_args_list))
 
     async def test_oauth_pipeline_resolves_identity_project_and_tier(self):
+        await self._assert_oauth_pipeline("g1-ultra-tier", "ultra")
+
+    async def test_oauth_pipeline_preserves_ultra_lite(self):
+        await self._assert_oauth_pipeline("g1-ultra-lite-tier", "ultra_lite")
+
+    async def _assert_oauth_pipeline(self, raw_tier, expected_tier):
         token_response = httpx.Response(200, json={"access_token": "synthetic-access", "expires_in": 3600})
-        project_response = httpx.Response(200, json={"cloudaicompanionProject": {"id": "shared-project"}, "paidTier": {"id": "ultra-tier"}})
+        project_response = httpx.Response(200, json={"cloudaicompanionProject": {"id": "shared-project"}, "paidTier": {"id": raw_tier}})
         user_response = httpx.Response(200, json={"email": "VERIFIED@example.invalid", "verified_email": True})
         with patch.object(rt, "post_async", AsyncMock(side_effect=[token_response, project_response])) as post, patch.object(rt, "get_async", AsyncMock(return_value=user_response)), patch.object(rt, "get_oauth_proxy_url", AsyncMock(return_value="https://oauth.invalid")), patch.object(rt, "get_googleapis_proxy_url", AsyncMock(return_value="https://google.invalid")), patch.object(rt, "get_antigravity_api_url", AsyncMock(return_value="https://ag.invalid")):
             response = await self.post({"manager_backup": [{"email": "forged@example.invalid", "refresh_token": "synthetic-sensitive"}]})
         result = response.json()
         self.assertEqual(result["imported_count"], 1)
         self.assertEqual(result["results"][0]["email"], "verified@example.invalid")
-        self.assertEqual(result["results"][0]["tier"], "ultra")
+        self.assertEqual(result["results"][0]["tier"], expected_tier)
         saved = await self.db.get_credential("verified@example.invalid")
         datetime.fromisoformat(saved["expiry"])
         self.assertNotIn("synthetic-sensitive", response.text)

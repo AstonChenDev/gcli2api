@@ -87,7 +87,7 @@ class CredentialUsageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_current_tier_changes_and_deleted_credentials_preserve_counts(self):
         baseline = await self.db.credential_usage_stats()
-        for tier in ("ultra", "pro", "free", "unrecognized"):
+        for tier in ("ultra", "ultra_lite", "pro", "free", "unrecognized"):
             await self.db.store_credential("a@example.invalid", {"tier": tier})
             response = await self.client.get("/usage-logs/credential-stats")
             self.assertEqual(response.status_code, 200)
@@ -97,6 +97,14 @@ class CredentialUsageTests(unittest.IsolatedAsyncioTestCase):
             for row in data["items"]:
                 expected = tier if row["credential_email"] == "a@example.invalid" and tier != "unrecognized" else None
                 self.assertEqual(row["credential_tier"], expected)
+
+    async def test_ultra_filter_includes_lite_and_lite_filter_is_specific(self):
+        for tier in ("ultra", "ultra_lite", "pro"):
+            await self.db.store_credential(f"{tier}@example.invalid", {"tier": tier})
+        ultra = await self.db.get_credentials_summary(tier_filter="ultra")
+        lite = await self.db.get_credentials_summary(tier_filter="ultra_lite")
+        self.assertEqual({r["tier"] for r in ultra["items"]}, {"ultra", "ultra_lite"})
+        self.assertEqual([r["tier"] for r in lite["items"]], ["ultra_lite"])
 
     async def test_auth_and_disabled_logging_flag(self):
         with patch.object(usage_logs, "get_usage_log_enabled", AsyncMock(return_value=False)):

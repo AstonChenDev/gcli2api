@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from config import get_antigravity_api_url, get_googleapis_proxy_url, get_oauth_proxy_url
 from log import log
 from src.httpx_client import get_async, post_async
+from src.credential_tier import normalize_credential_tier
 from src.storage.database import get_database
 from src.utils import ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET, ANTIGRAVITY_USER_AGENT
 
@@ -201,7 +202,7 @@ async def prepare_credential(refresh_token):
         raise ImportFailure("project_not_found", "RT 有效，但没有获取到 Antigravity Project ID；请先在官方应用激活账号")
     tier_data = account.get("paidTier") or account.get("currentTier") or {}
     raw_tier = str(tier_data.get("id", "") if isinstance(tier_data, dict) else "").lower()
-    tier = "ultra" if "ultra" in raw_tier else "pro" if "pro" in raw_tier else "free"
+    tier = normalize_credential_tier(raw_tier) or "free"
     credential = {
         "access_token": access_token, "refresh_token": data.get("refresh_token") or refresh_token,
         "client_id": ANTIGRAVITY_CLIENT_ID, "client_secret": ANTIGRAVITY_CLIENT_SECRET,
@@ -282,3 +283,5 @@ async def import_antigravity_refresh_tokens(candidates, *, database=None):
         summary[key] = sum(r["status"] == status for r in ordered)
     log.info(f"RT import completed: total={summary['total']}, success={summary['imported_count']}, skipped={summary['skipped_count']}, failed={summary['failed_count']}")
     return summary
+
+

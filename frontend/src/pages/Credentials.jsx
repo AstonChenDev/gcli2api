@@ -356,7 +356,7 @@ export default function Credentials() {
   };
 
   const tierStyle = (tier) =>
-    tier === "ultra"
+    tier === "ultra" || tier === "ultra_lite"
       ? "bg-red-500/10 text-red-700 border-red-500/30"
       : tier === "pro"
       ? "bg-amber-500/10 text-amber-700 border-amber-500/30"
@@ -472,6 +472,7 @@ export default function Credentials() {
             { value: "free", label: "Free" },
             { value: "pro", label: "Pro" },
             { value: "ultra", label: "Ultra" },
+            { value: "ultra_lite", label: "Ultra Lite" },
           ]}
         />
         <Select
@@ -583,7 +584,7 @@ export default function Credentials() {
                       <span
                         className={`text-xs px-2 py-0.5 rounded-full border ${tierStyle(cred.tier)}`}
                       >
-                        {cred.tier || "pro"}
+                        {cred.tier === "ultra_lite" ? "Ultra Lite" : cred.tier === "ultra" ? "Ultra" : cred.tier || "pro"}
                       </span>
                       {cred.disabled ? (
                         <span className="text-red-700 text-xs flex items-center gap-1">

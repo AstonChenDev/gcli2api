@@ -63,7 +63,7 @@ class AntigravityCredential(Base):
     # 模型级冷却 (JSON: {model_name: cooldown_timestamp})
     model_cooldowns: Mapped[str] = mapped_column(Text, default="{}")
 
-    # tier 状态 (free/pro/ultra)
+    # tier 状态 (free/pro/ultra/ultra_lite)
     tier: Mapped[Optional[str]] = mapped_column(String(32), default="pro")
 
     # 时间戳
@@ -585,8 +585,9 @@ class Database:
                     "tier": row.tier or "pro",
                     "project_id": row.project_id or "",
                 }
-                if tier_filter and tier_filter in ("free", "pro", "ultra"):
-                    if summary["tier"] != tier_filter:
+                if tier_filter and tier_filter in ("free", "pro", "ultra", "ultra_lite"):
+                    allowed_tiers = {"ultra", "ultra_lite"} if tier_filter == "ultra" else {tier_filter}
+                    if summary["tier"] not in allowed_tiers:
                         continue
                 if cooldown_filter == "in_cooldown" and not active_cooldowns:
                     continue
@@ -964,7 +965,7 @@ class Database:
                 # Enrich after aggregation: deleted credentials must retain their log counts.
                 credential_rows = (await s.execute(select(AntigravityCredential.email, AntigravityCredential.tier)
                     .where(AntigravityCredential.email.in_({r.credential_email for r in rows if r.credential_email})))).all()
-                tiers = {e: t.strip().lower() if t and t.strip().lower() in {"ultra", "pro", "free"} else None
+                tiers = {e: t.strip().lower() if t and t.strip().lower() in {"ultra", "ultra_lite", "pro", "free"} else None
                     for e, t in credential_rows}
                 errors = (await s.execute(select(email, model, UsageLog.status_code, func.count())
                     .where(*conditions, UsageLog.success.is_not(True), tuple_(email, model).in_([(r.credential_email, r.model_name) for r in rows]))

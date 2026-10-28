@@ -11,11 +11,12 @@ import {
   Trash2,
   XCircle,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
 import CredentialUsageStats from "../components/CredentialUsageStats";
+import { copyText } from "../utils/clipboard";
 
 const PAGE_SIZES = [20, 50, 100, 200].map((n) => ({ value: n, label: `每页 ${n}` }));
 
@@ -68,6 +69,15 @@ function UsageLogDetails() {
   const [detail, setDetail] = useState(null);
   const [detailBody, setDetailBody] = useState(null);
   const [detailBodyLoading, setDetailBodyLoading] = useState(false);
+  const [detailCopyState, setDetailCopyState] = useState("");
+  const manualCopyRef = useRef(null);
+
+  useEffect(() => {
+    if (detailCopyState === "manual") {
+      manualCopyRef.current?.focus();
+      manualCopyRef.current?.select();
+    }
+  }, [detailCopyState]);
 
   // 时间范围（小时）
   const [rangeHours, setRangeHours] = useState(24);
@@ -155,6 +165,7 @@ function UsageLogDetails() {
   // 请求体详细日志：按索引从磁盘读取
   const openRequestBody = async () => {
     if (!detail?.request_log_file) return;
+    setDetailCopyState("");
     setDetailBodyLoading(true);
     try {
       const res = await api.get("/usage-logs/request-body", { params: { path: detail.request_log_file } });
@@ -170,10 +181,12 @@ function UsageLogDetails() {
   const copyDetailBody = async () => {
     if (!detailBody || detailBody.__missing) return;
     try {
-      await navigator.clipboard.writeText(JSON.stringify(detailBody, null, 2));
-      setMessage({ type: "success", text: "已复制详细日志 JSON" });
+      await copyText(JSON.stringify(detailBody, null, 2));
+      setDetailCopyState("copied");
     } catch {
-      setMessage({ type: "error", text: "复制失败" });
+      setDetailCopyState("manual");
+      manualCopyRef.current?.focus();
+      manualCopyRef.current?.select();
     }
   };
 
@@ -466,6 +479,14 @@ function UsageLogDetails() {
             <p className="text-xs text-slate-500 mb-3">
               命中指定错误码时保存，用于排查请求体错误：完整记录发往上游的请求头（已脱敏）与请求体。响应体为上游返回的原始错误。
             </p>
+            {detailCopyState === "copied" && <p role="status" className="text-sm text-green-700 mb-3">已复制详细日志 JSON 到本机剪贴板</p>}
+            {detailCopyState === "manual" && (
+              <div className="mb-3 rounded-lg border border-amber-300 bg-amber-50 p-3">
+                <p role="status" className="text-sm text-amber-900 mb-2">浏览器未允许自动复制。请在下方文本框按 Ctrl+C / ⌘C，手机可长按后选择复制。</p>
+                <button className="btn btn-secondary text-xs mb-2" onClick={() => { manualCopyRef.current?.focus(); manualCopyRef.current?.select(); }}>全选 JSON</button>
+                <textarea ref={manualCopyRef} aria-label="手动复制完整 JSON" readOnly value={JSON.stringify(detailBody, null, 2)} className="w-full h-40 bg-white border border-slate-300 rounded p-2 font-mono text-xs text-slate-800" />
+              </div>
+            )}
             <div className="space-y-3 text-xs">
               <div>
                 <div className="text-slate-600 mb-1">请求 URL</div>

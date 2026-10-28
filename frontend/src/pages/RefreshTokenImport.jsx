@@ -87,7 +87,7 @@ export default function RefreshTokenImport() {
         {result.results?.map(row => <div key={row.item} className={`rounded-lg border p-3 text-sm ${row.status === "success" ? "bg-emerald-50 border-emerald-200" : row.status === "skipped" ? "bg-slate-50 border-slate-200" : "bg-red-50 border-red-200"}`}>
           <div className="font-medium">第 {row.item} 项 · {({ success: "成功", skipped: "已跳过", failed: "失败" })[row.status]}</div>
           {row.email && <p className="break-all mt-1">{row.email}</p>}
-          {(row.tier || row.project_id) && <p className="text-xs text-slate-600 mt-1 break-all">{row.tier && `等级：${row.tier}`} {row.project_id && ` · Project：${row.project_id}`}</p>}
+          {(row.tier || row.project_id) && <p className="text-xs text-slate-600 mt-1 break-all">{row.tier && `等级：${row.tier === "ultra_lite" ? "Ultra Lite" : row.tier}`} {row.project_id && ` · Project：${row.project_id}`}</p>}
           {row.error && <p className="text-xs text-slate-600 mt-1">{row.error}</p>}
         </div>)}
       </div>

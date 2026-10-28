@@ -17,6 +17,7 @@ from config import (
 from log import log
 
 from src.httpx_client import get_async, post_async
+from src.credential_tier import normalize_credential_tier
 
 
 class TokenError(Exception):
@@ -415,7 +416,7 @@ async def fetch_project_id_and_tier(
 
     Returns:
         (project_id, subscription_tier)
-        subscription_tier 可能是 "FREE", "PRO", "ULTRA" 或 None
+        subscription_tier 可能是 free、pro、ultra、ultra_lite 或 None
     """
     headers = {
         'User-Agent': user_agent,
@@ -424,27 +425,12 @@ async def fetch_project_id_and_tier(
         'Accept-Encoding': 'gzip'
     }
 
-    def _map_raw_tier(raw_tier: Optional[str]) -> Optional[str]:
-        """将 loadCodeAssist 返回的 raw tier 按关键词映射为统一 tier。"""
-        if not raw_tier:
-            return None
-
-        lowered = raw_tier.lower()
-        if "ultra" in lowered:
-            return "ultra"
-        if "pro" in lowered:
-            return "pro"
-        if "free" in lowered:
-            return "free"
-
-        return "free"
-
     subscription_tier = None
 
     # 步骤 1: 尝试 loadCodeAssist
     try:
         project_id, raw_tier = await _try_load_code_assist(api_base_url, headers)
-        subscription_tier = _map_raw_tier(raw_tier)
+        subscription_tier = normalize_credential_tier(raw_tier)
 
         if raw_tier:
             log.info(

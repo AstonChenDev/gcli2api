@@ -12,6 +12,14 @@ GEMINI.md
 .kiro
 # Environment configuration
 .env
+.env.*
+!.env.example
+app.env
+*.pem
+*.key
+*.dump
+*.sqlite
+*.sqlite3
 
 # Python
 uv.lock

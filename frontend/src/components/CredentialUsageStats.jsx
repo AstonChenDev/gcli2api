@@ -10,7 +10,7 @@ function rangeParams(range) {
   return { ...(start === null ? {} : { start_timestamp: start }), end_timestamp: end };
 }
 const inputClass = "rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 min-w-0";
-const tierStyles = { ultra: "bg-purple-100 text-purple-800", pro: "bg-blue-100 text-blue-800", free: "bg-slate-100 text-slate-700" };
+const tierStyles = { ultra: "bg-purple-100 text-purple-800", ultra_lite: "bg-purple-100 text-purple-800", pro: "bg-blue-100 text-blue-800", free: "bg-slate-100 text-slate-700" };
 
 export default function CredentialUsageStats() {
   const [range, setRange] = useState("today");
@@ -87,7 +87,7 @@ export default function CredentialUsageStats() {
         <tbody>{data.items.map(row => <tr key={JSON.stringify([row.credential_email, row.model_name])}>
           <td className="break-all min-w-48"><div>{row.credential_email || "未分配凭证"}</div>
             {row.credential_email && <span className={`inline-block mt-1 rounded px-2 py-0.5 text-xs font-medium ${tierStyles[row.credential_tier] || "bg-slate-100 text-slate-500"}`}>
-              级别：{({ ultra: "Ultra", pro: "Pro", free: "Free" })[row.credential_tier] || "未知"}
+              级别：{({ ultra: "Ultra", ultra_lite: "Ultra Lite", pro: "Pro", free: "Free" })[row.credential_tier] || "未知"}
             </span>}
           </td>
           <td className="break-all min-w-44">{row.model_name}</td>

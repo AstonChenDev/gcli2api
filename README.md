@@ -1,5 +1,11 @@
 # AGY2API
 
+> 本分支保存定制版代码，已同步至 2026-10-28 的 `bcb264b-clipboard-20261028` 发布版本。
+> 包含浅色界面、凭证批量测试和选中导出、额度展示、RT 导入、逐凭证模型统计、
+> 思考流兼容处理、Ultra Lite 标注，以及 HTTP 访问时复制请求明细 JSON 的修复。
+> 下文的上游镜像和安装脚本不会安装这些定制功能；请使用本仓库源码及根目录 Dockerfile 构建。
+> 生产配置、密码、凭证和数据库不包含在仓库内，环境变量格式见 `.env.example`。
+
 **将 Google Antigravity 转换为 OpenAI、Gemini 和 Claude API 兼容接口**
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)

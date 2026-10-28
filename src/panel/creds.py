@@ -316,8 +316,8 @@ async def get_creds_status_common(
         raise HTTPException(status_code=400, detail="status_filter 只能是 all、enabled 或 disabled")
     if cooldown_filter and cooldown_filter not in ["all", "in_cooldown", "no_cooldown"]:
         raise HTTPException(status_code=400, detail="cooldown_filter 只能是 all、in_cooldown 或 no_cooldown")
-    if tier_filter and tier_filter not in ["all", "free", "pro", "ultra"]:
-        raise HTTPException(status_code=400, detail="tier_filter 只能是 all、free、pro 或 ultra")
+    if tier_filter and tier_filter not in ["all", "free", "pro", "ultra", "ultra_lite"]:
+        raise HTTPException(status_code=400, detail="tier_filter 只能是 all、free、pro、ultra 或 ultra_lite")
 
     database = await get_database()
     result = await database.get_credentials_summary(
