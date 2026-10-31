@@ -163,7 +163,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_stream_success_and_error_captured(self):
         for code in (200, 400):
-            response = {"response": {"responseId": f"upstream-{code}", "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 20, "thoughtsTokenCount": 5, "cachedContentTokenCount": 40}}}
+            response = {"response": {"responseId": f"upstream-{code}", "candidates": [{"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"}], "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 20, "thoughtsTokenCount": 5, "cachedContentTokenCount": 40}}}
             with patch.object(api, "post_async", AsyncMock(return_value=httpx.Response(code, json=response))):
                 result = await api.non_stream_request(self.body, log_ctx={"request_id": "req-test"})
             self.assertEqual(result.status_code, code)
@@ -204,7 +204,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
                     stack.enter_context(patch.object(api, "stream_post_async", stream))
                     [x async for x in api.stream_request(self.body)]
                 else:
-                    stack.enter_context(patch.object(api, "post_async", AsyncMock(side_effect=[httpx.Response(429, json={"error":"synthetic retry"}), httpx.Response(200, json={"responseId":"retry-success"})])))
+                    stack.enter_context(patch.object(api, "post_async", AsyncMock(side_effect=[httpx.Response(429, json={"error":"synthetic retry"}), httpx.Response(200, json={"responseId":"retry-success","candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]})])))
                     await api.non_stream_request(self.body)
             rows = [call.args[0] for call in self.saved.call_args_list]
             self.assertEqual(len(rows), 2)

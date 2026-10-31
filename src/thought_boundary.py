@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+from collections import deque
 
 from src.converter.request_fields import normalize_gemini_request_fields
 
@@ -132,7 +133,40 @@ class ThoughtBoundaryGuard:
 
     def _state(self):
         return dict(pending="", mode="detect", method="", sections=set(), scan_tail="", finalized=False,
-                    detect_text_false=False, heading_text_false=False)
+                    detect_text_false=False, heading_text_false=False, segments=deque())
+
+    def _buffer_part(self, state, part):
+        """Keep metadata attached to its text while the boundary is undecided."""
+        metadata = {key: value for key, value in part.items() if key != "text"}
+        if not part["text"] and not (metadata.keys() - {"thought"}):
+            return
+        segments = state["segments"]
+        if segments and part["text"] and segments[-1][0] and segments[-1][1] == metadata:
+            segments[-1][0] += part["text"]
+        else:
+            segments.append([part["text"], metadata])
+
+    def _consume_parts(self, state, count, thought=None):
+        """Emit original text spans, or discard only framing text (thought=None)."""
+        parts = []
+        segments = state["segments"]
+        while segments and (count or not segments[0][0]):
+            text, metadata = segments[0]
+            if not text:
+                # An empty text part can carry an independent signature. It
+                # must survive even when adjacent framing text is discarded.
+                parts.append({**copy.deepcopy(metadata), "text": ""})
+                segments.popleft()
+                continue
+            take = min(count, len(text))
+            if thought is not None:
+                parts.extend(self._part(text[:take], thought, metadata))
+            if take == len(text):
+                segments.popleft()
+            else:
+                segments[0][0] = text[take:]
+            count -= take
+        return parts
 
     def _possible_heading(self, text):
         """Do not commit a split heading just because a transport sets false on every part."""
@@ -192,7 +226,7 @@ class ThoughtBoundaryGuard:
         if explicit_text and state["mode"] == "thought" and not state["heading_text_false"]:
             before = state["pending"]
             state.update(pending="", mode="answer", method="native_text")
-            return self._part(before, True) + self._split(text, state, original, final)
+            return self._consume_parts(state, len(before), True) + self._split(text, state, original, final)
         state["pending"] += text
         if state["mode"] == "detect" and explicit_text and text:
             state["detect_text_false"] = True
@@ -207,7 +241,9 @@ class ThoughtBoundaryGuard:
             was_answer = state["mode"] == "answer"
             self.marker_corrections += int(corrected)
             state.update(pending="", mode="answer", method="corrected_marker" if corrected else "marker")
-            return self._part(before, not was_answer, original) + self._split(after, state, original, final)
+            parts = self._consume_parts(state, len(before), not was_answer)
+            parts.extend(self._consume_parts(state, size))
+            return parts + self._split(after, state, original, final)
         if state["mode"] == "detect":
             heading = self.HEADER.match(pending)
             if heading and ("\n" in heading[0] or final):
@@ -221,11 +257,13 @@ class ThoughtBoundaryGuard:
             boundary = self._narrative_boundary(state)
             if boundary is not None:
                 state.update(pending="", mode="answer", method="narrative_heuristic")
-                return self._part(pending[:boundary], True) + self._split(pending[boundary:], state, original, final)
+                return self._consume_parts(state, boundary, True) + self._split(pending[boundary:], state, original, final)
+        discarded = 0
         if final:
             size = self._partial_marker_size(pending, final=True)
             if size >= len("<<<AGY_FINAL_"):
                 pending = pending[:-size]
+                discarded = size
         keep = 0
         if not final:
             keep = self._partial_marker_size(pending)
@@ -233,7 +271,10 @@ class ThoughtBoundaryGuard:
                 keep = max(keep, min(len(pending), self.LOOKBEHIND))
         safe = pending[:-keep] if keep else pending
         state["pending"] = pending[-keep:] if keep else ""
-        return self._part(safe, state["mode"] == "thought", original)
+        parts = self._consume_parts(state, len(safe), state["mode"] == "thought")
+        if discarded:
+            parts.extend(self._consume_parts(state, discarded))
+        return parts
 
     def feed(self, chunk):
         raw = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
@@ -265,6 +306,7 @@ class ThoughtBoundaryGuard:
                     if self.include_thoughts:
                         parts.append(part)
                 elif isinstance(part.get("text"), str):
+                    self._buffer_part(state, part)
                     parts.extend(self._split(part["text"], state, part))
                 else:
                     parts.append(part)
@@ -279,7 +321,7 @@ class ThoughtBoundaryGuard:
 
     def flush(self):
         """Drain buffered text before DONE, EOF or an explicit error; no fake STOP."""
-        if self.last_event is None or not any(s["pending"] for s in self.states.values()):
+        if self.last_event is None or not any(s["pending"] or s["segments"] for s in self.states.values()):
             return None
         event = copy.deepcopy(self.last_event)
         response = event.get("response", event)
@@ -294,7 +336,7 @@ class ThoughtBoundaryGuard:
 
     @property
     def complete(self):
-        return bool(self.states) and all(not s["pending"] for s in self.states.values())
+        return bool(self.states) and all(not s["pending"] and not s["segments"] for s in self.states.values())
 
     def metadata(self):
         return {"boundary_complete": self.complete, "boundary_failed": False,

@@ -46,6 +46,7 @@ async def record_request_body(
     response_id: str = "",
     response_body: str = "",
     error_message: str = "",
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """
     写入一条请求体详细日志（磁盘 JSON）。
@@ -75,6 +76,7 @@ async def record_request_body(
         "request_body": payload,
         "response_body": response_body,
         "error_message": error_message,
+        "diagnostics": diagnostics or {},
     }
 
     try:

@@ -20,8 +20,10 @@ from sqlalchemy import (
     String,
     Text,
     case,
+    cast,
     func,
     inspect,
+    literal,
     or_,
     select,
     text,
@@ -976,6 +978,18 @@ class Database:
             conditions.append(email == credential_email)
         return email, model, conditions
 
+    @asynccontextmanager
+    async def _usage_snapshot(self):
+        """Keep totals, pages and error groups on the same database snapshot."""
+        async with self.session() as session:
+            if self.backend_type == "postgresql":
+                # READ COMMITTED takes a new snapshot for each SELECT.
+                await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
+            else:
+                # sqlite3's legacy transaction mode does not BEGIN for SELECT.
+                await session.execute(text("BEGIN"))
+            yield session
+
     async def credential_usage_stats(self, offset=0, limit=50, **filters):
         """Aggregate retained request logs by credential and actual upstream model."""
         email, model, conditions = self._credential_usage_filters(**filters)
@@ -993,7 +1007,7 @@ class Database:
             func.coalesce(func.sum(UsageLog.prompt_tokens), 0),
             func.coalesce(func.sum(UsageLog.completion_tokens), 0),
             func.coalesce(func.sum(UsageLog.cached_tokens), 0)).where(*conditions)
-        async with self.session() as s:
+        async with self._usage_snapshot() as s:
             total = await s.scalar(select(func.count()).select_from(grouped.subquery()))
             summary = (await s.execute(summary_query)).one()
             rows = (await s.execute(grouped.order_by(func.count().desc(), email, model).offset(offset).limit(limit))).all()
@@ -1035,10 +1049,73 @@ class Database:
         grouped = select(UsageLog.status_code.label("status_code"), message.label("error_message"),
             func.count().label("count"), func.max(UsageLog.created_at).label("last_seen"))
         grouped = grouped.where(*conditions).group_by(UsageLog.status_code, message)
-        async with self.session() as s:
+        async with self._usage_snapshot() as s:
             total = await s.scalar(select(func.count()).select_from(grouped.subquery()))
             rows = (await s.execute(grouped.order_by(func.count().desc(), UsageLog.status_code, message).offset(offset).limit(limit))).all()
         return {"total": total, "items": [dict(r._mapping) for r in rows]}
+
+    def _overall_usage_source(self, scope="requests", **filters):
+        """Apply time/model filters after choosing each request's latest retained result."""
+        _, model, conditions = self._credential_usage_filters(**filters)
+        query = select(
+            UsageLog.id, model.label("model_name"), UsageLog.success.is_(True).label("success"),
+            func.coalesce(UsageLog.status_code, 0).label("status_code"),
+            func.coalesce(UsageLog.error_message, "").label("error_message"),
+            UsageLog.created_at,
+        )
+        if scope == "requests":
+            # Empty legacy IDs are independent records, not one giant request.
+            key = case((func.coalesce(UsageLog.request_id, "") != "",
+                        literal("request:") + UsageLog.request_id),
+                       else_=literal("log:") + cast(UsageLog.id, String))
+            ranked = select(UsageLog.id.label("log_id"),
+                func.row_number().over(partition_by=key, order_by=UsageLog.id.desc()).label("position")).subquery()
+            query = query.join(ranked, ranked.c.log_id == UsageLog.id).where(ranked.c.position == 1)
+        elif scope != "attempts":
+            raise ValueError("Unknown statistics scope")
+        return query.where(*conditions).subquery()
+
+    async def overall_usage_stats(self, **filters):
+        result = {}
+        async with self._usage_snapshot() as s:
+            for scope in ("requests", "attempts"):
+                source = self._overall_usage_source(scope, **filters)
+                rows = (await s.execute(select(source.c.model_name, source.c.success,
+                    source.c.status_code, func.count().label("count"))
+                    .group_by(source.c.model_name, source.c.success, source.c.status_code))).all()
+                models, errors = {}, {}
+                for row in rows:
+                    model = models.setdefault(row.model_name, {"model_name": row.model_name,
+                        "total_requests": 0, "success_count": 0, "failure_count": 0})
+                    model["total_requests"] += row.count
+                    model["success_count" if row.success else "failure_count"] += row.count
+                    if not row.success:
+                        errors[row.status_code] = errors.get(row.status_code, 0) + row.count
+                summary = {key: sum(m[key] for m in models.values())
+                           for key in ("total_requests", "success_count", "failure_count")}
+                for item in [summary, *models.values()]:
+                    item["success_rate"] = (round(item["success_count"] / item["total_requests"] * 100, 2)
+                                            if item["total_requests"] else None)
+                result[scope] = {"summary": summary,
+                    "by_model": sorted(models.values(), key=lambda m: (-m["total_requests"], m["model_name"])),
+                    "error_codes": [{"status_code": code, "count": count,
+                        "failure_percentage": round(count / summary["failure_count"] * 100, 2),
+                        "total_percentage": round(count / summary["total_requests"] * 100, 2)}
+                        for code, count in sorted(errors.items(), key=lambda item: (-item[1], item[0]))]}
+        return result
+
+    async def overall_usage_errors(self, scope="requests", offset=0, limit=20, status_code=None, **filters):
+        source = self._overall_usage_source(scope, **filters)
+        query = select(source.c.status_code, source.c.error_message, func.count().label("count"),
+                       func.max(source.c.created_at).label("last_seen")).where(source.c.success.is_(False))
+        if status_code is not None:
+            query = query.where(source.c.status_code == status_code)
+        query = query.group_by(source.c.status_code, source.c.error_message)
+        async with self._usage_snapshot() as s:
+            total = await s.scalar(select(func.count()).select_from(query.subquery()))
+            rows = (await s.execute(query.order_by(func.count().desc(), source.c.status_code,
+                source.c.error_message).offset(offset).limit(limit))).all()
+        return {"total": total, "items": [dict(row._mapping) for row in rows]}
 
     async def delete_usage_logs_before(self, before_timestamp: float) -> int:
         """删除指定时间之前的日志，返回删除条数"""

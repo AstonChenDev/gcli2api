@@ -1,5 +1,6 @@
 """Bounded, content-free metadata for tracing upstream response IDs."""
 import json
+import time
 
 
 class StreamMetadata:
@@ -8,12 +9,14 @@ class StreamMetadata:
         self.model_version = ""
         self.thought_parts = 0
         self.text_parts = 0
+        self.last_event_at = None
 
     def observe(self, chunk):
         if isinstance(chunk, bytes):
             chunk = chunk.decode("utf-8", errors="replace")
         if not isinstance(chunk, str) or not chunk.startswith("data:"):
             return
+        self.last_event_at = time.time()
         try:
             data = json.loads(chunk[5:].strip())
         except (ValueError, TypeError):
@@ -44,7 +47,8 @@ class StreamMetadata:
 
     def as_dict(self):
         return dict(response_id=self.response_id, model_version=self.model_version,
-                    thought_parts=self.thought_parts, text_parts=self.text_parts)
+                    thought_parts=self.thought_parts, text_parts=self.text_parts,
+                    upstream_last_event_at=self.last_event_at)
 
 
 class StreamCompletion:

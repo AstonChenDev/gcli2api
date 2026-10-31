@@ -942,7 +942,13 @@ async def normalize_antigravity_request(
     result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
 
     if generation_config:
-        generation_config["maxOutputTokens"] = MAX_OUTPUT_TOKENS
+        # Gemini callers may deliberately limit long responses. Keep the
+        # established default when absent and leave Claude budgeting unchanged.
+        limit = generation_config.get("maxOutputTokens") if profile.family in ("gemini3", "gemini4") else None
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            from fastapi import HTTPException
+            raise HTTPException(400, "maxOutputTokens 必须是正整数")
+        generation_config["maxOutputTokens"] = min(limit, MAX_OUTPUT_TOKENS) if limit is not None else MAX_OUTPUT_TOKENS
         generation_config["topK"] = TOP_K
         result["generationConfig"] = generation_config
 

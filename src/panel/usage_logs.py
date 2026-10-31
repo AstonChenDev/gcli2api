@@ -22,6 +22,39 @@ from src.utils import verify_panel_token
 router = APIRouter(prefix="/usage-logs", tags=["usage-logs"])
 
 
+def overall_filters(start_timestamp, end_timestamp, model_name):
+    if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
+        raise HTTPException(400, "开始时间不能晚于结束时间")
+    return dict(start_timestamp=start_timestamp, end_timestamp=end_timestamp, model_name=model_name.strip())
+
+
+@router.get("/overall-stats")
+async def get_overall_usage_stats(
+    token: str = Depends(verify_panel_token),
+    start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None,
+    model_name: str = "",
+):
+    filters = overall_filters(start_timestamp, end_timestamp, model_name)
+    database = await get_database()
+    result = await database.overall_usage_stats(**filters)
+    result["logging_enabled"] = await get_usage_log_enabled()
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/overall-errors")
+async def get_overall_usage_errors(
+    token: str = Depends(verify_panel_token), scope: Literal["requests", "attempts"] = "requests",
+    offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100),
+    start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None,
+    model_name: str = "", status_code: Optional[int] = None,
+):
+    filters = overall_filters(start_timestamp, end_timestamp, model_name)
+    database = await get_database()
+    result = await database.overall_usage_errors(scope=scope, offset=offset, limit=limit,
+        status_code=status_code, **filters)
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
 @router.get("/lookup")
 async def lookup_request(
     identifier: str = Query(min_length=1, max_length=160),

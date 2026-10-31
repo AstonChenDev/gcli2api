@@ -49,7 +49,7 @@ export default function UsageLogs() {
   return <div className="space-y-4">
     <div className="flex gap-2" role="tablist" aria-label="请求日志视图">
       <button role="tab" aria-selected={view === "logs"} onClick={() => setView("logs")} className={`btn text-sm ${view === "logs" ? "btn-primary" : "btn-secondary"}`}>请求明细</button>
-      <button role="tab" aria-selected={view === "stats"} onClick={() => setView("stats")} className={`btn text-sm ${view === "stats" ? "btn-primary" : "btn-secondary"}`}>数据统计（凭证 / 模型）</button>
+      <button role="tab" aria-selected={view === "stats"} onClick={() => setView("stats")} className={`btn text-sm ${view === "stats" ? "btn-primary" : "btn-secondary"}`}>数据统计（整体 / 凭证 / 模型）</button>
     </div>
     {view === "logs" ? <UsageLogDetails /> : <CredentialUsageStats />}
   </div>;

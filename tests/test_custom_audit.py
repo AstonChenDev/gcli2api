@@ -69,7 +69,8 @@ class CustomAuditTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):await task
             await stream.aclose()
         self.assertEqual(self.saved.await_count,1)
-        self.assertEqual(self.saved.call_args.args[0]['status_code'],499)
+        self.assertEqual(self.saved.call_args.args[0]['status_code'],500)
+        self.assertIn('STREAM_INTERRUPTED_UNKNOWN', self.saved.call_args.args[0]['error_message'])
         self.assertFalse(self.saved.call_args.args[0]['success'])
 
     async def test_anyio_disconnect_scope_allows_final_accounting(self):
@@ -91,7 +92,8 @@ class CustomAuditTests(unittest.IsolatedAsyncioTestCase):
                 await blocked.wait()
                 group.cancel_scope.cancel()
         self.assertEqual(self.saved.await_count,1)
-        self.assertEqual(self.saved.call_args.args[0]['status_code'],499)
+        self.assertEqual(self.saved.call_args.args[0]['status_code'],500)
+        self.assertIn('STREAM_INTERRUPTED_UNKNOWN', self.saved.call_args.args[0]['error_message'])
 
     async def test_schema_snake_case_bypasses_text_boundary_and_conflicts_reject(self):
         from src.thought_boundary import prepare_thought_boundary

@@ -196,7 +196,13 @@ class EventRecoveryTests(unittest.IsolatedAsyncioTestCase):
              patch.object(api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)):
             response = await build_streaming_response_or_error(api.stream_request(
                 {'model': 'gemini-4-argon-medium', 'request': {'contents': []}}))
-            chunks = [x async for x in response.body_iterator]
+            chunks = []
+            async def send(message):
+                if message['type']=='http.response.body' and message.get('body'):
+                    chunks.append(message['body'].decode())
+            async def receive():
+                await asyncio.Event().wait()
+            await response({'type':'http','asgi':{'spec_version':'2.4'}}, receive, send)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(parts_of(chunks), [{'text': 'OK'}])
         self.assertEqual(self.saved.call_args.args[0]['response_id'], 'synthetic-recovery')
@@ -270,7 +276,7 @@ class EventRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()['error']['status'], 'INVALID_ARGUMENT')
 
-    async def test_cancel_while_waiting_after_heartbeat_is_still_499(self):
+    async def test_internal_cancel_after_heartbeat_is_unknown_interruption(self):
         entered = asyncio.Event()
         async def upstream(**kwargs):
             yield ': keepalive'
@@ -286,7 +292,8 @@ class EventRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 await task
             await stream.aclose()
         self.assertEqual(self.saved.await_count, 1)
-        self.assertEqual(self.saved.call_args.args[0]['status_code'], 499)
+        self.assertEqual(self.saved.call_args.args[0]['status_code'], 500)
+        self.assertIn('STREAM_INTERRUPTED_UNKNOWN', self.saved.call_args.args[0]['error_message'])
 
 
 class LineInspectionTests(unittest.TestCase):

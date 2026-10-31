@@ -66,7 +66,8 @@ class CredentialToolsTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(creds, "get_antigravity_api_url", AsyncMock(return_value="https://upstream.invalid")):
             for code in [200, 401, 403, 404, 429]:
                 self.db.update_credential_state.reset_mock()
-                with patch("src.httpx_client.post_async", AsyncMock(return_value=httpx.Response(code, text="test response"))) as post:
+                upstream = httpx.Response(code, json={"response": {"candidates": [{"content": {"parts": [{"text": "OK"}]}, "finishReason": "STOP"}]}}) if code == 200 else httpx.Response(code, text="test response")
+                with patch("src.httpx_client.post_async", AsyncMock(return_value=upstream)) as post:
                     response = await self.client.post("/creds/test/a@example.invalid", params={"model": "chosen-model"})
                 self.assertEqual(response.status_code, code)
                 self.assertEqual(response.json()["status_code"], code)
@@ -80,7 +81,8 @@ class CredentialToolsTests(unittest.IsolatedAsyncioTestCase):
         async def refresh(instance):
             instance.access_token = "refreshed-test-access"
             instance.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-        with patch.object(creds.Credentials, "refresh", refresh), patch.object(creds, "get_antigravity_api_url", AsyncMock(return_value="https://upstream.invalid")), patch("src.httpx_client.post_async", AsyncMock(return_value=httpx.Response(200))):
+        upstream = httpx.Response(200, json={"response": {"candidates": [{"content": {"parts": [{"text": "OK"}]}, "finishReason": "STOP"}]}})
+        with patch.object(creds.Credentials, "refresh", refresh), patch.object(creds, "get_antigravity_api_url", AsyncMock(return_value="https://upstream.invalid")), patch("src.httpx_client.post_async", AsyncMock(return_value=upstream)):
             response = await self.client.post("/creds/test/a@example.invalid", params={"model": "chosen-model"})
         self.assertEqual(response.status_code, 200)
         saved = self.db.store_credential.call_args.args[1]

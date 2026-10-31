@@ -251,6 +251,8 @@ async def _process_credential_file(entry: dict) -> dict:
         return {"status": "error", "message": entry["error"]}
     try:
         data = json.loads(entry["content"])
+    except RecursionError:
+        return {"status": "error", "message": "JSON 嵌套层级过深，请检查凭证文件内容"}
     except (ValueError, TypeError):
         return {"status": "error", "message": "JSON 格式错误"}
     if not isinstance(data, dict):
@@ -281,7 +283,17 @@ async def _credential_import_events(entries: List[dict]):
 
     async def worker():
         for index, entry in pending:
-            result = await _process_credential_file(entry)
+            try:
+                result = await _process_credential_file(entry)
+                if not isinstance(result, dict) or result.get("status") not in ("success", "error"):
+                    raise ValueError("Invalid credential import result")
+            except Exception as exc:
+                # Every scheduled file must produce a result; otherwise the
+                # progress reader waits forever for a worker that has exited.
+                # CancelledError still propagates to stop disconnected imports.
+                log.warning(f"文件导入异常: item={index}, type={type(exc).__name__}")
+                result = {"status": "error", "code": "processing_failed",
+                          "message": "此文件处理异常，已跳过；其他凭证继续导入，请检查后重试此项"}
             await queue.put({**result, "filename": entry["filename"], "item_index": index})
 
     workers = [asyncio.create_task(worker()) for _ in range(min(IMPORT_CONCURRENCY, total))]
@@ -900,6 +912,16 @@ async def test_credential(
         )
 
         status_code = response.status_code
+        if status_code == 200:
+            # The batch tester must apply the same response semantics as the
+            # model API, rather than clearing errors on an HTTP-200 rejection.
+            from src.stream_events import inspect_line, stream_error
+            kind, classified = inspect_line("data: " + response.text, allow_text_notice=True) if response.content else ("metadata", None)
+            if kind != "content":
+                if kind not in ("blocked", "error", "invalid"):
+                    classified = stream_error(502, "UPSTREAM_EMPTY_RESPONSE", "上游未返回有效内容")
+                status_code = classified.status_code
+                response = httpx.Response(status_code, content=classified.body)
 
         if status_code == 200 or status_code == 429:
             log.info(f"凭证测试成功: {email} (status={status_code})")

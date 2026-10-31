@@ -58,14 +58,14 @@ class StreamAccountingTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_then_aclose_is_success(self):
         await self.run_close([event('BOUNDARYOK','STOP')],(200,True),guard=True,close=True)
 
-    async def test_body_started_but_unfinished_cancel_is_499(self):
-        await self.run_close([event('BOUNDARYpartial')],(499,False),guard=True)
+    async def test_internal_cancel_is_unknown_interruption(self):
+        await self.run_close([event('BOUNDARYpartial')],(500,False),guard=True)
 
-    async def test_body_started_but_unfinished_aclose_is_499(self):
-        await self.run_close([event('BOUNDARYpartial')],(499,False),guard=True,close=True)
+    async def test_internal_generator_close_is_unknown_interruption(self):
+        await self.run_close([event('BOUNDARYpartial')],(500,False),guard=True,close=True)
 
-    async def test_no_guard_partial_aclose_is_499(self):
-        await self.run_close([event('partial')],(499,False),close=True)
+    async def test_no_guard_internal_close_is_unknown_interruption(self):
+        await self.run_close([event('partial')],(500,False),close=True)
 
     async def test_done_then_cancel_is_success(self):
         await self.run_close([event(),'data: [DONE]\n\n'],(200,True))
@@ -116,7 +116,8 @@ class StreamAccountingTests(unittest.IsolatedAsyncioTestCase):
             if message['type']=='http.response.body' and message.get('body'):
                 sent.append(message['body']);disconnected.set()
         with patch.object(api,'stream_post_async',upstream),patch.object(api,'prepare_thought_boundary',lambda m,r:(r,'BOUNDARY')):
-            response=StreamingResponse(api.stream_request({'model':'gemini-4-argon-medium','request':{'contents':[]}}))
+            from src.router.stream_passthrough import build_streaming_response_or_error
+            response=await build_streaming_response_or_error(api.stream_request({'model':'gemini-4-argon-medium','request':{'contents':[]}}))
             await asyncio.wait_for(response({'type':'http','asgi':{'spec_version':'2.3'}},receive,send),5)
         self.assertEqual(len(sent),1)
         self.assertEqual(self.saved.await_count,1)

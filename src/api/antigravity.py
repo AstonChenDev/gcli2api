@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Callable, Tuple
 
 from fastapi import Response
+from httpx import TransportError
 from config import (
     get_antigravity_api_url,
     get_auto_ban_error_codes,
@@ -31,6 +32,7 @@ from src.models import Model, model_to_dict
 from anyio import CancelScope
 from src.stream_metadata import StreamMetadata, StreamCompletion
 from src.stream_events import inspect_line, stream_error
+from src.stream_delivery import current_delivery
 from src.converter.request_fields import normalize_gemini_request_fields
 from src.usage_log import extract_response_id
 from src.thought_boundary import prepare_thought_boundary, ThoughtBoundaryGuard
@@ -253,7 +255,7 @@ def _base_log_entry(
 
     ctx = log_ctx or {}
     return {
-        "request_id": ctx.get("request_id") or new_request_id(),
+        "request_id": ctx.get("request_id") or (current_delivery.get().request_id if current_delivery.get() else new_request_id()),
         "api_format": ctx.get("api_format", ""),
         "client_ip": ctx.get("client_ip", ""),
         "model_name": ctx.get("client_model") or model_name,
@@ -273,6 +275,7 @@ async def _record_request_body_detail(
     payload: Any,
     response_body: str,
     is_stream: bool,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     请求体详细日志：开关开启后按全部请求或指定状态码写盘（JSON 文件），
@@ -299,6 +302,7 @@ async def _record_request_body_detail(
             payload=payload,
             response_body=response_body,
             error_message=error_message,
+            diagnostics=diagnostics,
         )
         return rel_path or ""
     except Exception as e:
@@ -328,6 +332,9 @@ async def stream_request(
     # 请求日志：开始时间与基础条目（成功/失败均会记录一次）
     log_entry = _base_log_entry(model_name, "", True, log_ctx)
     log_start_time = time.time()
+    delivery = current_delivery.get()
+    if delivery:
+        await delivery.begin_segment()
 
     # 凭证亲和: 从请求内容派生会话 key
     session_key = _derive_session_key(model_name, body)
@@ -404,6 +411,7 @@ async def stream_request(
     last_error_body = ""  # 详细日志：最后一次的错误响应体
     next_cred_task = None  # 预热的下一个凭证任务
     empty_retries = 0
+    previous_finalizer = None
 
     # 内部函数：快速更新凭证(只更新token和project_id,避免重建整个请求)
     async def refresh_credential_fast():
@@ -449,6 +457,8 @@ async def stream_request(
         attempt_start_time = time.time()  # 本次上游调用开始时间
         stream_metadata = StreamMetadata()
         completion = StreamCompletion((inner_request.get("generationConfig") or {}).get("candidateCount", 1))
+        if delivery:
+            delivery.gemini_completion.expected_candidates = completion.expected_candidates
         thought_guard = (ThoughtBoundaryGuard(boundary_marker,
             (inner_request.get("generationConfig", {}).get("thinkingConfig") or {}).get("includeThoughts", True))
             if boundary_marker else None)
@@ -470,6 +480,7 @@ async def stream_request(
                 "event_counts": event_counts, "content_delivered": content_delivered,
                 **stream_metadata.as_dict(), **completion.as_dict(),
                 **(thought_guard.metadata() if thought_guard else {}),
+                **(delivery.metadata() if delivery else {}),
             }, ensure_ascii=True))
 
             attempt_entry = {
@@ -486,6 +497,11 @@ async def stream_request(
                 payload=final_payload,
                 response_body=last_error_body,
                 is_stream=True,
+                diagnostics={
+                    "outcome": outcome, "event_counts": event_counts,
+                    **stream_metadata.as_dict(), **completion.as_dict(),
+                    **(delivery.metadata() if delivery else {}),
+                },
             )
 
             # 每条日志记录本次调用实际使用的凭证
@@ -506,16 +522,46 @@ async def stream_request(
             # Preserve an already decided outcome if cancellation races log I/O.
             if selected_result is None:
                 selected_result = (status_code, success, error_message)
+            if delivery and success:
+                # A generated STOP is not evidence that ASGI sent it.
+                return
             with CancelScope(shield=True):
                 await _write_stream_result(*selected_result)
 
         async def _log_interrupted() -> None:
             nonlocal outcome
+            if delivery:
+                # The response owner finalizes after receive/send has settled.
+                return
             if completion.complete and meaningful_content and (not thought_guard or thought_guard.complete):
                 outcome = "complete"
                 await _log_stream_result(200, True)
             else:
-                await _log_stream_result(499, False, "请求被取消或客户端断开，未完整接收响应")
+                await _log_stream_result(500, False, "STREAM_INTERRUPTED_UNKNOWN: 任务被取消或生成器关闭，未观察到客户端断开")
+
+        async def finalize_delivery(continuing=False):
+            nonlocal outcome
+            if result_logged:
+                return
+            if selected_result and not selected_result[1]:
+                await _write_stream_result(*selected_result)
+            elif completion.complete and meaningful_content and (
+                delivery.complete or (continuing and not delivery.disconnect_source and not delivery.error_sent)
+            ):
+                outcome = "segment_complete" if continuing else "complete"
+                await _write_stream_result(200, True)
+            elif delivery.disconnect_source:
+                outcome = "downstream_interrupted"
+                await _write_stream_result(499, False, "CLIENT_DISCONNECTED: 下游连接中断，响应未完整发送")
+            else:
+                outcome = "internal_interrupted"
+                await _write_stream_result(500, False, "STREAM_INTERRUPTED_UNKNOWN: 内部取消或关闭，响应未完整发送")
+
+        if delivery:
+            if previous_finalizer is not None:
+                delivery.callbacks.remove(previous_finalizer)
+            delivery.callbacks.append(finalize_delivery)
+            previous_finalizer = finalize_delivery
 
         def observe_output(chunk):
             nonlocal content_delivered, meaningful_content
@@ -532,12 +578,15 @@ async def stream_request(
             return pending
 
         try:
-            async for chunk in stream_post_async(
+            upstream_stream = stream_post_async(
                 url=target_url,
                 body=final_payload,
                 native=native,
                 headers=auth_headers
-            ):
+            )
+            if delivery:
+                delivery.closers.append(upstream_stream.aclose)
+            async for chunk in upstream_stream:
                 # Parse protocol events before applying the text boundary guard.
                 # Comments keep long connections alive but are never content.
                 event_kind = "http_error"
@@ -547,7 +596,7 @@ async def stream_request(
                     extracted = extract_usage_tokens(chunk)
                     if extracted:
                         usage_tokens = extracted
-                    event_kind, chunk = inspect_line(chunk)
+                    event_kind, chunk = inspect_line(chunk, allow_text_notice=not success_recorded)
                     event_counts[event_kind] = event_counts.get(event_kind, 0) + 1
                     if event_kind == "empty":
                         continue
@@ -734,22 +783,31 @@ async def stream_request(
             raise
 
         except Exception as e:
+            # A transport teardown failure cannot invalidate an already
+            # complete protocol answer. Explicit upstream error events still
+            # take their normal error path above.
+            if (isinstance(e, TransportError) and completion.complete and meaningful_content
+                    and (not thought_guard or thought_guard.complete)):
+                outcome = "complete"
+                log.warning(f"[ANTIGRAVITY STREAM] 完整结束事件之后连接关闭异常: {type(e).__name__}, request_id={log_entry.get('request_id')}")
+                await _log_stream_result(200, True)
+                return
             pending = flush_guard()
             if pending is not None:
                 yield pending
             outcome = "transport_error"
             completion.error = True
-            log.error(f"[ANTIGRAVITY STREAM] 流式请求异常: {e}, 凭证: {current_file}")
+            log.error(f"[ANTIGRAVITY STREAM] 流式请求异常: {type(e).__name__}: {e}, 凭证: {current_file}")
             if not content_delivered and retry_config["retry_enabled"] and attempt < max_retries:
                 log.info(f"[ANTIGRAVITY STREAM] 异常后重试 (attempt {attempt + 2}/{max_retries + 1})...")
                 # 本次上游调用（异常）产生一条日志
-                await _log_stream_result(500, False, f"异常: {e}")
+                await _log_stream_result(500, False, f"异常: {type(e).__name__}: {e}")
                 await asyncio.sleep(retry_interval)
                 continue
             else:
                 # 所有重试都失败，返回最后一次的错误（如果有）
                 log.error(f"[ANTIGRAVITY STREAM] 所有重试均失败，最后异常: {e}")
-                await _log_stream_result(500, False, f"异常: {e}")
+                await _log_stream_result(500, False, f"异常: {type(e).__name__}: {e}")
                 if last_error_response:
                     yield last_error_response
                 else:
@@ -801,6 +859,7 @@ async def non_stream_request(
     auth_headers: Optional[Dict[str, str]] = None
     final_payload: Dict[str, Any] = {}
     last_error_body = ""  # 详细日志：最后一次的错误响应体
+    upstream_response_content = None
     current_file = ""  # 当前使用的凭证（未获取前为空）
     attempt_start_time = time.time()  # 本次上游调用开始时间（循环内每次重置）
 
@@ -811,6 +870,8 @@ async def non_stream_request(
         """
         from src.usage_log import record_usage_log, extract_usage_tokens
 
+        if response_content is None:
+            response_content = upstream_response_content
         attempt_entry = {
             **log_entry, "credential_email": current_file,
             "response_id": extract_response_id(response_content) or extract_response_id(last_error_body),
@@ -827,7 +888,9 @@ async def non_stream_request(
             is_stream=False,
         )
 
-        tokens = extract_usage_tokens(response_content) if success else {}
+        # Rejections and partial/empty answers can still report real usage.
+        # Keep it independent of success, using the original upstream body.
+        tokens = extract_usage_tokens(response_content)
         # 每条日志记录本次调用实际使用的凭证
         await record_usage_log({
             **attempt_entry,
@@ -890,6 +953,7 @@ async def non_stream_request(
     DISABLE_ERROR_CODES = await get_auto_ban_error_codes()  # 禁用凭证的错误码
     last_error_response = None  # 记录最后一次的错误响应
     next_cred_task = None  # 预热的下一个凭证任务
+    empty_retries = 0
 
     # 内部函数：快速更新凭证(只更新token和project_id,避免重建整个请求)
     async def refresh_credential_fast():
@@ -922,6 +986,10 @@ async def non_stream_request(
 
     for attempt in range(max_retries + 1):
         last_error_body = ""
+        upstream_response_content = None
+        # A later connection failure must not return the previous attempt's
+        # 429/503 while its usage row records the current 500.
+        last_error_response = None
         need_retry = False  # 标记是否需要重试
         attempt_start_time = time.time()  # 本次上游调用开始时间
         
@@ -931,40 +999,50 @@ async def non_stream_request(
                 json=final_payload,
                 headers=auth_headers
             )
+            upstream_response_content = response.content
 
             status_code = response.status_code
 
-            # 成功
+            # HTTP 200 may still contain a structured rejection or no answer.
             if status_code == 200:
-                # 检查是否为空回复
-                if not response.content or len(response.content) == 0:
-                    log.warning(f"[ANTIGRAVITY] 收到200响应但内容为空，凭证: {current_file}")
-                    
-                    # 记录错误
-                    await record_api_call_error(current_file, 200, None, model_name=model_name,
-                        error_message="Empty response from API"
-                    )
-                    # 本次上游调用（空回复）产生一条日志
-                    await _log_result(200, False, error_message="Empty response from API")
-                    
-                    if attempt < max_retries:
+                if not response.content:
+                    kind, classified = "metadata", None
+                else:
+                    kind, classified = inspect_line("data: " + response.text, allow_text_notice=True)
+                if kind in ("blocked", "error", "invalid"):
+                    error_body = classified.body
+                    if getattr(classified, "upstream_content", None):
+                        payload = json.loads(error_body)
+                        partial = json.loads(classified.upstream_content[5:])
+                        payload["partialResponse"] = partial.get("response", partial)
+                        error_body = json.dumps(payload, ensure_ascii=False).encode()
+                    last_error_body = error_body.decode()
+                    if kind == "blocked":
+                        await _log_result(classified.status_code, False,
+                            response_content=response.content, error_message=last_error_body)
+                        return Response(content=error_body, status_code=classified.status_code,
+                                        media_type="application/json")
+                    # Explicit embedded HTTP errors use the same credential and
+                    # retry policy as transport-level errors; do not fake 200.
+                    import httpx
+                    response = httpx.Response(classified.status_code, content=error_body,
+                                              headers={"content-type": "application/json"})
+                    status_code = classified.status_code
+                elif kind != "content":
+                    error = stream_error(502, "UPSTREAM_EMPTY_RESPONSE", "上游未返回有效内容")
+                    last_error_body = error.body.decode()
+                    await _log_result(502, False, response_content=response.content,
+                                      error_message=last_error_body)
+                    if retry_config["retry_enabled"] and attempt < max_retries and empty_retries < 1:
+                        empty_retries += 1
                         need_retry = True
                     else:
-                        log.error(f"[ANTIGRAVITY] 空回复达到最大重试次数")
-                        return Response(
-                            content=json.dumps({"error": "服务返回空回复"}),
-                            status_code=500,
-                            media_type="application/json"
-                        )
+                        return error
                 else:
-                    # 正常响应
                     await record_api_call_success(current_file, model_name=model_name)
                     await _log_result(200, True, response_content=response.content)
-                    return Response(
-                        content=response.content,
-                        status_code=200,
-                        headers=dict(response.headers)
-                    )
+                    return Response(content=response.content, status_code=200,
+                                    headers=dict(response.headers))
 
             # 失败 - 记录最后一次错误
             if status_code != 200:
@@ -1053,13 +1131,13 @@ async def non_stream_request(
             if attempt < max_retries:
                 log.info(f"[ANTIGRAVITY] 异常后重试 (attempt {attempt + 2}/{max_retries + 1})...")
                 # 本次上游调用（异常）产生一条日志
-                await _log_result(500, False, error_message=f"异常: {e}")
+                await _log_result(500, False, error_message=f"异常: {type(e).__name__}: {e}")
                 await asyncio.sleep(retry_interval)
                 continue
             else:
                 # 所有重试都失败，返回最后一次的错误（如果有）或500错误
                 log.error(f"[ANTIGRAVITY] 所有重试均失败，最后异常: {e}")
-                await _log_result(500, False, error_message=f"异常: {e}")
+                await _log_result(500, False, error_message=f"异常: {type(e).__name__}: {e}")
                 if last_error_response:
                     return last_error_response
                 else:

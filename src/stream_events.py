@@ -13,6 +13,35 @@ BLOCK_REASONS = {
     "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION",
 }
 
+# Observed verbatim on the upstream wire, without error/usage/finish fields.
+# Do not infer a rejection from arbitrary prose containing policy keywords.
+PROMPT_REJECTION_NOTICE = (
+    "The prompt could not be submitted. The prompt contains sensitive words that violate Google's "
+    "[Generative AI Prohibited Use policy](https://policies.google.com/terms/generative-ai/use-policy). "
+    "Try rephrasing the prompt. If you think this was an error, "
+    "[send feedback](https://ai.google.dev/gemini-api/docs/troubleshooting)."
+)
+
+
+def prompt_rejection_notice(response):
+    if set(response) != {"candidates"}:
+        return None
+    candidates = response["candidates"]
+    if not isinstance(candidates, list) or len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    if not isinstance(candidate, dict) or set(candidate) != {"content"}:
+        return None
+    content = candidate["content"]
+    if not isinstance(content, dict) or set(content) != {"parts"}:
+        return None
+    parts = content["parts"]
+    if not isinstance(parts, list) or len(parts) != 1 or not isinstance(parts[0], dict):
+        return None
+    if set(parts[0]) == {"text"} and parts[0]["text"] == PROMPT_REJECTION_NOTICE:
+        return PROMPT_REJECTION_NOTICE
+    return None
+
 
 def stream_error(status, code, message, **details):
     return Response(status_code=status, media_type="application/json", content=json.dumps(
@@ -40,7 +69,7 @@ def _with_partial_content(error, event):
     return error
 
 
-def inspect_line(chunk):
+def inspect_line(chunk, *, allow_text_notice=False):
     """Return (kind, normalized line or Response); no response text is retained."""
     try:
         raw = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
@@ -64,6 +93,10 @@ def inspect_line(chunk):
     response = event.get("response", event) if isinstance(event, dict) else None
     if not isinstance(response, dict):
         return "invalid", stream_error(500, "UPSTREAM_INVALID_EVENT", "上游返回了无效的 JSON 流事件")
+    notice = prompt_rejection_notice(response) if allow_text_notice else None
+    if notice:
+        return "blocked", stream_error(400, "UPSTREAM_CONTENT_BLOCKED", notice,
+            reasonSource="upstream_text_notice", upstreamHttpStatus=200)
     if response.get("error"):
         error = response["error"]
         code = error.get("code") if isinstance(error, dict) else None
