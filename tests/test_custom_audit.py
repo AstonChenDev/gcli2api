@@ -42,7 +42,7 @@ class CustomAuditTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_error_then_generator_close_does_not_add_fake_success(self):
         async def upstream(**kwargs):
-            yield 'data: '+json.dumps({'response':{'responseId':'audit','candidates':[{'finishReason':'STOP','content':{'parts':[{'text':'unframed reasoning'}]}}]}})+'\n\n'
+            yield Response(status_code=502, content=json.dumps({'error': {'code': 502, 'status': 'UPSTREAM_EMPTY_RESPONSE'}}))
         with patch.object(api,'stream_post_async',upstream):
             stream=api.stream_request({'model':'gemini-4-argon-medium','request':{'contents':[]}})
             try:

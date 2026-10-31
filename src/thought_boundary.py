@@ -1,16 +1,11 @@
-"""Explicit framing for Argon text streams that sometimes mislabel analysis.
-
-Never infer the answer boundary from language, headings, or punctuation. The
-upstream must supply a request-specific delimiter; unframed text is quarantined
-as thought and a missing delimiter is a stream error, not a successful answer.
-"""
+"""Preserve native thoughts and recover mislabeled planning without requiring a marker."""
 
 import copy
 import hashlib
 import json
 import os
+import re
 
-from fastapi import Response
 from src.converter.request_fields import normalize_gemini_request_fields
 
 
@@ -56,18 +51,110 @@ def prepare_thought_boundary(model, request):
 
 
 class ThoughtBoundaryGuard:
+    """Incremental framing, with conservative recovery for leaked planning headings.
+
+    The request marker and narrowly recognized copy errors define framing.
+    The unmarked narrative fallback is a
+    heuristic, restricted to structured English planning followed by a complete
+    Chinese prose sentence. Unresolved planning remains thought, not an error.
+    """
+    START_LIMIT = 128
+    LOOKBEHIND = 1024
+    HEADER = re.compile(r"^\s*(?:#{1,6}\s*)?(?:\*\*|__)?Thinking Process(?:\*\*|__)?\s*[:：](?:\*\*|__)?[ \t]*(?:\r?\n|$)", re.I)
+    SECTION = re.compile(r"(?:^|\n)\s*(\d+)\.\s+\*\*[A-Za-z]")
+    PROSE = re.compile(r"(?<=[.])([ \t\r\n]*)([\u4e00-\u9fff][^\n。！？]{0,512}[。！？])")
+    PLANNING_ZH = re.compile(r"思考|分析|规划|提纲|大纲|接下来|需要|应该|确保|例如|比如|示例|检查|要求|字数|正文|写作|开头|结尾|场景|描写")
+
     def __init__(self, marker, include_thoughts=True):
         self.marker = marker
         self.include_thoughts = include_thoughts
         self.states = {}
-        self.failed = False
+        self.failed = False  # compatibility; boundary uncertainty is not failure
         self.reclassified_chars = 0
         self.last_event = None
         self.last_was_bytes = False
+        self.marker_corrections = 0
+        shape = re.fullmatch(r"<<<AGY_FINAL_([0-9a-f]{16})>>>(_*)", marker)
+        self.marker_nonce = shape[1] if shape else None
+        self.marker_suffix = shape[2] if shape else ""
+        self.marker_pattern = (re.compile(r"<<<AGY_FINAL_([0-9a-f]{16,20})>>>" + re.escape(self.marker_suffix))
+                               if shape else None)
+
+    def _nonce_matches(self, nonce):
+        expected = self.marker_nonce
+        if len(nonce) == len(expected):
+            return sum(a != b for a, b in zip(nonce, expected)) <= 1
+        extra = len(nonce) - len(expected)
+        # Models sometimes duplicate a short run while copying the private nonce.
+        return 1 <= extra <= 4 and any(
+            nonce == expected[:i] + expected[i:i + extra] + expected[i:]
+            for i in range(len(expected) - extra + 1))
+
+    def _find_marker(self, pending):
+        pos = pending.find(self.marker)
+        found = (pos, len(self.marker), False) if pos >= 0 else None
+        if self.marker_pattern:
+            for match in self.marker_pattern.finditer(pending):
+                if self._nonce_matches(match[1]):
+                    if found is None or match.start() < found[0]:
+                        found = (match.start(), len(match[0]), match[0] != self.marker)
+                    break
+        return found
+
+    def _marker_variants(self):
+        yield self.marker
+        if self.marker_nonce is None:
+            return
+        nonce = self.marker_nonce
+        for i, old in enumerate(nonce):
+            for char in "0123456789abcdef":
+                if char != old:
+                    yield "<<<AGY_FINAL_" + nonce[:i] + char + nonce[i + 1:] + ">>>" + self.marker_suffix
+        for size in range(1, 5):
+            for i in range(len(nonce) - size + 1):
+                yield "<<<AGY_FINAL_" + nonce[:i] + nonce[i:i + size] + nonce[i:] + ">>>" + self.marker_suffix
+
+    def _partial_marker_size(self, pending, final=False):
+        keep = 0
+        for size in range(min(len(self.marker) - 1, len(pending)), 0, -1):
+            if pending.endswith(self.marker[:size]):
+                keep = size
+                break
+        if self.marker_nonce:
+            tail = re.search(r"<<<AGY_FINAL_[0-9a-f]{0,20}>{0,2}$", pending)
+            if self.marker_suffix:
+                suffix = re.search(r"<<<AGY_FINAL_[0-9a-f]{16,20}>>>(_*)$", pending)
+                if suffix and len(suffix[1]) < len(self.marker_suffix):
+                    tail = suffix
+            if tail and (not final or any(marker.startswith(tail[0]) for marker in self._marker_variants())):
+                keep = max(keep, len(tail[0]))
+        return keep
+
+    def _state(self):
+        return dict(pending="", mode="detect", method="", sections=set(), scan_tail="", finalized=False,
+                    detect_text_false=False, heading_text_false=False)
+
+    def _possible_heading(self, text):
+        """Do not commit a split heading just because a transport sets false on every part."""
+        text = text.lstrip()
+        if not text or text in ("*", "**", "_", "__"):
+            return True
+        text = re.sub(r"^#{1,6}\s*", "", text)
+        if text in ("*", "**", "_", "__"):
+            return True
+        text = re.sub(r"^(?:\*\*|__)", "", text)
+        text = re.sub(r"\s*([:：])\s*", r"\1", text).rstrip().casefold()
+        return any(("thinking process" + close + colon + end).startswith(text)
+                   for close in ("", "**", "__") for colon in (":", "：")
+                   for end in ("", "**", "__"))
 
     def _part(self, text, thought, original=None):
-        if not text or (thought and not self.include_thoughts):
+        if not text:
             return []
+        if thought:
+            self.reclassified_chars += len(text)
+            if not self.include_thoughts:
+                return []
         part = copy.deepcopy(original or {})
         part["text"] = text
         if thought:
@@ -76,28 +163,77 @@ class ThoughtBoundaryGuard:
             part.pop("thought", None)
         return [part]
 
-    def _split(self, text, state, original):
-        if state["answer"]:
-            return self._part(text, False, original)
+    def _narrative_boundary(self, state):
+        if len(state["sections"]) < 2:
+            return None
+        text = state["pending"]
+        for match in self.PROSE.finditer(text):
+            start = match.start(2)
+            prefix = text[max(0, match.start() - 256):match.start()]
+            sentence = match.group(2)
+            # Reject quoted examples, lists, mixed-language analysis, and Chinese
+            # planning vocabulary. Never switch merely upon seeing a Han glyph.
+            line = prefix.rsplit("\n", 1)[-1]
+            if not re.search(r"[A-Za-z]{3}", prefix):
+                continue
+            if line.count('"') % 2 or line.count('`') % 2 or line.count('(') > line.count(')'):
+                continue
+            if (len(re.findall(r"[\u4e00-\u9fff]", sentence)) < 24
+                    or re.search(r"[A-Za-z*`]|[:：]", sentence)
+                    or self.PLANNING_ZH.search(sentence)):
+                continue
+            return start
+        return None
+
+    def _split(self, text, state, original=None, final=False):
+        explicit_text = (original or {}).get("thought") is False
+        # A false flag already present on the leaked heading is not a new body
+        # boundary when the next part repeats it. A newly introduced flag is.
+        if explicit_text and state["mode"] == "thought" and not state["heading_text_false"]:
+            before = state["pending"]
+            state.update(pending="", mode="answer", method="native_text")
+            return self._part(before, True) + self._split(text, state, original, final)
         state["pending"] += text
-        pos = state["pending"].find(self.marker)
-        if pos >= 0:
-            before = state["pending"][:pos]
-            after = state["pending"][pos + len(self.marker):]
-            state.update(pending="", answer=True)
-            self.reclassified_chars += len(before)
-            return self._part(before, True) + self._part(after, False, original)
-        # Retain only a possible split marker prefix. All other prefix text can
-        # stream immediately as thought; bounded memory even on very long runs.
+        if state["mode"] == "detect" and explicit_text and text:
+            state["detect_text_false"] = True
+        scan = state["scan_tail"] + text
+        state["sections"].update(self.SECTION.findall(scan))
+        state["scan_tail"] = scan[-128:]
+        pending = state["pending"]
+        match = self._find_marker(pending)
+        if match is not None:
+            pos, size, corrected = match
+            before, after = pending[:pos], pending[pos + size:]
+            was_answer = state["mode"] == "answer"
+            self.marker_corrections += int(corrected)
+            state.update(pending="", mode="answer", method="corrected_marker" if corrected else "marker")
+            return self._part(before, not was_answer, original) + self._split(after, state, original, final)
+        if state["mode"] == "detect":
+            heading = self.HEADER.match(pending)
+            if heading and ("\n" in heading[0] or final):
+                state.update(mode="thought", method="thinking_header",
+                             heading_text_false=state["detect_text_false"])
+            elif final or len(pending) >= self.START_LIMIT or (explicit_text and not self._possible_heading(pending)):
+                state.update(mode="answer", method="native_text" if explicit_text else "plain_text")
+            else:
+                return []
+        if state["mode"] == "thought":
+            boundary = self._narrative_boundary(state)
+            if boundary is not None:
+                state.update(pending="", mode="answer", method="narrative_heuristic")
+                return self._part(pending[:boundary], True) + self._split(pending[boundary:], state, original, final)
+        if final:
+            size = self._partial_marker_size(pending, final=True)
+            if size >= len("<<<AGY_FINAL_"):
+                pending = pending[:-size]
         keep = 0
-        for size in range(min(len(self.marker) - 1, len(state["pending"])), 0, -1):
-            if state["pending"].endswith(self.marker[:size]):
-                keep = size
-                break
-        safe = state["pending"][:-keep] if keep else state["pending"]
-        state["pending"] = state["pending"][-keep:] if keep else ""
-        self.reclassified_chars += len(safe)
-        return self._part(safe, True)
+        if not final:
+            keep = self._partial_marker_size(pending)
+            if state["mode"] == "thought":
+                keep = max(keep, min(len(pending), self.LOOKBEHIND))
+        safe = pending[:-keep] if keep else pending
+        state["pending"] = pending[-keep:] if keep else ""
+        return self._part(safe, state["mode"] == "thought", original)
 
     def feed(self, chunk):
         raw = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
@@ -105,10 +241,6 @@ class ThoughtBoundaryGuard:
             return chunk
         payload = raw[5:].strip()
         if payload == "[DONE]":
-            # A missing boundary must not be followed by a success terminator.
-            if not self.complete:
-                self.failed = True
-                return None
             return chunk
         try:
             event = json.loads(payload)
@@ -124,40 +256,49 @@ class ThoughtBoundaryGuard:
         for index, candidate in enumerate(response["candidates"]):
             if not isinstance(candidate, dict):
                 continue
-            state = self.states.setdefault(candidate.get("index", index), {"pending": "", "answer": False})
+            state = self.states.setdefault(candidate.get("index", index), self._state())
             content = candidate.get("content") or {}
             parts = []
             for part in content.get("parts", []):
-                if not isinstance(part, dict):
-                    continue
                 if part.get("thought") is True:
+                    # Explicit upstream thoughts and signatures are never rewritten.
                     if self.include_thoughts:
                         parts.append(part)
                 elif isinstance(part.get("text"), str):
                     parts.extend(self._split(part["text"], state, part))
                 else:
                     parts.append(part)
-            if candidate.get("finishReason") and not state["answer"]:
-                parts.extend(self._part(state["pending"], True))
-                state["pending"] = ""
-                candidate.pop("finishReason", None)
-                self.failed = True
+            if candidate.get("finishReason") not in (None, "", "FINISH_REASON_UNSPECIFIED"):
+                parts.extend(self._split("", state, final=True))
+                state["finalized"] = True
             candidate["content"] = {**content, "parts": parts}
         self.last_event = event
         self.last_was_bytes = isinstance(chunk, bytes)
         result = "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
         return result.encode() if self.last_was_bytes else result
 
+    def flush(self):
+        """Drain buffered text before DONE, EOF or an explicit error; no fake STOP."""
+        if self.last_event is None or not any(s["pending"] for s in self.states.values()):
+            return None
+        event = copy.deepcopy(self.last_event)
+        response = event.get("response", event)
+        response["candidates"] = []
+        for index, state in self.states.items():
+            parts = self._split("", state, final=True)
+            state["finalized"] = True
+            if parts:
+                response["candidates"].append({"index": index, "content": {"role": "model", "parts": parts}})
+        raw = "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+        return raw.encode() if self.last_was_bytes else raw
+
     @property
     def complete(self):
-        return bool(self.states) and all(s["answer"] for s in self.states.values())
-
-    def error_response(self):
-        return Response(status_code=502, media_type="application/json", content=json.dumps({"error": {
-            "code": 502, "status": ERROR_CODE,
-            "message": "上游未提供可靠的正文分界，内容已隔离到思考通道，本次未输出正文。请重试。",
-        }}, ensure_ascii=False))
+        return bool(self.states) and all(not s["pending"] for s in self.states.values())
 
     def metadata(self):
-        return {"boundary_complete": self.complete, "boundary_failed": self.failed,
-                "reclassified_chars": self.reclassified_chars}
+        return {"boundary_complete": self.complete, "boundary_failed": False,
+                "boundary_uncertain": any(s["mode"] == "thought" for s in self.states.values()),
+                "boundary_methods": sorted({s["method"] for s in self.states.values() if s["method"]}),
+                "reclassified_chars": self.reclassified_chars,
+                "boundary_marker_corrections": self.marker_corrections}

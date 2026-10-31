@@ -195,8 +195,23 @@ async def chat_completions(
             if not chunk:
                 continue
 
+            if isinstance(chunk, Response):
+                from src.stream_events import error_payload
+                yield ("data: " + json.dumps(error_payload(chunk)) + "\n\n").encode()
+                return
+
             # 解析 Gemini SSE 格式
             chunk_str = chunk.decode('utf-8') if isinstance(chunk, bytes) else chunk
+
+            if chunk_str.startswith("data:"):
+                try:
+                    obj = json.loads(chunk_str[5:])
+                    inner = obj.get("response", obj)
+                    if inner.get("error"):
+                        yield ("data: " + json.dumps({"error": inner["error"]}) + "\n\n").encode()
+                        return
+                except (ValueError, AttributeError):
+                    pass
 
             # 跳过空行
             if not chunk_str.strip():
@@ -251,21 +266,8 @@ async def chat_completions(
         async for chunk in prepend_async_item(first_chunk, stream_gen):
             # 检查是否是Response对象（错误情况）
             if isinstance(chunk, Response):
-                # 将Response转换为SSE格式的错误消息
-                try:
-                    error_content = chunk.body if isinstance(chunk.body, bytes) else (chunk.body or b'').encode('utf-8')
-                    gemini_error = json.loads(error_content.decode('utf-8'))
-                    # 转换为 OpenAI 格式错误
-                    from src.converter.openai2gemini import convert_gemini_to_openai_response
-                    openai_error = convert_gemini_to_openai_response(
-                        gemini_error,
-                        real_model,
-                        chunk.status_code
-                    )
-                    yield f"data: {json.dumps(openai_error)}\n\n".encode('utf-8')
-                except Exception:
-                    yield f"data: {json.dumps({'error': 'Stream error'})}\n\n".encode('utf-8')
-                yield b"data: [DONE]\n\n"
+                from src.stream_events import error_payload
+                yield ("data: " + json.dumps(error_payload(chunk)) + "\n\n").encode()
                 return
             else:
                 # 正常的bytes数据，转换为 OpenAI 格式

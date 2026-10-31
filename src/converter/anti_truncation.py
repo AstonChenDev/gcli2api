@@ -504,19 +504,8 @@ class AntiTruncationStreamProcessor:
                             f"(status={line.status_code}), treating as error",
                             flush=True,
                         )
-                        error_chunk = {
-                            "error": {
-                                "message": (
-                                    line.body.decode("utf-8", errors="ignore")
-                                    if hasattr(line, "body") and line.body
-                                    else "Upstream error"
-                                ),
-                                "type": "api_error",
-                                "code": line.status_code,
-                            }
-                        }
-                        yield f"data: {json.dumps(error_chunk)}\n\n".encode()
-                        yield b"data: [DONE]\n\n"
+                        # Keep structured upstream status/reason for each protocol adapter.
+                        yield line
                         return
 
                     # 解码 bytes 为字符串
@@ -574,6 +563,11 @@ class AntiTruncationStreamProcessor:
                         except (json.JSONDecodeError, ValueError):
                             yield line
                             continue
+
+                        inner = data.get("response", data)
+                        if isinstance(inner, dict) and inner.get("error"):
+                            yield line
+                            return
 
                         # 回传前把真实 thoughtSignature 替换为跳过校验占位符，
                         # 替换后重算 line，保证后续原样透传分支也携带脱敏数据

@@ -56,8 +56,8 @@ def extract_usage_tokens(source: Any) -> Dict[str, int]:
         # 流式 SSE 块：解析 JSON 提取 usageMetadata
         try:
             text = source.decode("utf-8") if isinstance(source, bytes) else source
-            if text.startswith("data: "):
-                text = text[len("data: "):].strip()
+            if text.startswith("data:"):
+                text = text[len("data:"):].strip()
             if not text or text == "[DONE]":
                 return {}
             source = __import__("json").loads(text)

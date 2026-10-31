@@ -55,13 +55,13 @@ class ThoughtBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text_of(result, True), "分析")
         self.assertEqual(text_of(result), "答案")
 
-    def test_no_language_or_heading_guesses(self):
+    def test_uncertain_chinese_after_heading_stays_thought_without_error(self):
         guard = ThoughtBoundaryGuard(MARKER)
         result = [guard.feed(event([{"text": "Thinking Process:\n苏晨开始故事。\n\nFinal Answer: still unframed"}], "STOP"))]
         self.assertEqual(text_of(result), "")
-        self.assertTrue(guard.failed)
-        self.assertNotIn("finishReason", decode(result[0])["candidates"][0])
-        self.assertEqual(json.loads(guard.error_response().body)["error"]["status"], ERROR_CODE)
+        self.assertFalse(guard.failed)
+        self.assertEqual(decode(result[0])["candidates"][0]["finishReason"], "STOP")
+        self.assertTrue(guard.metadata()["boundary_uncertain"])
 
     def test_native_thought_and_signature_preserved(self):
         guard = ThoughtBoundaryGuard(MARKER)
@@ -110,12 +110,12 @@ class ThoughtBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn({"type": "thinking_delta", "thinking": "unmarked analysis"}, deltas)
         self.assertIn({"type": "text_delta", "text": "final answer"}, deltas)
 
-    async def test_anthropic_boundary_error_is_a_real_error_event(self):
+    async def test_anthropic_blocked_error_is_a_real_error_event(self):
         async def source():
-            yield ThoughtBoundaryGuard(MARKER).error_response()
+            yield Response(status_code=400, content=json.dumps({"error": {"code": 400, "status": "UPSTREAM_CONTENT_BLOCKED", "message": "PROHIBITED_CONTENT"}}))
         output = [x async for x in gemini_stream_to_anthropic_stream(source(), "gemini-4-argon-medium")]
         self.assertTrue(output[0].startswith(b"event: error\n"))
-        self.assertIn(ERROR_CODE.encode(), output[0])
+        self.assertIn(b"PROHIBITED_CONTENT", output[0])
 
     async def test_api_integration_and_missing_boundary_eof(self):
         for framed in (True, False):
@@ -123,7 +123,7 @@ class ThoughtBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 prompt = kwargs["body"]["request"]["systemInstruction"]["parts"][-1]["text"]
                 import re
                 marker = re.search(r"<<<AGY_FINAL_[0-9a-f]+>>>", prompt)[0]
-                yield event([{"text": "unmarked analysis"}])
+                yield event([{"text": "Thinking Process:\nanalysis"}])
                 if framed:
                     yield event([{"text": marker + "answer"}], "STOP")
             with ExitStack() as stack:
@@ -137,12 +137,12 @@ class ThoughtBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 saved = stack.enter_context(patch("src.usage_log.record_usage_log", AsyncMock()))
                 stack.enter_context(patch.object(api, "stream_post_async", source))
                 chunks = [x async for x in api.stream_request({"model": "gemini-4-argon-medium", "request": {"contents": []}}, native=False)]
-            self.assertEqual(text_of(chunks, True), "unmarked analysis")
+            self.assertEqual(text_of(chunks, True), "Thinking Process:\nanalysis")
             if framed:
                 self.assertEqual(text_of(chunks), "answer")
                 self.assertTrue(saved.call_args.args[0]["success"])
             else:
                 self.assertEqual(text_of(chunks), "")
                 self.assertIsInstance(chunks[-1], Response)
-                self.assertEqual(chunks[-1].status_code, 502)
+                self.assertEqual(chunks[-1].status_code, 500)
                 self.assertFalse(saved.call_args.args[0]["success"])

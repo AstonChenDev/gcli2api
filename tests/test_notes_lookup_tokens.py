@@ -176,7 +176,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_response_id_and_last_usage_preserved(self):
         async def stream(**kwargs):
             for n in (1, 20):
-                yield "data: " + json.dumps({"response": {"responseId": "stream-id", "candidates": [{"content": {"parts": [{"text": "answer"}]}}], "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": n, "thoughtsTokenCount": 5}}}) + "\n\n"
+                yield "data: " + json.dumps({"response": {"responseId": "stream-id", "candidates": [{"finishReason": "STOP" if n == 20 else "FINISH_REASON_UNSPECIFIED", "content": {"parts": [{"text": "answer"}]}}], "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": n, "thoughtsTokenCount": 5}}}) + "\n\n"
         with patch.object(api, "stream_post_async", stream):
             chunks = [x async for x in api.stream_request(self.body)]
         self.assertEqual(len(chunks), 2)
@@ -194,7 +194,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
                 if count == 1:
                     yield Response(status_code=429, content='{"error":"synthetic retry"}')
                 else:
-                    yield 'data: {"response":{"responseId":"retry-success","candidates":[{"content":{"parts":[{"text":"ok"}]}}]}}\n\n'
+                    yield 'data: {"response":{"responseId":"retry-success","candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"ok"}]}}]}}\n\n'
             with ExitStack() as stack:
                 stack.enter_context(patch.object(api, "get_valid_credential", AsyncMock(side_effect=credentials)))
                 stack.enter_context(patch.object(api, "get_retry_config", AsyncMock(return_value={"max_retries": 1, "retry_interval": 0, "retry_enabled": True})))

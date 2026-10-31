@@ -12,10 +12,10 @@ class StreamMetadata:
     def observe(self, chunk):
         if isinstance(chunk, bytes):
             chunk = chunk.decode("utf-8", errors="replace")
-        if not isinstance(chunk, str) or not chunk.startswith("data: "):
+        if not isinstance(chunk, str) or not chunk.startswith("data:"):
             return
         try:
-            data = json.loads(chunk[6:])
+            data = json.loads(chunk[5:].strip())
         except (ValueError, TypeError):
             return
         if not isinstance(data, dict):
@@ -102,7 +102,7 @@ class StreamCompletion:
     def complete(self):
         if self.error:
             return False
-        return self.eof or (len(self.candidates) >= self.expected_candidates and
+        return (len(self.candidates) >= self.expected_candidates and
             (self.done or self.candidates.issubset(self.finish_reasons)))
 
     def as_dict(self):

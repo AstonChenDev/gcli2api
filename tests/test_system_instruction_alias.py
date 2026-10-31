@@ -98,7 +98,7 @@ class SystemAliasTests(unittest.IsolatedAsyncioTestCase):
             marker = re.search(r'<<<AGY_FINAL_[0-9a-f]+>>>', contract)[0]
             # Verify the existing thought/body separation still works end to end.
             for part in [{'text': 'native thought', 'thought': True}, {'text': 'unmarked thought' + marker + 'OK'}]:
-                yield 'data: ' + json.dumps({'response': {'responseId': 'test-alias', 'candidates': [{'content': {'role': 'model', 'parts': [part]}}]}}) + '\n\n'
+                yield 'data: ' + json.dumps({'response': {'responseId': 'test-alias', 'candidates': [{'finishReason': 'STOP' if part['text'].endswith('OK') else 'FINISH_REASON_UNSPECIFIED', 'content': {'role': 'model', 'parts': [part]}}]}}) + '\n\n'
         async def nonstream(**kwargs):
             inner = kwargs['json']['request']; self.assert_system(inner)
             captured.append(copy.deepcopy(inner))

@@ -211,6 +211,10 @@ async def stream_generate_content(
 
         # 迭代 process_stream() 生成器，并展开 response 包装
         async for chunk in processor.process_stream():
+            if isinstance(chunk, Response):
+                from src.stream_events import error_payload
+                yield ("data: " + json.dumps(error_payload(chunk)) + "\n\n").encode()
+                return
             if isinstance(chunk, (str, bytes)):
                 chunk_str = chunk.decode('utf-8') if isinstance(chunk, bytes) else chunk
 

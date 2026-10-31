@@ -70,8 +70,8 @@ class StreamAccountingTests(unittest.IsolatedAsyncioTestCase):
     async def test_done_then_cancel_is_success(self):
         await self.run_close([event(),'data: [DONE]\n\n'],(200,True))
 
-    async def test_boundary_failure_does_not_become_success_on_close(self):
-        await self.run_close([event('missing boundary','STOP')],(502,False),guard=True,close=True)
+    async def test_unmarked_finished_answer_is_success_on_close(self):
+        await self.run_close([event('missing boundary','STOP')],(200,True),guard=True,close=True)
 
     async def test_asyncio_cancel_during_success_log_preserves_outcome(self):
         entered=asyncio.Event();calls=0
@@ -80,7 +80,7 @@ class StreamAccountingTests(unittest.IsolatedAsyncioTestCase):
             calls+=1
             if calls==1:entered.set();await asyncio.Event().wait()
             return ''
-        async def upstream(**kwargs):yield event('OK')
+        async def upstream(**kwargs):yield event('OK', 'STOP')
         with patch.object(api,'stream_post_async',upstream),patch.object(api,'prepare_thought_boundary',lambda m,r:(r,None)),patch.object(api,'_record_request_body_detail',detail):
             stream=api.stream_request({'model':'gemini-4-argon-medium','request':{'contents':[]}})
             await anext(stream)
@@ -95,7 +95,7 @@ class StreamAccountingTests(unittest.IsolatedAsyncioTestCase):
         entered=asyncio.Event();release=asyncio.Event()
         async def detail(*args,**kwargs):
             entered.set();await release.wait();return ''
-        async def upstream(**kwargs):yield event()
+        async def upstream(**kwargs):yield event(reason="STOP")
         async def consume():
             async for _ in api.stream_request({'model':'gemini-4-argon-medium','request':{'contents':[]}}):pass
         with patch.object(api,'stream_post_async',upstream),patch.object(api,'prepare_thought_boundary',lambda m,r:(r,None)),patch.object(api,'_record_request_body_detail',detail):

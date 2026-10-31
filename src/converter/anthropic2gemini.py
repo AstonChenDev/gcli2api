@@ -1010,19 +1010,14 @@ async def gemini_stream_to_anthropic_stream(
             # 检查是否是 Response 对象（错误情况）
             if isinstance(chunk, Response):
                 log.warning(f"[GEMINI_TO_ANTHROPIC] 收到 Response 对象，状态码: {chunk.status_code}，直接转发错误")
-                # 直接转发错误响应内容，不做格式转换
-                error_content = chunk.body if isinstance(chunk.body, bytes) else chunk.body.encode('utf-8')
-                try:
-                    boundary_error = json.loads(error_content).get("error", {})
-                    if isinstance(boundary_error, dict) and boundary_error.get("status") == "UPSTREAM_OUTPUT_BOUNDARY_MISSING":
-                        yield _sse_event("error", {"type": "error", "error": {
-                            "type": "api_error", "message": boundary_error["message"],
-                            "code": boundary_error["status"],
-                        }})
-                        return
-                except (ValueError, AttributeError):
-                    pass
-                yield error_content
+                from src.stream_events import error_payload
+                error = error_payload(chunk)["error"]
+                if not isinstance(error, dict):
+                    error = {"message": str(error)}
+                yield _sse_event("error", {"type": "error", "error": {
+                    **error, "type": error.get("type", "api_error"),
+                    "message": error.get("message", str(error)),
+                }})
                 return
 
             # 记录接收到的原始chunk
@@ -1061,6 +1056,16 @@ async def gemini_stream_to_anthropic_stream(
                 response = data["response"]
             else:
                 response = data
+
+            if response.get("error"):
+                error = response["error"]
+                if not isinstance(error, dict):
+                    error = {"message": str(error)}
+                yield _sse_event("error", {"type": "error", "error": {
+                    **error, "type": error.get("type", "api_error"),
+                    "message": error.get("message", str(error)),
+                }})
+                return
 
             candidate = (response.get("candidates", []) or [{}])[0] or {}
             parts = (candidate.get("content", {}) or {}).get("parts", []) or []
@@ -1175,11 +1180,10 @@ async def gemini_stream_to_anthropic_stream(
                 if "text" in part:
                     if (
                         is_skip_thought_signature_placeholder(part)
-                        or is_internal_placeholder_text(part.get("text"))
                     ):
                         continue
                     text = part.get("text", "")
-                    if isinstance(text, str) and not text.strip():
+                    if not isinstance(text, str) or not text:
                         continue
 
                     if current_block_type != "text":

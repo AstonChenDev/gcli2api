@@ -1139,7 +1139,7 @@ def extract_tool_calls_from_parts(
             text = part["text"]
             if (
                 is_skip_thought_signature_placeholder(part)
-                or is_internal_placeholder_text(text)
+                or (not is_streaming and is_internal_placeholder_text(text))
             ):
                 continue
             text_content += text
@@ -1877,7 +1877,7 @@ def convert_gemini_to_openai_stream(
                 text_content = additional_content
         
         # 合并 reasoning content
-        reasoning_content = "\n\n".join(reasoning_parts) if reasoning_parts else ""
+        reasoning_content = "".join(reasoning_parts) if reasoning_parts else ""
 
         # 构建 delta 对象
         delta = {}
