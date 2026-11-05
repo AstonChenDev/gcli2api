@@ -54,6 +54,9 @@ async def get_antigravity_models_with_features():
     # 提取模型 ID
     base_model_ids = [model['id'] for model in base_models_data if 'id' in model]
     
+    from src.thinking_model_routing import add_thinking_model_aliases
+    base_model_ids = await add_thinking_model_aliases(base_model_ids)
+
     # 添加功能前缀
     models = []
     for base_model in base_model_ids:

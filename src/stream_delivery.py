@@ -20,6 +20,7 @@ class StreamDelivery:
         self.bytes_sent = 0
         self.last_send_at = None
         self.error_sent = False
+        self.conversion_error = None
         self.terminal_sent = False
         self.openai_candidates = set()
         self.openai_finished = set()

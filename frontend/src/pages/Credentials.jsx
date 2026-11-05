@@ -19,6 +19,10 @@ import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
 import QuotaSummary, { quotaGroups } from "../components/QuotaSummary";
+import CredentialQuota from "../components/CredentialQuota";
+
+const hasActiveCooldown = (item, now) =>
+  Object.values(item.model_cooldowns || {}).some(until => until > now);
 
 export default function Credentials() {
   const [items, setItems] = useState([]);
@@ -38,7 +42,7 @@ export default function Credentials() {
   const [stats, setStats] = useState({ total: 0, normal: 0, disabled: 0 });
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(20);
+  const [pageSize, setPageSize] = useState(50);
   const [statusFilter, setStatusFilter] = useState("all");
   const [errorCodeFilter, setErrorCodeFilter] = useState("all");
   const [cooldownFilter, setCooldownFilter] = useState("all");
@@ -57,6 +61,7 @@ export default function Credentials() {
   const quotaCacheRef = useRef({});
   const quotaRequests = useRef(new Map());
   const quotaController = useRef(new AbortController());
+  const previousAutoQuotaEmails = useRef(new Set());
   const [testModel, setTestModel] = useState("gemini-4-argon-medium");
   const [batchProgress, setBatchProgress] = useState(null);
   const [testResults, setTestResults] = useState({});
@@ -247,21 +252,32 @@ export default function Credentials() {
     return task;
   }, []);
 
+  // Only restart the queue when eligibility changes, not on each countdown tick.
+  const autoQuotaEmails = JSON.stringify(items
+    .filter(item => !item.disabled && !hasActiveCooldown(item, now))
+    .map(item => item.email));
+
   useEffect(() => {
     let cancelled = false;
     let index = 0;
-    const emails = items.filter(item => !item.disabled).map(item => item.email);
+    const emails = JSON.parse(autoQuotaEmails);
+    const previous = previousAutoQuotaEmails.current;
+    previousAutoQuotaEmails.current = new Set(emails);
     const workers = Array.from({ length: Math.min(3, emails.length) }, async () => {
-      while (!cancelled && index < emails.length) await requestQuota(emails[index++]);
+      while (!cancelled && index < emails.length) {
+        const email = emails[index++];
+        // After CD expires, obtain fresh quota even if an old cache still exists.
+        await requestQuota(email, !previous.has(email));
+      }
     });
     Promise.all(workers);
     return () => { cancelled = true; };
-  }, [items, requestQuota]);
+  }, [autoQuotaEmails, requestQuota]);
 
   const refreshPageQuotas = async () => {
     setBusy("__quota__", true);
     let index = 0;
-    const emails = items.filter(item => !item.disabled).map(item => item.email);
+    const emails = items.filter(item => !item.disabled && !hasActiveCooldown(item, Date.now() / 1000)).map(item => item.email);
     try {
       await Promise.all(Array.from({ length: Math.min(3, emails.length) }, async () => {
         while (index < emails.length) await requestQuota(emails[index++], true);
@@ -424,7 +440,7 @@ export default function Credentials() {
         </button>
       </div>
 
-      <button onClick={refreshPageQuotas} disabled={loading || busyFiles.has("__quota__")} className="btn btn-secondary text-xs flex items-center gap-1.5">
+      <button onClick={refreshPageQuotas} disabled={loading || busyFiles.has("__quota__")} title="仅刷新本页已启用且未进入 CD 的凭证" className="btn btn-secondary text-xs flex items-center gap-1.5">
         <RefreshCw size={14} className={busyFiles.has("__quota__") ? "animate-spin" : ""} /> 刷新本页额度
       </button>
 
@@ -650,10 +666,9 @@ export default function Credentials() {
                   </div>
                 </div>
 
-                <div className="rounded-lg bg-slate-50 border border-slate-200 p-3">
-                  <div className="flex justify-between items-center mb-2"><span className="text-xs font-medium text-slate-700">剩余额度</span><button onClick={() => requestQuota(cred.email, true)} disabled={quotaLoading.has(cred.email)} className="text-xs text-purple-700 disabled:opacity-50">刷新额度</button></div>
-                  {cred.disabled && !quotaCache[cred.email] ? <p className="text-xs text-slate-500">已禁用，点击刷新可查询额度</p> : <QuotaSummary data={quotaCache[cred.email]} loading={quotaLoading.has(cred.email)} />}
-                </div>
+                <CredentialQuota key={`${cred.email}:${Boolean(cooldownText)}`}
+                  email={cred.email} cooling={Boolean(cooldownText)} disabled={cred.disabled}
+                  data={quotaCache[cred.email]} loading={quotaLoading.has(cred.email)} onRequest={requestQuota} />
                 {testResults[cred.email] && <div className={`text-xs ${testResults[cred.email].status === 200 ? "text-emerald-700" : "text-red-700"}`}>最近测试：{testResults[cred.email].model} · HTTP {testResults[cred.email].status || "—"}</div>}
 
                 {/* 操作按钮（2×3 网格铺满卡片） */}

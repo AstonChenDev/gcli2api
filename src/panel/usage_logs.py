@@ -12,9 +12,8 @@ from fastapi.responses import JSONResponse
 
 from config import get_usage_log_enabled
 from log import log
-from src.request_body_log import clear_request_body_logs, read_request_body_log
+from src.request_body_log import delete_request_body_logs, read_request_body_log
 from src.storage.database import get_database
-from src.usage_log import clear_usage_logs
 from src.utils import verify_panel_token
 
 
@@ -181,22 +180,12 @@ async def clear_logs(
     try:
         if days < 0:
             raise HTTPException(status_code=400, detail="天数不能为负数")
-        if days == 0:
-            # 0 = 删除所有（cutoff = now），同步清空请求体详细日志文件
-            deleted = await clear_usage_logs(0)
-            files_deleted = await asyncio.to_thread(clear_request_body_logs)
-            return JSONResponse(content={
-                "message": "已清理全部日志",
-                "deleted": deleted,
-                "files_deleted": files_deleted,
-            })
-        deleted = await clear_usage_logs(days)
-        # 同步删除 N 天前的请求体详细日志文件
-        files_deleted = await asyncio.to_thread(
-            clear_request_body_logs, time.time() - days * 86400
-        )
+        cutoff = time.time() - days * 86400
+        database = await get_database()
+        deleted, paths = await database.delete_usage_logs_with_files(cutoff)
+        files_deleted = await asyncio.to_thread(delete_request_body_logs, paths)
         return JSONResponse(content={
-            "message": f"已清理 {days} 天前的日志",
+            "message": "已清理已有日志" if days == 0 else f"已清理 {days} 天前的日志",
             "deleted": deleted,
             "files_deleted": files_deleted,
         })
@@ -209,30 +198,16 @@ async def clear_logs(
 
 @router.post("/truncate")
 async def truncate_logs(token: str = Depends(verify_panel_token)):
-    """清空日志：直接 DROP 整张 usage_log 表并重建，不留任何残留"""
-    from fastapi import Response as FastAPIResponse
-
+    """清空操作开始前的日志，保留并发完成的新请求记录。"""
     try:
-        from src.storage.database import UsageLog
-        from sqlalchemy import text
-
+        cutoff = time.time()
         database = await get_database()
-        # 先统计当前条数用于返回
-        _, total = await database.query_usage_logs(offset=0, limit=1)
-
-        async with database.session() as s:
-            await s.execute(text(f"DROP TABLE IF EXISTS {UsageLog.__tablename__}"))
-
-        # 重新建表（走统一的建表逻辑，保证结构最新）
-        async with database._engine.begin() as conn:
-            await conn.run_sync(database._create_tables)
-
-        # 同步清空全部请求体详细日志文件
-        files_deleted = await asyncio.to_thread(clear_request_body_logs)
+        deleted, paths = await database.delete_usage_logs_with_files(cutoff)
+        files_deleted = await asyncio.to_thread(delete_request_body_logs, paths)
 
         return JSONResponse(content={
-            "message": "已清空全部日志（表已重建）",
-            "deleted": total,
+            "message": "已清空已有日志，保留清空期间新增的记录",
+            "deleted": deleted,
             "files_deleted": files_deleted,
         })
     except Exception as e:

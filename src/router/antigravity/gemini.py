@@ -38,6 +38,7 @@ from src.router.stream_passthrough import (
 )
 
 # 本地模块 - 数据模型
+from src.thinking_model_routing import route_thinking_model
 from src.models import GeminiRequest, model_to_dict
 from src.converter.request_fields import normalize_gemini_request_fields
 
@@ -78,6 +79,7 @@ async def generate_content(
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(model)
     real_model = get_base_model_from_feature_model(model)
+    real_model = await route_thinking_model(real_model, normalized_dict, "gemini")
 
     # 对于抗截断模型的非流式请求，给出警告
     if use_anti_truncation:
@@ -147,6 +149,7 @@ async def stream_generate_content(
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(model)
     real_model = get_base_model_from_feature_model(model)
+    real_model = await route_thinking_model(real_model, normalized_dict, "gemini")
 
     # 更新模型名为真实模型名
     normalized_dict["model"] = real_model
@@ -327,9 +330,9 @@ async def stream_generate_content(
     # ========== 根据模式选择生成器 ==========
     if use_anti_truncation:
         log.info("启用流式抗截断功能")
-        return await build_streaming_response_or_error(anti_truncation_generator())
+        return await build_streaming_response_or_error(anti_truncation_generator(), request=request)
     else:
-        return await build_streaming_response_or_error(normal_stream_generator())
+        return await build_streaming_response_or_error(normal_stream_generator(), request=request)
 
 @router.post("/v1beta/models/{model:path}:countTokens")
 @router.post("/v1/models/{model:path}:countTokens")

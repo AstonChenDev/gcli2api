@@ -29,6 +29,8 @@ AUTO_BAN_ERROR_CODES = [403]
 ENV_MAPPINGS = {
     "CREDENTIALS_DIR": "credentials_dir",
     "PROXY": "proxy",
+    "STREAM_HANDSHAKE_TIMEOUT_ENABLED": "stream_handshake_timeout_enabled",
+    "STREAM_HANDSHAKE_TIMEOUT_SECONDS": "stream_handshake_timeout_seconds",
     "OAUTH_PROXY_URL": "oauth_proxy_url",
     "GOOGLEAPIS_PROXY_URL": "googleapis_proxy_url",
     "ANTIGRAVITY_API_URL": "antigravity_api_url",
@@ -43,6 +45,8 @@ ENV_MAPPINGS = {
     "SENSITIVE_WORDS_ENABLED": "sensitive_words_enabled",
     "IP_WHITELIST": "ip_whitelist",
     "IP_WHITELIST_ENABLED": "ip_whitelist_enabled",
+    "THINKING_MODEL_ROUTING_ENABLED": "thinking_model_routing_enabled",
+    "THINKING_MODEL_ROUTING_BASES": "thinking_model_routing_bases",
     "MODEL_REWRITE_ENABLED": "model_rewrite_enabled",
     "MODEL_REWRITE_RULES": "model_rewrite_rules",
     "USAGE_LOG_ENABLED": "usage_log_enabled",
@@ -137,6 +141,24 @@ async def get_proxy_config():
         )
         return None
     return proxy_url
+
+
+async def get_stream_handshake_timeout_enabled() -> bool:
+    value = await get_config_value("stream_handshake_timeout_enabled", True, "STREAM_HANDSHAKE_TIMEOUT_ENABLED")
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+async def get_stream_handshake_timeout_seconds() -> int:
+    value = await get_config_value("stream_handshake_timeout_seconds", 40, "STREAM_HANDSHAKE_TIMEOUT_SECONDS")
+    try:
+        seconds = int(value)
+        if not isinstance(value, bool) and str(seconds) == str(value).strip() and 1 <= seconds <= 3600:
+            return seconds
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return 40
 
 
 async def get_auto_ban_enabled() -> bool:
@@ -798,3 +820,19 @@ async def get_antigravity_api_url() -> str:
             "ANTIGRAVITY_API_URL",
         )
     )
+
+
+async def get_thinking_model_routing_enabled() -> bool:
+    """按等级选择模型，默认关闭；环境变量优先。"""
+    value = os.getenv("THINKING_MODEL_ROUTING_ENABLED")
+    if value is not None:
+        return value.lower() in ("true", "1", "yes", "on")
+    return bool(await get_config_value("thinking_model_routing_enabled", False))
+
+
+async def get_thinking_model_routing_bases() -> list[str]:
+    """仅对明确配置的模型基础名称添加等级后缀。"""
+    value = os.getenv("THINKING_MODEL_ROUTING_BASES")
+    if value is not None:
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return await get_config_value("thinking_model_routing_bases", ["gemini-4-argon"])

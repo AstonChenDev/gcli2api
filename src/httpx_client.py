@@ -10,9 +10,58 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, Optional
 
 import httpx
+from anyio import CancelScope, fail_after
 
-from config import get_proxy_config
+from config import get_proxy_config, get_stream_handshake_timeout_enabled, get_stream_handshake_timeout_seconds
 from log import log
+
+
+class _StreamingClient(httpx.AsyncClient):
+    def __init__(self, *, handshake_timeout, **kwargs):
+        super().__init__(**kwargs)
+        self.handshake_timeout = handshake_timeout
+
+    async def send(self, request, **kwargs):
+        # connect= alone does not bound an HTTP proxy's CONNECT response read.
+        # Keep one deadline through TCP, proxy negotiation and TLS, then lift it
+        # before sending the origin request. Model generation has no deadline.
+        original_trace = request.extensions.get("trace")
+        pending_stream = None
+        with fail_after(self.handshake_timeout) as handshake:
+            async def trace(event, info):
+                nonlocal pending_stream
+                if event.endswith((".connect_tcp.complete", ".connect_unix_socket.complete", ".start_tls.complete")):
+                    pending_stream = info.get("return_value")
+                if event in ("http11.send_request_headers.started", "http2.send_request_headers.started"):
+                    if info["request"].method != b"CONNECT":
+                        handshake.deadline = float("inf")
+                        pending_stream = None  # The HTTP connection now owns it.
+                if original_trace:
+                    await original_trace(event, info)
+
+            request.extensions["trace"] = trace
+            try:
+                return await super().send(request, **kwargs)
+            except BaseException:
+                # httpcore may not yet own a socket if SOCKS negotiation is
+                # cancelled. Closing the client pool alone misses that socket.
+                if pending_stream is not None:
+                    with CancelScope(shield=True):
+                        try:
+                            await pending_stream.aclose()
+                        except Exception as exc:
+                            log.warning(f"Handshake socket cleanup failed: {type(exc).__name__}")
+                if handshake.cancel_called:
+                    raise httpx.ConnectTimeout(
+                        f"Upstream connection/proxy/TLS handshake exceeded {self.handshake_timeout:g}s",
+                        request=request,
+                    ) from None
+                raise
+            finally:
+                if original_trace is None:
+                    request.extensions.pop("trace", None)
+                else:
+                    request.extensions["trace"] = original_trace
 
 
 async def get_client_kwargs(timeout: float = 30.0, **kwargs) -> Dict[str, Any]:
@@ -42,17 +91,24 @@ async def get_client(
 async def get_streaming_client(
     timeout: float = None, **kwargs
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
-    """获取用于流式请求的HTTP客户端（无超时限制）"""
+    """流式读取默认不限时；每次调用读取当前握手超时设置。"""
+    handshake_timeout = (
+        await get_stream_handshake_timeout_seconds()
+        if await get_stream_handshake_timeout_enabled() else None
+    )
+    if timeout is None:
+        timeout = httpx.Timeout(None, connect=handshake_timeout)
     client_kwargs = await get_client_kwargs(timeout=timeout, **kwargs)
 
     # 创建独立的客户端实例用于流式处理
-    client = httpx.AsyncClient(**client_kwargs)
+    client = _StreamingClient(handshake_timeout=handshake_timeout, **client_kwargs)
     try:
         yield client
     finally:
         # 确保无论发生什么都关闭客户端
         try:
-            await client.aclose()
+            with CancelScope(shield=True):
+                await client.aclose()
         except Exception as e:
             log.warning(f"Error closing streaming client: {e}")
 

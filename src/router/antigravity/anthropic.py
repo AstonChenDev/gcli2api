@@ -38,6 +38,7 @@ from src.router.stream_passthrough import (
 )
 
 # 本地模块 - 数据模型
+from src.thinking_model_routing import route_thinking_model
 from src.models import ClaudeRequest, model_to_dict
 
 # 本地模块 - Token估算
@@ -77,6 +78,7 @@ async def messages(
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(claude_request.model)
     real_model = get_base_model_from_feature_model(claude_request.model)
+    real_model = await route_thinking_model(real_model, normalized_dict, "anthropic")
 
     # 获取流式标志
     is_streaming = claude_request.stream
@@ -249,9 +251,9 @@ async def messages(
     # ========== 根据模式选择生成器 ==========
     if use_anti_truncation:
         log.info("启用流式抗截断功能")
-        return await build_streaming_response_or_error(anti_truncation_generator())
+        return await build_streaming_response_or_error(anti_truncation_generator(), request=request)
     else:
-        return await build_streaming_response_or_error(normal_stream_generator())
+        return await build_streaming_response_or_error(normal_stream_generator(), request=request)
 
 
 @router.post("/v1/messages/count_tokens")

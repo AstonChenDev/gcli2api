@@ -149,7 +149,7 @@ function UsageLogDetails() {
   };
 
   const truncateLogs = async () => {
-    if (!window.confirm("确定要清空全部请求日志吗？\n整张日志表将被删除重建，不留任何残留，此操作不可恢复。")) return;
+    if (!window.confirm("确定要清空已有请求日志及其详细文件吗？\n清空期间新增的记录会保留，此操作不可恢复。")) return;
     setClearing(true);
     try {
       const res = await api.post("/usage-logs/truncate");

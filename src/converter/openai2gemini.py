@@ -58,22 +58,24 @@ def _convert_usage_metadata(usage_metadata: Dict[str, Any]) -> Optional[Dict[str
     Returns:
         OpenAI格式的usage字典，如果没有usage数据则返回None
     """
-    if not usage_metadata:
+    if not isinstance(usage_metadata, dict) or not usage_metadata:
         return None
 
-    prompt_tokens = int(usage_metadata.get("promptTokenCount", 0) or 0)
-    cached_tokens = int(usage_metadata.get("cachedContentTokenCount", 0) or 0)
-    reasoning_tokens = int(usage_metadata.get("thoughtsTokenCount", 0) or 0)
+    def token_count(key, default=0):
+        # Usage is optional metadata, never a reason to discard valid content.
+        value = usage_metadata.get(key)
+        try:
+            return max(0, int(value)) if value is not None and not isinstance(value, bool) else default
+        except (ValueError, TypeError, OverflowError):
+            return default
+
+    prompt_tokens = token_count("promptTokenCount")
+    cached_tokens = token_count("cachedContentTokenCount")
+    reasoning_tokens = token_count("thoughtsTokenCount")
     completion_tokens = (
-        int(usage_metadata.get("candidatesTokenCount", 0) or 0) + reasoning_tokens
+        token_count("candidatesTokenCount") + reasoning_tokens
     )
-    total_tokens = int(
-        usage_metadata.get(
-            "totalTokenCount",
-            prompt_tokens + completion_tokens,
-        )
-        or 0
-    )
+    total_tokens = token_count("totalTokenCount", prompt_tokens + completion_tokens)
 
     usage = {
         "prompt_tokens": prompt_tokens,

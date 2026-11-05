@@ -38,12 +38,28 @@ from src.router.stream_passthrough import (
 )
 
 # 本地模块 - 数据模型
+from src.thinking_model_routing import route_thinking_model
 from src.models import OpenAIChatCompletionRequest, model_to_dict
 
 
 # ==================== 路由器初始化 ====================
 
 router = APIRouter()
+
+
+def _conversion_failure(exc):
+    """Make adapter failures visible to both callers and delivery accounting."""
+    from src.stream_delivery import current_delivery
+    from src.stream_events import stream_error, error_payload
+    error = stream_error(502, "RESPONSE_CONVERSION_FAILED", "上游响应格式转换失败")
+    delivery = current_delivery.get()
+    if delivery:
+        delivery.conversion_error = error
+        delivery.error_sent = True
+    log.error(f"Failed to convert chunk: {type(exc).__name__}")
+    if delivery and delivery.bytes_sent:
+        return ("data: " + json.dumps(error_payload(error)) + "\n\n").encode()
+    return error
 
 
 # ==================== API 路由 ====================
@@ -74,6 +90,7 @@ async def chat_completions(
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(openai_request.model)
     real_model = get_base_model_from_feature_model(openai_request.model)
+    real_model = await route_thinking_model(real_model, normalized_dict, "openai")
 
     # 获取流式标志
     is_streaming = openai_request.stream
@@ -237,8 +254,8 @@ async def chat_completions(
                         yield openai_chunk_str.encode('utf-8')
 
                 except Exception as e:
-                    log.error(f"Failed to convert chunk: {e}")
-                    continue
+                    yield _conversion_failure(e)
+                    return
 
         # 发送结束标记
         yield "data: [DONE]\n\n".encode('utf-8')
@@ -297,8 +314,8 @@ async def chat_completions(
                             yield openai_chunk_str.encode('utf-8')
 
                     except Exception as e:
-                        log.error(f"Failed to convert chunk: {e}")
-                        continue
+                        yield _conversion_failure(e)
+                        return
 
         # 发送结束标记
         yield "data: [DONE]\n\n".encode('utf-8')
@@ -306,6 +323,6 @@ async def chat_completions(
     # ========== 根据模式选择生成器 ==========
     if use_anti_truncation:
         log.info("启用流式抗截断功能")
-        return await build_streaming_response_or_error(anti_truncation_generator())
+        return await build_streaming_response_or_error(anti_truncation_generator(), request=request)
     else:
-        return await build_streaming_response_or_error(normal_stream_generator())
+        return await build_streaming_response_or_error(normal_stream_generator(), request=request)

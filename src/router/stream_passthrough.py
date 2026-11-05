@@ -1,8 +1,8 @@
 from typing import Any, AsyncIterator
 
-from fastapi import Response
+from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
-from anyio import CancelScope
+from anyio import CancelScope, create_task_group
 from src.stream_delivery import StreamDelivery, current_delivery
 
 
@@ -33,7 +33,23 @@ class ObservedStreamingResponse(StreamingResponse):
                 state.sent(message)
 
         try:
-            await super().__call__(scope, observed_receive, observed_send)
+            version = tuple(map(int, scope.get('asgi', {}).get('spec_version', '2.0').split('.')))
+            if version >= (2, 4):
+                # ASGI 2.4 StreamingResponse relies on a failed send. There may
+                # be no next send while the model is thinking, so still watch
+                # disconnects. Older ASGI already has its own receive watcher.
+                async with create_task_group() as tasks:
+                    async def watch_disconnect():
+                        await self.listen_for_disconnect(observed_receive)
+                        tasks.cancel_scope.cancel()
+
+                    tasks.start_soon(watch_disconnect)
+                    try:
+                        await super().__call__(scope, observed_receive, observed_send)
+                    finally:
+                        tasks.cancel_scope.cancel()
+            else:
+                await super().__call__(scope, observed_receive, observed_send)
         except BaseException as exc:
             state.exception_type = state.exception_type or type(exc).__name__
             raise
@@ -63,6 +79,7 @@ async def read_first_async_item(iterator: AsyncIterator[Any]) -> Any:
 async def build_streaming_response_or_error(
     iterator: AsyncIterator[Any],
     media_type: str = "text/event-stream",
+    request: Request = None,
 ):
     """
     Prefetch the first async item so router code can return an upstream error
@@ -70,9 +87,40 @@ async def build_streaming_response_or_error(
     """
     state = StreamDelivery()
     token = current_delivery.set(state)
+    # Close the outer converter too, including when it yielded a Response or
+    # was interrupted before ObservedStreamingResponse could take ownership.
+    close = getattr(iterator, "aclose", None)
+    if close:
+        state.closers.append(close)
     try:
         try:
-            first_item = await read_first_async_item(iterator)
+            if request is None:
+                first_item = await read_first_async_item(iterator)
+            else:
+                # Request bodies have already been parsed by FastAPI. Only this
+                # watcher owns receive until prefetch completes; it is joined
+                # before StreamingResponse starts its own disconnect listener.
+                exhausted = False
+                async with create_task_group() as tasks:
+                    async def watch_disconnect():
+                        while True:
+                            if (await request.receive())["type"] == "http.disconnect":
+                                state.disconnect_source = "http.disconnect"
+                                tasks.cancel_scope.cancel()
+                                return
+
+                    tasks.start_soon(watch_disconnect)
+                    try:
+                        first_item = await read_first_async_item(iterator)
+                    except StopAsyncIteration:
+                        exhausted = True
+                    finally:
+                        tasks.cancel_scope.cancel()
+                if state.disconnect_source:
+                    await state.finalize()
+                    return Response(status_code=499, headers={'X-Request-ID': state.request_id})
+                if exhausted:
+                    raise StopAsyncIteration
         except StopAsyncIteration:
             await state.finalize()
             return Response(status_code=204, headers={'X-Request-ID': state.request_id})

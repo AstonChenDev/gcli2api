@@ -25,7 +25,9 @@ const CONFIG_GROUPS = [
     title: "基础配置",
     fields: [
       { key: "credentials_dir", label: "凭证目录路径", type: "text", note: "存储认证文件的目录路径" },
-      { key: "proxy", label: "代理设置", type: "text", note: "支持 http/https/socks5/socks5h，可带账号密码（user:pass@host:port），留空不使用（重启生效）", placeholder: "http://user:pass@proxy:port 或 socks5h://proxy:port" },
+      { key: "proxy", label: "代理设置", type: "text", note: "支持 http/https/socks5/socks5h，可带账号密码（user:pass@host:port），留空不使用。保存后对新连接生效", placeholder: "http://user:pass@proxy:port 或 socks5h://proxy:port" },
+      { key: "stream_handshake_timeout_enabled", label: "启用握手超时", type: "bool", note: "限制流式调用连接上游的等待时间，使用代理和不使用代理时均生效。默认开启；关闭后不限建连时间，客户端断开仍会取消请求。保存后对新请求生效" },
+      { key: "stream_handshake_timeout_seconds", label: "握手超时秒数", type: "number", min: 1, max: 3600, step: 1, showIf: (cfg) => !!cfg.stream_handshake_timeout_enabled, note: "默认 40 秒，可设 1–3600 秒。每次重试单独计时，不限制连接建立后的思考与生成时长" },
     ],
   },
   {
@@ -89,6 +91,13 @@ const CONFIG_GROUPS = [
     fields: [
       { key: "sensitive_words_enabled", label: "启用敏感词过滤", type: "bool", note: "请求中命中敏感词的内容会被替换为空，避免触发 Google API 端点的敏感词拦截" },
       { key: "sensitive_words", label: "敏感词列表", type: "textarea", showIf: (cfg) => !!cfg.sensitive_words_enabled, note: "每行一个词或短语，不区分大小写，支持中文。命中后整词替换为空。保存后立即生效（热更新）", placeholder: "例如：\nsensitive word\n敏感词\n另一个词" },
+    ],
+  },
+  {
+    title: "思考等级模型匹配",
+    fields: [
+      { key: "thinking_model_routing_enabled", label: "按思考等级匹配模型", type: "bool", note: "默认关闭。开启后，例如 gemini-4-argon + high 自动选择 gemini-4-argon-high。支持 high / medium / low；已带等级后缀优先，未传等级默认选择 medium。保存后立即生效。" },
+      { key: "thinking_model_routing_bases", label: "适用模型", type: "textarea", showIf: (cfg) => !!cfg.thinking_model_routing_enabled, note: "每行一个基础模型名，默认 gemini-4-argon。仅添加上游确实提供 -high / -medium / -low 变体的模型。OpenAI 使用 reasoning_effort，Gemini 使用 generationConfig.thinkingConfig.thinkingLevel。后续模型名复写规则仍可覆盖匹配结果。" },
     ],
   },
   {
@@ -208,6 +217,9 @@ export default function Config() {
         <label className="flex items-center gap-3 cursor-pointer select-none">
           <button
             type="button"
+            aria-label={field.label}
+            role="switch"
+            aria-checked={!!value}
             onClick={() => setField(field.key, !value)}
             className={`relative w-11 h-6 rounded-full transition-colors ${
               value ? "bg-purple-600" : "bg-slate-200"
@@ -341,6 +353,10 @@ export default function Config() {
     return (
       <input
         type={field.type}
+        aria-label={field.label}
+        min={field.min}
+        max={field.max}
+        step={field.step}
         value={value}
         onChange={(e) =>
           setField(

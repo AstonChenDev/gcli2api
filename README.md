@@ -380,3 +380,47 @@ Gemini 请求的 `system_instruction` 与 `systemInstruction` 会在提示词注
 ### 流式完成与 499 记账
 
 流式响应已输出有效的 `finishReason`（多候选需全部结束）、`[DONE]` 或上游正常读完后，随后关闭连接不会再误记为 499。仅识别到正文分界不代表响应完成；在结束前取消仍记为 499。日志收尾保留已确定的成功或错误结果，避免取消期间变更状态、重复记账。诊断元数据记录结束原因、结束标记及 EOF，不记录响应正文。此规则按服务端可观察的协议状态判断，不追溯改写缺少结束标记证据的历史 499。
+
+
+### 按思考等级匹配模型
+
+在后台「配置 → 思考等级模型匹配」开启开关并保存，立即对新请求生效。默认关闭；适用模型默认 `gemini-4-argon`。可按行添加其他基础模型名，但应先确认上游提供对应的 `-high`、`-medium`、`-low` 变体。
+
+OpenAI `/v1/chat/completions` 请求示例：
+
+```json
+{
+  "model": "gemini-4-argon",
+  "reasoning_effort": "high",
+  "messages": [{"role": "user", "content": "请解释这段代码"}],
+  "stream": true
+}
+```
+
+此请求选择 `gemini-4-argon-high`。将等级改为 `medium` 或 `low` 即选择对应变体。流式、非流式及 `抗截断-` 前缀均支持。
+
+- OpenAI：`reasoning_effort`，也接受 `reasoning.effort`（仅聊天接口，不新增 Responses 接口）。
+- Gemini：路径模型名使用基础名称，请求体传 `generationConfig.thinkingConfig.thinkingLevel`，也接受对应 snake_case 字段。
+- Claude 格式 `/v1/messages`：基础模型名配合 `output_config.effort`。
+- 等级接受 high / medium / low，不区分大小写；仅对已配置的基础名称生效。未传等级（或等级为 null）时默认选择 medium，例如 gemini-4-argon 自动匹配 gemini-4-argon-medium。非法或相互冲突的等级返回 HTTP 400。
+- 已经带后缀的模型名优先，例如 `gemini-4-argon-low` 配 `high` 仍使用 low。其他模型保持原行为。
+- 匹配发生在模型名复写规则之前；已有复写规则仍可覆盖匹配结果。请求日志保留客户端原始模型名，上游请求使用匹配后的模型名。
+- 开关开启且模型列表包含三个等级变体时，模型列表额外显示基础名称，保留原有变体。
+
+环境变量（优先于后台设置，按现有配置机制锁定对应后台项）：
+
+```dotenv
+THINKING_MODEL_ROUTING_ENABLED=true
+THINKING_MODEL_ROUTING_BASES=gemini-4-argon
+```
+
+多个基础模型用英文逗号分隔；空列表表示不匹配任何模型。此功能负责选择上游模型，不保证所有凭证都具有该模型权限。
+
+### 流式连接与日志清理
+
+- 在“配置管理 → 基础配置”中，可通过“启用握手超时”和“握手超时秒数”控制流式上游调用的建连阶段（TCP、代理协商、TLS）。默认开启、40 秒，可设置 1–3600 秒，关闭后取消建连时限但仍保留断连回收。保存后对新请求生效，已建立的请求保持原设置。
+- 开始发送模型请求后解除握手期限，正常生成与流式读取默认不限时。每次重试单独计时，总请求耗时可能超过设置秒数。也可通过 `STREAM_HANDSHAKE_TIMEOUT_ENABLED` 和 `STREAM_HANDSHAKE_TIMEOUT_SECONDS` 环境变量设置，环境变量会锁定对应后台选项。
+- 客户端在首个响应前或流式输出期间断开时，取消对应任务并关闭上游连接。建连超时记录为 504 / `UPSTREAM_CONNECT_TIMEOUT`，已观察到的客户端断开记录为 499；完整交付后的断开仍按成功处理。
+- 清空日志使用事务删除已有记录，保留表、索引及操作期间新增的记录。详细文件只删除已删除记录对应的文件；尚未入库的文件和孤立文件不会被整目录清除。
+- OpenAI 响应中异常的 token 统计字段不会丢弃正文；无法恢复的流式转换错误会明确报错并记录失败。客户端在获取凭证阶段断开也记录日志，重试预取任务随请求退出回收。
+- 凭证列表默认每页显示 50 个，仍可在页面切换每页数量。

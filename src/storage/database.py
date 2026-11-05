@@ -21,6 +21,7 @@ from sqlalchemy import (
     Text,
     case,
     cast,
+    delete,
     func,
     inspect,
     literal,
@@ -1116,6 +1117,21 @@ class Database:
             rows = (await s.execute(query.order_by(func.count().desc(), source.c.status_code,
                 source.c.error_message).offset(offset).limit(limit))).all()
         return {"total": total, "items": [dict(row._mapping) for row in rows]}
+
+    async def delete_usage_logs_with_files(self, before_timestamp: float):
+        """Atomically delete old rows and return only their detailed-log paths.
+
+        DELETE RETURNING uses one snapshot, without dropping the table or
+        racing a separate SELECT against concurrent log writers.
+        """
+        async with self.session() as s:
+            result = await s.execute(
+                delete(UsageLog).where(UsageLog.created_at < before_timestamp)
+                .returning(UsageLog.request_log_file)
+            )
+            paths = list(result.scalars())
+        # The commit must succeed before any caller removes files.
+        return len(paths), [path for path in paths if path]
 
     async def delete_usage_logs_before(self, before_timestamp: float) -> int:
         """删除指定时间之前的日志，返回删除条数"""

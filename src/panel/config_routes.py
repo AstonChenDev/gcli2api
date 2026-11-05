@@ -29,6 +29,8 @@ async def get_config(token: str = Depends(verify_panel_token)):
         # 基础配置
         current_config["credentials_dir"] = await config.get_credentials_dir()
         current_config["proxy"] = await config.get_proxy_config() or ""
+        current_config["stream_handshake_timeout_enabled"] = await config.get_stream_handshake_timeout_enabled()
+        current_config["stream_handshake_timeout_seconds"] = await config.get_stream_handshake_timeout_seconds()
 
         # 代理端点配置
         current_config["oauth_proxy_url"] = await config.get_oauth_proxy_url()
@@ -60,6 +62,8 @@ async def get_config(token: str = Depends(verify_panel_token)):
         current_config["ip_whitelist"] = await config.get_ip_whitelist()
 
         # 模型名复写配置
+        current_config["thinking_model_routing_enabled"] = await config.get_thinking_model_routing_enabled()
+        current_config["thinking_model_routing_bases"] = await config.get_thinking_model_routing_bases()
         current_config["model_rewrite_enabled"] = await config.get_model_rewrite_enabled()
         current_config["model_rewrite_rules"] = await config.get_model_rewrite_rules_config()
 
@@ -109,6 +113,14 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         log.debug(f"收到的配置数据: {list(new_config.keys())}")
 
         # 验证配置项
+        if "stream_handshake_timeout_enabled" in new_config:
+            if not isinstance(new_config["stream_handshake_timeout_enabled"], bool):
+                raise HTTPException(status_code=400, detail="握手超时开关必须是布尔值")
+        if "stream_handshake_timeout_seconds" in new_config:
+            seconds = new_config["stream_handshake_timeout_seconds"]
+            if type(seconds) is not int or not 1 <= seconds <= 3600:
+                raise HTTPException(status_code=400, detail="握手超时必须是 1–3600 秒之间的整数；关闭限制请使用开关")
+
         if "retry_429_max_retries" in new_config:
             if (
                 not isinstance(new_config["retry_429_max_retries"], int)
@@ -190,6 +202,19 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                     raise HTTPException(status_code=400, detail=f"无效的 IP 白名单条目: {entry!r}")
                 cleaned_entries.append(entry)
             new_config["ip_whitelist"] = cleaned_entries
+
+        if "thinking_model_routing_enabled" in new_config:
+            if not isinstance(new_config["thinking_model_routing_enabled"], bool):
+                raise HTTPException(status_code=400, detail="思考等级模型匹配开关必须是布尔值")
+        if "thinking_model_routing_bases" in new_config:
+            bases = new_config["thinking_model_routing_bases"]
+            import re
+            if not isinstance(bases, list) or any(
+                not isinstance(base, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", base.strip())
+                or base.strip().endswith(("-high", "-medium", "-low")) for base in bases
+            ):
+                raise HTTPException(status_code=400, detail="适用模型必须为基础模型名数组，不含等级后缀、空格或路径")
+            new_config["thinking_model_routing_bases"] = list(dict.fromkeys(base.strip() for base in bases))
 
         # 验证模型名复写配置（每条规则 [pattern, replacement]，pattern 支持正则）
         if "model_rewrite_enabled" in new_config:

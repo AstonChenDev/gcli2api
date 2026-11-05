@@ -8,7 +8,6 @@
 
 import json
 import os
-import shutil
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -115,39 +114,18 @@ def read_request_body_log(rel_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def clear_request_body_logs(before_timestamp: Optional[float] = None) -> int:
-    """
-    清理详细日志文件，返回删除的文件数。
-    - before_timestamp=None: 清空全部（删除整个 request_logs 目录后重建）
-    - 否则: 只删除文件名时间戳早于该值的文件
-    """
-    root = REQUEST_LOG_DIR
-    if not os.path.isdir(root):
-        return 0
-
-    if before_timestamp is None:
-        count = 0
-        for _dirpath, _dirnames, filenames in os.walk(root):
-            count += len(filenames)
-        try:
-            shutil.rmtree(root, ignore_errors=True)
-            os.makedirs(root, exist_ok=True)
-        except Exception as e:
-            log.warning(f"清空请求体详细日志目录失败: {e}")
-        return count
-
-    cutoff_ms = int(before_timestamp * 1000)
+def delete_request_body_logs(paths) -> int:
+    """仅删除已提交删除的数据库记录所引用的文件，保留并发写入。"""
     deleted = 0
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for name in filenames:
-            try:
-                ts_ms = int(name.split("_", 1)[0])
-            except ValueError:
-                continue
-            if ts_ms < cutoff_ms:
-                try:
-                    os.remove(os.path.join(dirpath, name))
-                    deleted += 1
-                except OSError:
-                    pass
+    for path in set(paths):
+        full = _resolve_path(path)
+        if not full:
+            continue
+        try:
+            os.remove(full)
+            deleted += 1
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning(f"删除请求体详细日志失败: {type(exc).__name__}")
     return deleted

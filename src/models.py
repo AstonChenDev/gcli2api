@@ -55,6 +55,8 @@ class OpenAIChatMessage(BaseModel):
 
 
 class OpenAIChatCompletionRequest(BaseModel):
+    reasoning_effort: Optional[str] = None
+    reasoning: Optional[Dict[str, Any]] = None
     model: str
     messages: List[OpenAIChatMessage]
     temperature: Optional[float] = None
