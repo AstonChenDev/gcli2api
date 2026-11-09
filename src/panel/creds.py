@@ -9,8 +9,10 @@ import io
 import json
 import time
 import zipfile
+from contextlib import aclosing
 
 import httpx
+from anyio import CancelScope, create_task_group
 from urllib.parse import quote
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -157,7 +159,8 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
         }
 
         if "note" in data:
-            credential_data["note"] = data["note"].strip()
+            # Backups must restore the saved note verbatim, including formatting.
+            credential_data["note"] = data["note"]
         await add_credential(email, credential_data)
         return {
             "status": "success",
@@ -327,15 +330,40 @@ async def upload_credentials_common(files: List[UploadFile]) -> JSONResponse:
             return JSONResponse(content={key: value for key, value in event.items() if key != "type"})
 
 
+class _CredentialImportResponse(StreamingResponse):
+    async def __call__(self, scope, receive, send):
+        try:
+            version = tuple(map(int, scope.get('asgi', {}).get('spec_version', '2.0').split('.')))
+            if version >= (2, 4):
+                # Newer ASGI relies on a failed send; also notice disconnects
+                # while a credential is still being validated.
+                async with create_task_group() as tasks:
+                    async def watch_disconnect():
+                        await self.listen_for_disconnect(receive)
+                        tasks.cancel_scope.cancel()
+                    tasks.start_soon(watch_disconnect)
+                    try:
+                        await super().__call__(scope, receive, send)
+                    finally:
+                        tasks.cancel_scope.cancel()
+            else:
+                await super().__call__(scope, receive, send)
+        finally:
+            # A failed send can leave the producer suspended at its last yield.
+            with CancelScope(shield=True):
+                await self.body_iterator.aclose()
+
+
 @router.post("/upload-stream")
 async def upload_credentials_stream(files: List[UploadFile] = File(...), token: str = Depends(verify_panel_token)):
     entries = await _read_credential_files(files)
 
     async def stream():
-        async for event in _credential_import_events(entries):
-            yield json.dumps(event, ensure_ascii=False) + "\n"
+        async with aclosing(_credential_import_events(entries)) as events:
+            async for event in events:
+                yield json.dumps(event, ensure_ascii=False) + "\n"
 
-    return StreamingResponse(stream(), media_type="application/x-ndjson", headers={
+    return _CredentialImportResponse(stream(), media_type="application/x-ndjson", headers={
         "Cache-Control": "no-store", "X-Accel-Buffering": "no",
     })
 

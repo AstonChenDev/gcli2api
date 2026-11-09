@@ -49,13 +49,10 @@ router = APIRouter()
 
 def _conversion_failure(exc):
     """Make adapter failures visible to both callers and delivery accounting."""
-    from src.stream_delivery import current_delivery
-    from src.stream_events import stream_error, error_payload
-    error = stream_error(502, "RESPONSE_CONVERSION_FAILED", "上游响应格式转换失败")
+    from src.stream_delivery import current_delivery, record_conversion_failure
+    from src.stream_events import error_payload
+    error = record_conversion_failure()
     delivery = current_delivery.get()
-    if delivery:
-        delivery.conversion_error = error
-        delivery.error_sent = True
     log.error(f"Failed to convert chunk: {type(exc).__name__}")
     if delivery and delivery.bytes_sent:
         return ("data: " + json.dumps(error_payload(error)) + "\n\n").encode()
@@ -134,6 +131,10 @@ async def chat_completions(
 
         # 检查响应状态码
         status_code = getattr(response, "status_code", 200)
+        if not 200 <= status_code < 300:
+            # Errors may be empty, plain text or HTML. Preserve their status,
+            # body and retry headers without parsing them as model output.
+            return response
 
         # 提取响应体
         if hasattr(response, "body"):
@@ -206,6 +207,7 @@ async def chat_completions(
         # 转换为 OpenAI 格式
         import uuid
         response_id = str(uuid.uuid4())
+        tool_call_state = {}
 
         # 直接迭代 process_stream() 生成器，并转换为 OpenAI 格式
         async for chunk in processor.process_stream():
@@ -247,7 +249,8 @@ async def chat_completions(
                     openai_chunk_str = convert_gemini_to_openai_stream(
                         chunk_str,
                         real_model,
-                        response_id
+                        response_id,
+                        tool_call_state=tool_call_state,
                     )
 
                     if openai_chunk_str:
@@ -278,6 +281,7 @@ async def chat_completions(
             return
 
         response_id = str(uuid.uuid4())
+        tool_call_state = {}
 
         # yield所有数据,处理可能的错误Response
         async for chunk in prepend_async_item(first_chunk, stream_gen):
@@ -307,7 +311,8 @@ async def chat_completions(
                         openai_chunk_str = convert_gemini_to_openai_stream(
                             chunk_str,
                             real_model,
-                            response_id
+                            response_id,
+                            tool_call_state=tool_call_state,
                         )
 
                         if openai_chunk_str:

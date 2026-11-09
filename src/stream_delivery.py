@@ -11,6 +11,17 @@ from src.usage_log import new_request_id
 current_delivery = ContextVar('current_stream_delivery', default=None)
 
 
+def record_conversion_failure():
+    """Keep local adapter errors separate from a later client disconnect."""
+    from src.stream_events import stream_error
+    error = stream_error(502, 'RESPONSE_CONVERSION_FAILED', '上游响应格式转换失败')
+    delivery = current_delivery.get()
+    if delivery:
+        delivery.conversion_error = error
+        delivery.error_sent = True
+    return error
+
+
 class StreamDelivery:
     def __init__(self):
         self.request_id = new_request_id()

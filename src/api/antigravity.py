@@ -35,7 +35,8 @@ from src.stream_events import inspect_line, stream_error
 from src.stream_delivery import current_delivery
 from src.converter.request_fields import normalize_gemini_request_fields
 from src.usage_log import extract_response_id
-from src.thought_boundary import prepare_thought_boundary, ThoughtBoundaryGuard
+from src.thought_boundary import (prepare_thought_boundary, ThoughtBoundaryGuard,
+                                 ThoughtBoundaryError, POLLUTION_ERROR_CODE)
 from src.utils import ANTIGRAVITY_USER_AGENT
 
 # 导入共同的基础功能
@@ -233,6 +234,49 @@ async def _cancel_credential_prefetch(task):
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+async def _close_upstream_stream(stream, delivery=None):
+    """Release an attempt before retrying, including on cancellation or errors."""
+    if stream is None:
+        return
+    close = stream.aclose
+    with CancelScope(shield=True):
+        try:
+            await close()
+        except Exception as exc:
+            log.warning(f"Upstream stream cleanup failed: {type(exc).__name__}")
+    # finalize() may already be iterating its closers. In that case leave its
+    # list alone; closing an exhausted async generator again is harmless.
+    if delivery and not delivery.closed and close in delivery.closers:
+        delivery.closers.remove(close)
+
+
+def _prepend_signature_parts(chunk, signatures):
+    """Attach deferred metadata to confirmed output without inventing text/STOP."""
+    was_bytes = isinstance(chunk, bytes)
+    event = json.loads(chunk[5:])
+    response = event.get("response", event)
+    candidates = response.get("candidates", [])
+    by_index = {}
+    for position, candidate in enumerate(candidates):
+        # Inserting a metadata-only candidate must not change the implicit
+        # indexes of the original candidates in this event.
+        candidate.setdefault("index", position)
+        by_index[candidate["index"]] = candidate
+    prefixes = {}
+    for index, part in signatures:
+        prefixes.setdefault(index, []).append(part)
+    for index, parts in prefixes.items():
+        candidate = by_index.get(index)
+        if candidate is None:
+            candidates.insert(0, {"index": index, "content": {"role": "model", "parts": parts}})
+        else:
+            content = candidate.get("content") or {}
+            candidate["content"] = {**content, "parts": parts + content.get("parts", [])}
+    response["candidates"] = candidates
+    result = "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+    return result.encode() if was_bytes else result
 
 
 # ==================== 新的流式和非流式请求函数 ====================
@@ -499,6 +543,8 @@ async def stream_request(
             outcome = "pending"
             need_retry = False  # 标记是否需要重试
             usage_tokens: Dict[str, int] = {}  # 从流中提取的 token 用量
+            deferred_signatures = []
+            deferred_signature_bytes = 0
             attempt_start_time = time.time()  # 本次上游调用开始时间
             stream_metadata = StreamMetadata()
             completion = StreamCompletion((inner_request.get("generationConfig") or {}).get("candidateCount", 1))
@@ -545,6 +591,7 @@ async def stream_request(
                     diagnostics={
                         "outcome": outcome, "event_counts": event_counts,
                         **stream_metadata.as_dict(), **completion.as_dict(),
+                        **(thought_guard.metadata() if thought_guard else {}),
                         **(delivery.metadata() if delivery else {}),
                     },
                 )
@@ -613,19 +660,38 @@ async def stream_request(
                 previous_finalizer = finalize_delivery
 
             def observe_output(chunk):
-                nonlocal content_delivered, meaningful_content
+                nonlocal content_delivered, meaningful_content, deferred_signature_bytes
                 completion.observe(chunk)
                 if thought_guard and thought_guard.reclassified_chars:
                     meaningful_content = True
                 if native or inspect_line(chunk)[0] == "content":
                     content_delivered = meaningful_content = True
+                if deferred_signatures and (meaningful_content or content_delivered):
+                    chunk = _prepend_signature_parts(chunk, deferred_signatures)
+                    deferred_signatures.clear()
+                    deferred_signature_bytes = 0
+                return chunk
 
             def flush_guard():
                 pending = thought_guard.flush() if thought_guard else None
                 if pending is not None:
-                    observe_output(pending)
+                    pending = observe_output(pending)
+                    if not (meaningful_content or content_delivered):
+                        return None
                 return pending
 
+            async def invalid_boundary_response():
+                nonlocal outcome, last_error_body
+                outcome = "invalid_output_boundary"
+                completion.error = True
+                error = stream_error(502, POLLUTION_ERROR_CODE,
+                    "上游正文分隔异常，已停止输出以避免内部标记或分析混入正文")
+                last_error_body = error.body.decode("utf-8")
+                await _log_stream_result(502, False, last_error_body)
+                await _close_upstream_stream(upstream_stream, delivery)
+                return error
+
+            upstream_stream = None
             try:
                 upstream_stream = stream_post_async(
                     url=target_url,
@@ -654,15 +720,40 @@ async def stream_request(
                             continue
                         if event_kind in ("metadata", "done") and not success_recorded:
                             # Do not commit attempt-specific metadata or a success
-                            # terminator before we know there is a response.
-                            continue
+                            # terminator before we know there is a response. Keep
+                            # signature-only parts for that eventual response.
+                            if event_kind == "metadata":
+                                value = json.loads(chunk[5:])
+                                value = value.get("response", value)
+                                include_thoughts = (inner_request.get("generationConfig", {}).get("thinkingConfig") or {}).get("includeThoughts", True)
+                                for index, candidate in enumerate(value.get("candidates", [])):
+                                    for part in (candidate.get("content") or {}).get("parts", []):
+                                        if (not part.get("text") and part.get("thoughtSignature")
+                                                and (include_thoughts or part.get("thought") is not True)):
+                                            deferred_signatures.append((candidate.get("index", index), copy.deepcopy(part)))
+                                            deferred_signature_bytes += len(json.dumps(part, ensure_ascii=True))
+                            if deferred_signature_bytes <= 1024 * 1024:
+                                continue
+                            event_kind = "invalid"
+                            chunk = stream_error(500, "UPSTREAM_INVALID_EVENT", "上游首段签名元数据超过缓冲限制")
                     if event_kind in ("blocked", "error") and getattr(chunk, "upstream_content", None):
-                        partial = thought_guard.feed(chunk.upstream_content) if thought_guard else chunk.upstream_content
-                        observe_output(partial)
-                        if meaningful_content:
-                            yield partial
+                        try:
+                            partial = thought_guard.feed(chunk.upstream_content) if thought_guard else chunk.upstream_content
+                        except ThoughtBoundaryError:
+                            # The explicit upstream error is authoritative; keep
+                            # its status/reason while discarding unsafe text.
+                            partial = None
+                        if partial is not None:
+                            partial = observe_output(partial)
+                            if meaningful_content:
+                                yield partial
                     if isinstance(chunk, Response) or event_kind == "done":
-                        pending = flush_guard()
+                        try:
+                            pending = flush_guard()
+                        except ThoughtBoundaryError:
+                            if not isinstance(chunk, Response):
+                                raise
+                            pending = None
                         if pending is not None:
                             yield pending
                     if event_kind in ("blocked", "invalid"):
@@ -760,7 +851,7 @@ async def stream_request(
                                 for c in inner.get("candidates", []) for p in c.get("content", {}).get("parts", []))
                         protected = thought_guard.feed(chunk) if thought_guard else chunk
                         if protected is not None:
-                            observe_output(protected)
+                            protected = observe_output(protected)
                             if meaningful_content or content_delivered:
                                 yield protected
 
@@ -802,6 +893,7 @@ async def stream_request(
 
                 # 统一处理重试
                 if need_retry:
+                    await _close_upstream_stream(upstream_stream, delivery)
                     log.info(f"[ANTIGRAVITY STREAM] 重试请求 (attempt {attempt + 2}/{max_retries + 1})...")
 
                     switched, next_cred_task = await _switch_credential_for_retry(
@@ -822,6 +914,13 @@ async def stream_request(
                         return
                     continue  # 重试
 
+            except ThoughtBoundaryError:
+                # Framing violations are output failures, never a credential
+                # failure or a successful STOP. Do not flush ambiguous text or
+                # automatically retry an answer that may already be visible.
+                yield await invalid_boundary_response()
+                return
+
             except (asyncio.CancelledError, GeneratorExit):
                 # A client may close immediately after the final protocol event.
                 # Preserve completed/error outcomes; only unfinished streams are 499.
@@ -841,7 +940,11 @@ async def stream_request(
                     log.warning(f"[ANTIGRAVITY STREAM] 完整结束事件之后连接关闭异常: {type(e).__name__}, request_id={log_entry.get('request_id')}")
                     await _log_stream_result(200, True)
                     return
-                pending = flush_guard()
+                try:
+                    pending = flush_guard()
+                except ThoughtBoundaryError:
+                    yield await invalid_boundary_response()
+                    return
                 if pending is not None:
                     yield pending
                 outcome = "transport_error"
@@ -870,6 +973,9 @@ async def stream_request(
                         )
                     return
 
+            finally:
+                await _close_upstream_stream(upstream_stream, delivery)
+
         # 所有重试均已耗尽（for循环正常结束）——每次上游调用均已各自记录日志，
         # 这里不额外记录，直接返回最后一次的错误响应
         log.error("[ANTIGRAVITY STREAM] 所有重试均失败")
@@ -883,6 +989,16 @@ async def stream_request(
             )
     finally:
         await _cancel_credential_prefetch(next_cred_task)
+
+
+def _decoded_response_headers(headers) -> Dict[str, str]:
+    """httpx has decoded the body; let Starlette size the downstream bytes."""
+    excluded = {
+        "content-encoding", "content-length", "transfer-encoding", "connection",
+        "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade",
+    }
+    excluded.update(value.strip().lower() for value in headers.get("connection", "").split(","))
+    return {key: value for key, value in headers.items() if key.lower() not in excluded}
 
 
 async def non_stream_request(
@@ -1096,14 +1212,14 @@ async def non_stream_request(
                         await record_api_call_success(current_file, model_name=model_name)
                         await _log_result(200, True, response_content=response.content)
                         return Response(content=response.content, status_code=200,
-                                        headers=dict(response.headers))
+                                        headers=_decoded_response_headers(response.headers))
 
                 # 失败 - 记录最后一次错误
                 if status_code != 200:
                     last_error_response = Response(
                         content=response.content,
                         status_code=status_code,
-                        headers=dict(response.headers)
+                        headers=_decoded_response_headers(response.headers)
                     )
 
                     # 判断是否需要重试

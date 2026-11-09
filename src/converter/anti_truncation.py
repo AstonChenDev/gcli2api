@@ -542,8 +542,10 @@ class AntiTruncationStreamProcessor:
                                 side_buffer.close()
                                 self._clear_content()
                                 if not finish_reason_forwarded:
-                                    # 流未自然收尾：补发 finishReason 让客户端正常结束
-                                    yield self._build_finish_reason_chunk()
+                                    # Exhausting continuation attempts does not
+                                    # make a truncated synthetic answer complete.
+                                    yield self._build_finish_reason_chunk(
+                                        last_finish_reason if last_finish_reason in TRUNCATION_FINISH_REASONS else "STOP")
                                 yield line
                                 return
                             else:
@@ -704,8 +706,8 @@ class AntiTruncationStreamProcessor:
                         flush=True,
                     )
                     if not finish_reason_forwarded:
-                        # 流未自然收尾（无 finishReason chunk）：补发收尾信号
-                        yield self._build_finish_reason_chunk()
+                        yield self._build_finish_reason_chunk(
+                            last_finish_reason if last_finish_reason in TRUNCATION_FINISH_REASONS else "STOP")
                     yield b"data: [DONE]\n\n"
                     return
 

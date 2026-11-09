@@ -79,10 +79,10 @@ def extract_usage_tokens(source: Any) -> Dict[str, int]:
     def _first_int(*keys: str) -> int:
         for key in keys:
             value = metadata.get(key)
-            if value is not None:
+            if value is not None and not isinstance(value, bool):
                 try:
-                    return int(value)
-                except (TypeError, ValueError):
+                    return max(0, int(value))
+                except (TypeError, ValueError, OverflowError):
                     continue
         return 0
 
@@ -105,10 +105,10 @@ def extract_usage_tokens(source: Any) -> Dict[str, int]:
             details = metadata.get(details_key)
             if isinstance(details, dict):
                 value = details.get("cached_tokens")
-                if value is not None:
+                if value is not None and not isinstance(value, bool):
                     try:
-                        cached_tokens = int(value)
-                    except (TypeError, ValueError):
+                        cached_tokens = max(0, int(value))
+                    except (TypeError, ValueError, OverflowError):
                         cached_tokens = 0
                     break
 

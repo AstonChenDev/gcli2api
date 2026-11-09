@@ -11,6 +11,15 @@ from src.converter.request_fields import normalize_gemini_request_fields
 
 
 ERROR_CODE = "UPSTREAM_OUTPUT_BOUNDARY_MISSING"
+POLLUTION_ERROR_CODE = "UPSTREAM_OUTPUT_BOUNDARY_INVALID"
+
+
+class ThoughtBoundaryError(ValueError):
+    """The private framing contract was violated; text cannot be trusted."""
+
+
+class _NativePart(dict):
+    """A queued native part; its text is independent of undecided plain text."""
 
 
 def prepare_thought_boundary(model, request):
@@ -57,7 +66,8 @@ class ThoughtBoundaryGuard:
     The request marker and narrowly recognized copy errors define framing.
     The unmarked narrative fallback is a
     heuristic, restricted to structured English planning followed by a complete
-    Chinese prose sentence. Unresolved planning remains thought, not an error.
+    Chinese prose sentence. Unresolved planning remains thought. Malformed
+    private framing and recognized transport self-talk fail explicitly.
     """
     START_LIMIT = 128
     LOOKBEHIND = 1024
@@ -65,12 +75,26 @@ class ThoughtBoundaryGuard:
     SECTION = re.compile(r"(?:^|\n)\s*(\d+)\.\s+\*\*[A-Za-z]")
     PROSE = re.compile(r"(?<=[.])([ \t\r\n]*)([\u4e00-\u9fff][^\n。！？]{0,512}[。！？])")
     PLANNING_ZH = re.compile(r"思考|分析|规划|提纲|大纲|接下来|需要|应该|确保|例如|比如|示例|检查|要求|字数|正文|写作|开头|结尾|场景|描写")
+    PRIVATE_PREFIX = "<<<AGY_FINAL"
+    PRIVATE_TOKEN = re.compile(r"<<<AGY_FINAL[^<>\r\n]*>>>")
+    # Only inspect an answer's opening. English itself is never evidence of
+    # pollution. Hold possible self-talk until its reference to framing is clear.
+    OPENING_LIMIT = 192
+    SELF_TALK_STARTS = ("wait", "let me", "let's", "i need", "i must",
+                        "the marker", "the boundary", "output transport contract")
+    SELF_TALK = re.compile(
+        r"^(?:wait\b|let me\b|let's\b|i (?:need|must)\b|the (?:marker|boundary)\b|"
+        r"output transport contract\b)[\s\S]{0,160}?"
+        r"(?:\b(?:exact|boundary|transport|final|private) marker\b|"
+        r"\b(?:emit|output|copy|check|verify)\b[^.!?\n]{0,64}\bmarker\b|"
+        r"\b(?:developer prompt|transport contract|agy_final)\b)", re.I)
 
     def __init__(self, marker, include_thoughts=True):
         self.marker = marker
         self.include_thoughts = include_thoughts
         self.states = {}
-        self.failed = False  # compatibility; boundary uncertainty is not failure
+        self.failed = False
+        self.failure_reason = ""
         self.reclassified_chars = 0
         self.last_event = None
         self.last_was_bytes = False
@@ -129,11 +153,76 @@ class ThoughtBoundaryGuard:
                     tail = suffix
             if tail and (not final or any(marker.startswith(tail[0]) for marker in self._marker_variants())):
                 keep = max(keep, len(tail[0]))
+        # Buffer malformed/private tokens too, before the ordinary 128-char
+        # fallback can commit their prefix to the body.
+        start = pending.rfind(self.PRIVATE_PREFIX)
+        if not final and start >= 0 and ">>>" not in pending[start:]:
+            keep = max(keep, min(128, len(pending) - start))
         return keep
+
+    def _fail(self, reason):
+        self.failed = True
+        self.failure_reason = reason
+        raise ThoughtBoundaryError(reason)
+
+    def _validate_framing(self, pending, state, final):
+        # Literal examples in already recognized planning remain in the thought
+        # channel. Outside it, a private-looking token must be recoverable.
+        if state["mode"] == "thought" or self.HEADER.match(pending):
+            return
+        for prefix in re.finditer(re.escape(self.PRIVATE_PREFIX), pending):
+            end = pending.find(">>>", prefix.end())
+            if re.search(r"[<\r\n]", pending[prefix.end():end if end >= 0 else None]):
+                self._fail("malformed_private_marker")
+        for match in self.PRIVATE_TOKEN.finditer(pending):
+            token = match[0]
+            # Include a collision suffix when validating the complete marker.
+            suffix = pending[match.end():match.end() + len(self.marker_suffix)]
+            found = self._find_marker(token + suffix)
+            if (not final and len(suffix) < len(self.marker_suffix)
+                    and self.marker_suffix.startswith(suffix)
+                    and self.marker_pattern and self._nonce_matches(token[len("<<<AGY_FINAL_"):-3])):
+                continue
+            if found is None or found[:2] != (0, len(token) + len(self.marker_suffix)):
+                self._fail("malformed_private_marker")
+        start = pending.rfind(self.PRIVATE_PREFIX)
+        if start >= 0 and ">>>" not in pending[start:]:
+            tail = pending[start:]
+            if len(tail) > 128 or re.search(r"[\r\n<]", tail[len(self.PRIVATE_PREFIX):]):
+                self._fail("malformed_private_marker")
+            if final and self._partial_marker_size(tail, final=True) != len(tail):
+                self._fail("unfinished_private_marker")
+
+    def _probe_answer_opening(self, state, final):
+        pending = state["pending"]
+        opening = pending.lstrip()
+        heading = self.HEADER.match(opening)
+        self_talk = self.SELF_TALK.search(opening[:self.OPENING_LIMIT + 1])
+        if self_talk and self_talk.end() > self.OPENING_LIMIT:
+            self_talk = None
+        if self_talk and self_talk.end() == len(opening) and not final:
+            # A packet end is not a word boundary: "marker" may continue as
+            # "markerboard". Wait for a real delimiter or protocol completion.
+            return False
+        if (self_talk
+                or (heading and ("\n" in heading[0] or final))):
+            self._fail("analysis_after_private_marker")
+        lower = opening.casefold()
+        possible = (not lower or self._possible_heading(opening)
+                    or self.marker.startswith(opening)
+                    or self.PRIVATE_PREFIX.startswith(opening)
+                    or opening.startswith(self.PRIVATE_PREFIX) or any(
+            phrase.startswith(lower) or lower.startswith(phrase)
+            for phrase in self.SELF_TALK_STARTS))
+        if possible and not final and len(pending) < self.OPENING_LIMIT:
+            return False
+        state["probe_opening"] = False
+        return True
 
     def _state(self):
         return dict(pending="", mode="detect", method="", sections=set(), scan_tail="", finalized=False,
-                    detect_text_false=False, heading_text_false=False, segments=deque())
+                    detect_text_false=False, heading_text_false=False, segments=deque(),
+                    probe_opening=False, marker_seen=False, answer_started=False)
 
     def _buffer_part(self, state, part):
         """Keep metadata attached to its text while the boundary is undecided."""
@@ -155,7 +244,11 @@ class ThoughtBoundaryGuard:
             if not text:
                 # An empty text part can carry an independent signature. It
                 # must survive even when adjacent framing text is discarded.
-                parts.append({**copy.deepcopy(metadata), "text": ""})
+                if isinstance(metadata, _NativePart):
+                    if self.include_thoughts or metadata.get("thought") is not True:
+                        parts.append(copy.deepcopy(dict(metadata)))
+                else:
+                    parts.append({**copy.deepcopy(metadata), "text": ""})
                 segments.popleft()
                 continue
             take = min(count, len(text))
@@ -234,16 +327,25 @@ class ThoughtBoundaryGuard:
         state["sections"].update(self.SECTION.findall(scan))
         state["scan_tail"] = scan[-128:]
         pending = state["pending"]
+        self._validate_framing(pending, state, final)
         match = self._find_marker(pending)
         if match is not None:
             pos, size, corrected = match
             before, after = pending[:pos], pending[pos + size:]
             was_answer = state["mode"] == "answer"
+            if state["marker_seen"] and not state["answer_started"] and not before.strip():
+                self._fail("repeated_private_marker_before_answer")
+            if state["probe_opening"]:
+                self._probe_answer_opening(state, final=True)
             self.marker_corrections += int(corrected)
-            state.update(pending="", mode="answer", method="corrected_marker" if corrected else "marker")
+            state.update(pending="", mode="answer", method="corrected_marker" if corrected else "marker",
+                         probe_opening=True, marker_seen=True,
+                         answer_started=state["answer_started"] or (was_answer and bool(before.strip())))
             parts = self._consume_parts(state, len(before), not was_answer)
             parts.extend(self._consume_parts(state, size))
             return parts + self._split(after, state, original, final)
+        if state["probe_opening"] and not self._probe_answer_opening(state, final):
+            return []
         if state["mode"] == "detect":
             heading = self.HEADER.match(pending)
             if heading and ("\n" in heading[0] or final):
@@ -261,7 +363,7 @@ class ThoughtBoundaryGuard:
         discarded = 0
         if final:
             size = self._partial_marker_size(pending, final=True)
-            if size >= len("<<<AGY_FINAL_"):
+            if size >= len(self.PRIVATE_PREFIX):
                 pending = pending[:-size]
                 discarded = size
         keep = 0
@@ -270,6 +372,8 @@ class ThoughtBoundaryGuard:
             if state["mode"] == "thought":
                 keep = max(keep, min(len(pending), self.LOOKBEHIND))
         safe = pending[:-keep] if keep else pending
+        if state["mode"] == "answer" and safe.strip():
+            state["answer_started"] = True
         state["pending"] = pending[-keep:] if keep else ""
         parts = self._consume_parts(state, len(safe), state["mode"] == "thought")
         if discarded:
@@ -304,12 +408,22 @@ class ThoughtBoundaryGuard:
                 if part.get("thought") is True:
                     # Explicit upstream thoughts and signatures are never rewritten.
                     if self.include_thoughts:
-                        parts.append(part)
+                        if state["segments"] or not part.get("text"):
+                            state["segments"].append(["", _NativePart(copy.deepcopy(part))])
+                            if part.get("text") and not state["pending"]:
+                                # Signature-only parts must wait for real output,
+                                # but must not delay following native thinking.
+                                parts.extend(self._consume_parts(state, 0))
+                        else:
+                            parts.append(part)
                 elif isinstance(part.get("text"), str):
                     self._buffer_part(state, part)
                     parts.extend(self._split(part["text"], state, part))
                 else:
-                    parts.append(part)
+                    # Preserve nontext parts in the same queue as buffered text.
+                    # They must not overtake text awaiting boundary classification.
+                    state["segments"].append(["", _NativePart(copy.deepcopy(part))])
+                    parts.extend(self._consume_parts(state, 0))
             if candidate.get("finishReason") not in (None, "", "FINISH_REASON_UNSPECIFIED"):
                 parts.extend(self._split("", state, final=True))
                 state["finalized"] = True
@@ -321,6 +435,8 @@ class ThoughtBoundaryGuard:
 
     def flush(self):
         """Drain buffered text before DONE, EOF or an explicit error; no fake STOP."""
+        if self.failed:
+            return None
         if self.last_event is None or not any(s["pending"] or s["segments"] for s in self.states.values()):
             return None
         event = copy.deepcopy(self.last_event)
@@ -336,10 +452,11 @@ class ThoughtBoundaryGuard:
 
     @property
     def complete(self):
-        return bool(self.states) and all(not s["pending"] and not s["segments"] for s in self.states.values())
+        return not self.failed and bool(self.states) and all(not s["pending"] and not s["segments"] for s in self.states.values())
 
     def metadata(self):
-        return {"boundary_complete": self.complete, "boundary_failed": False,
+        return {"boundary_complete": self.complete, "boundary_failed": self.failed,
+                "boundary_failure_reason": self.failure_reason,
                 "boundary_uncertain": any(s["mode"] == "thought" for s in self.states.values()),
                 "boundary_methods": sorted({s["method"] for s in self.states.values() if s["method"]}),
                 "reclassified_chars": self.reclassified_chars,

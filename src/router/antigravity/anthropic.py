@@ -122,6 +122,10 @@ async def messages(
 
         # 检查响应状态码
         status_code = getattr(response, "status_code", 200)
+        if not 200 <= status_code < 300:
+            # Errors may be empty, plain text or HTML. Preserve their status,
+            # body and retry headers without parsing them as model output.
+            return response
 
         # 提取响应体
         if hasattr(response, "body"):

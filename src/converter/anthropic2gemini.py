@@ -196,10 +196,20 @@ def _anthropic_debug_enabled() -> bool:
     return str(os.getenv("ANTHROPIC_DEBUG", "true")).strip().lower() in _DEBUG_TRUE
 
 
-def _cached_content_token_count(usage_metadata: Any) -> int:
+def _token_count(usage_metadata: Any, key: str) -> int:
     if not isinstance(usage_metadata, dict):
         return 0
-    return int(usage_metadata.get("cachedContentTokenCount", 0) or 0)
+    value = usage_metadata.get(key)
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _cached_content_token_count(usage_metadata: Any) -> int:
+    return _token_count(usage_metadata, "cachedContentTokenCount")
 
 
 def _anthropic_usage_from_metadata(usage_metadata: Any) -> Dict[str, Any]:
@@ -216,13 +226,13 @@ def _anthropic_usage_from_metadata(usage_metadata: Any) -> Dict[str, Any]:
     if not isinstance(usage_metadata, dict):
         return {"input_tokens": 0, "output_tokens": 0}
 
-    prompt_tokens_total = int(usage_metadata.get("promptTokenCount", 0) or 0)
+    prompt_tokens_total = _token_count(usage_metadata, "promptTokenCount")
     cached_tokens = _cached_content_token_count(usage_metadata)
-    reasoning_tokens = int(usage_metadata.get("thoughtsTokenCount", 0) or 0)
+    reasoning_tokens = _token_count(usage_metadata, "thoughtsTokenCount")
     usage: Dict[str, Any] = {
         "input_tokens": max(prompt_tokens_total - cached_tokens, 0),
         "output_tokens": (
-            int(usage_metadata.get("candidatesTokenCount", 0) or 0)
+            _token_count(usage_metadata, "candidatesTokenCount")
             + reasoning_tokens
         ),
     }
@@ -942,7 +952,7 @@ async def gemini_stream_to_anthropic_stream(
     gemini_stream: AsyncIterator[bytes],
     model: str,
     status_code: int = 200
-) -> AsyncIterator[bytes]:
+) -> AsyncIterator[bytes | Response]:
     """
     将 Gemini 格式流式响应转换为 Anthropic SSE 格式流式响应
 
@@ -970,6 +980,7 @@ async def gemini_stream_to_anthropic_stream(
     current_thinking_signature: Optional[str] = None
     has_tool_use = False
     input_tokens = 0
+    prompt_tokens_total = 0
     output_tokens = 0
     cached_input_tokens = 0
     reasoning_tokens = 0
@@ -1075,16 +1086,16 @@ async def gemini_stream_to_anthropic_stream(
                 usage = response["usageMetadata"]
                 if isinstance(usage, dict):
                     if "promptTokenCount" in usage:
-                        prompt_tokens_total = int(usage.get("promptTokenCount", 0) or 0)
+                        prompt_tokens_total = _token_count(usage, "promptTokenCount")
                         input_tokens = max(prompt_tokens_total - cached_input_tokens, 0)
                     if "candidatesTokenCount" in usage:
-                        output_tokens = int(usage.get("candidatesTokenCount", 0) or 0)
+                        output_tokens = _token_count(usage, "candidatesTokenCount")
                     if "thoughtsTokenCount" in usage:
-                        reasoning_tokens = int(usage.get("thoughtsTokenCount", 0) or 0)
+                        reasoning_tokens = _token_count(usage, "thoughtsTokenCount")
                     if "cachedContentTokenCount" in usage:
-                        cached_input_tokens = int(usage.get("cachedContentTokenCount", 0) or 0)
+                        cached_input_tokens = _token_count(usage, "cachedContentTokenCount")
                         input_tokens = max(
-                            int(usage.get("promptTokenCount", 0) or 0) - cached_input_tokens,
+                            prompt_tokens_total - cached_input_tokens,
                             0,
                         )
 
@@ -1314,7 +1325,14 @@ async def gemini_stream_to_anthropic_stream(
         yield _sse_event("message_stop", {"type": "message_stop"})
 
     except Exception as e:
-        log.error(f"[ANTHROPIC] 流式转换失败: {e}")
+        from src.stream_delivery import current_delivery, record_conversion_failure
+        from src.stream_events import error_payload
+        log.error(f"[ANTHROPIC] 流式转换失败: {type(e).__name__}")
+        error = record_conversion_failure()
+        delivery = current_delivery.get()
+        if delivery and not delivery.bytes_sent:
+            yield error
+            return
         # 发送错误事件
         if not message_start_sent:
             yield _sse_event(
@@ -1335,5 +1353,5 @@ async def gemini_stream_to_anthropic_stream(
             )
         yield _sse_event(
             "error",
-            {"type": "error", "error": {"type": "api_error", "message": str(e)}},
+            {"type": "error", "error": {"type": "api_error", **error_payload(error)["error"]}},
         )
