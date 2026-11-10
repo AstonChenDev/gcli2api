@@ -11,6 +11,8 @@ from src.models import ConfigSaveRequest
 from src.storage.database import get_database
 from src.utils import verify_panel_token
 from .utils import get_env_locked_keys
+from src.credential_cooldown import DEFAULTS as COOLDOWN_DEFAULTS, PREFIX as COOLDOWN_PREFIX, CooldownStore, public_settings, save_settings, validate_settings
+from src.credential_cooldown import resolve_family, family_label
 
 
 # 创建路由器
@@ -24,7 +26,7 @@ async def get_config(token: str = Depends(verify_panel_token)):
 
 
         # 读取当前配置（包括环境变量和TOML文件中的配置）
-        current_config = {}
+        current_config = dict(COOLDOWN_DEFAULTS)
 
         # 基础配置
         current_config["credentials_dir"] = await config.get_credentials_dir()
@@ -96,6 +98,8 @@ async def get_config(token: str = Depends(verify_panel_token)):
             if key not in env_locked_keys:
                 current_config[key] = value
 
+        current_config.pop(COOLDOWN_PREFIX + "revision", None)
+        current_config.update(await public_settings(database))
         return JSONResponse(content={"config": current_config, "env_locked": list(env_locked_keys)})
 
     except Exception as e:
@@ -113,6 +117,10 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         log.debug(f"收到的配置数据: {list(new_config.keys())}")
 
         # 验证配置项
+        try:
+            validate_settings(new_config)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         if "stream_handshake_timeout_enabled" in new_config:
             if not isinstance(new_config["stream_handshake_timeout_enabled"], bool):
                 raise HTTPException(status_code=400, detail="握手超时开关必须是布尔值")
@@ -302,8 +310,9 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
 
         # 直接写入数据库
         database = await get_database()
+        await save_settings(database, {k: v for k, v in new_config.items() if k.startswith(COOLDOWN_PREFIX)})
         for key, value in new_config.items():
-            if key not in env_locked_keys:
+            if key not in env_locked_keys and not key.startswith(COOLDOWN_PREFIX):
                 await database.set_config(key, value)
                 if key in ("api_password", "panel_password"):
                     log.debug(f"设置{key}字段为: {value}")
@@ -330,3 +339,27 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
     except Exception as e:
         log.error(f"保存配置失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/cooldown499/status")
+async def cooldown_status(token: str = Depends(verify_panel_token)):
+    return await CooldownStore(await get_database()).status()
+
+
+@router.post("/cooldown499/resolve")
+async def preview_cooldown_family(request: dict, token: str = Depends(verify_panel_token)):
+    """Evaluate an unsaved draft without storing it or calling a model."""
+    model = request.get("model")
+    draft = request.get("config", {})
+    if not isinstance(model, str) or not 1 <= len(model.strip()) <= 128:
+        raise HTTPException(status_code=400, detail="请输入 1–128 字的模型名")
+    if not isinstance(draft, dict) or any(key not in COOLDOWN_DEFAULTS for key in draft):
+        raise HTTPException(status_code=400, detail="预览配置必须使用有效的 499 保护配置项")
+    values = {**COOLDOWN_DEFAULTS, **draft}
+    try:
+        validate_settings(values)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    cfg = {key[len(COOLDOWN_PREFIX):]: value for key, value in values.items()}
+    group = resolve_family(model.strip(), cfg)
+    return {"group": group, "label": family_label(group), "scope": cfg["scope"]}

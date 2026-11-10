@@ -28,6 +28,7 @@ from src.credential_manager import (
     get_valid_credential,
 )
 from src.httpx_client import stream_post_async, post_async
+from src.credential_cooldown import acquire_dispatch, PoolCooling
 from src.models import Model, model_to_dict
 from anyio import CancelScope
 from src.stream_metadata import StreamMetadata, StreamCompletion
@@ -532,6 +533,7 @@ async def stream_request(
 
     try:
         for attempt in range(max_retries + 1):
+            lease = None
             last_error_body = ""
             last_error_response = None
             result_logged = False
@@ -540,6 +542,7 @@ async def stream_request(
             content_delivered = False
             meaningful_content = False
             event_counts = {}
+            upstream_event_seen = False
             outcome = "pending"
             need_retry = False  # 标记是否需要重试
             usage_tokens: Dict[str, int] = {}  # 从流中提取的 token 用量
@@ -562,6 +565,11 @@ async def stream_request(
                 nonlocal result_logged
                 if result_logged:
                     return
+                if lease:
+                    await lease.result(success=success, cancelled_empty=bool(
+                        status_code == 499 and delivery and delivery.disconnect_source
+                        and not delivery.conversion_error and not upstream_event_seen
+                        and not content_delivered and delivery.bytes_sent == 0))
                 from src.usage_log import record_usage_log
 
                 log.info("[UPSTREAM_STREAM_METADATA] " + json.dumps({
@@ -693,6 +701,19 @@ async def stream_request(
 
             upstream_stream = None
             try:
+                try:
+                    picked, lease = await acquire_dispatch(
+                        (current_file, {"access_token": access_token, "project_id": project_id}),
+                        model_name, session_key, log_entry["request_id"], get_valid_credential)
+                except PoolCooling as exc:
+                    outcome = "credential_cooling"
+                    await _log_stream_result(503, False, str(exc))
+                    yield Response(content=json.dumps({"error": str(exc)}), status_code=503,
+                                   headers={"Retry-After": str(exc.retry_after)}, media_type="application/json")
+                    return
+                if not apply_cred_result(picked):
+                    raise ValueError("所选凭证缺少访问令牌或项目 ID")
+                attempt_start_time = time.time()
                 upstream_stream = stream_post_async(
                     url=target_url,
                     body=final_payload,
@@ -701,7 +722,8 @@ async def stream_request(
                 )
                 if delivery:
                     delivery.closers.append(upstream_stream.aclose)
-                async for chunk in upstream_stream:
+                async for chunk in lease.iterate(upstream_stream):
+                    upstream_event_seen = True
                     # Parse protocol events before applying the text boundary guard.
                     # Comments keep long connections alive but are never content.
                     event_kind = "http_error"
@@ -975,6 +997,9 @@ async def stream_request(
 
             finally:
                 await _close_upstream_stream(upstream_stream, delivery)
+                if lease:
+                    with CancelScope(shield=True):
+                        await lease.close()
 
         # 所有重试均已耗尽（for循环正常结束）——每次上游调用均已各自记录日志，
         # 这里不额外记录，直接返回最后一次的错误响应
@@ -1029,6 +1054,7 @@ async def non_stream_request(
     final_payload: Dict[str, Any] = {}
     last_error_body = ""  # 详细日志：最后一次的错误响应体
     upstream_response_content = None
+    lease = None
     current_file = ""  # 当前使用的凭证（未获取前为空）
     attempt_start_time = time.time()  # 本次上游调用开始时间（循环内每次重置）
 
@@ -1037,6 +1063,8 @@ async def non_stream_request(
         写入一次上游调用的请求日志（调用一次谷歌 API 产生一条日志；
         重试会在后续 attempt 各自再记一条，属于正常行为）。
         """
+        if lease:
+            await lease.result(success=success)
         from src.usage_log import record_usage_log, extract_usage_tokens
 
         if response_content is None:
@@ -1155,6 +1183,7 @@ async def non_stream_request(
 
     try:
         for attempt in range(max_retries + 1):
+            lease = None
             last_error_body = ""
             upstream_response_content = None
             # A later connection failure must not return the previous attempt's
@@ -1164,6 +1193,17 @@ async def non_stream_request(
             attempt_start_time = time.time()  # 本次上游调用开始时间
 
             try:
+                try:
+                    picked, lease = await acquire_dispatch(
+                        (current_file, {"access_token": access_token, "project_id": project_id}),
+                        model_name, session_key, log_entry["request_id"], get_valid_credential)
+                except PoolCooling as exc:
+                    await _log_result(503, False, error_message=str(exc))
+                    return Response(content=json.dumps({"error": str(exc)}), status_code=503,
+                                    headers={"Retry-After": str(exc.retry_after)}, media_type="application/json")
+                if not apply_cred_result(picked):
+                    raise ValueError("所选凭证缺少访问令牌或项目 ID")
+                attempt_start_time = time.time()
                 response = await post_async(
                     url=target_url,
                     json=final_payload,
@@ -1316,6 +1356,11 @@ async def non_stream_request(
                             status_code=500,
                             media_type="application/json"
                         )
+            finally:
+                if lease:
+                    with CancelScope(shield=True):
+                        await lease.result()
+                        await lease.close()
 
         # 所有重试都失败（for循环正常结束）——每次上游调用均已各自记录日志，
         # 这里不额外记录，直接返回最后一次的原始错误

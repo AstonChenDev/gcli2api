@@ -24,6 +24,7 @@ class HandshakeSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.stack.enter_context(patch.object(config, '_config_cache', {}))
         self.stored = {}
         self.db = AsyncMock()
+        self.stack.enter_context(patch.object(config_routes, 'public_settings', AsyncMock(return_value=dict(config_routes.COOLDOWN_DEFAULTS))))
         async def read():
             return dict(self.stored)
         async def save(key, value):

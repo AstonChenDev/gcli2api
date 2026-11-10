@@ -89,6 +89,13 @@ class ConfigItem(Base):
     updated_at: Mapped[float] = mapped_column(Float, default=time.time)
 
 
+class Credential499State(Base):
+    """Separate breaker state: never cleared by record_success or quota CD."""
+    __tablename__ = "credential_499_state"
+    email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    state: Mapped[str] = mapped_column(Text, default="{}")
+
+
 class UsageLog(Base):
     """请求日志表：每次 API 调用记录一条（成功与失败均记录）"""
     __tablename__ = "usage_log"
@@ -318,6 +325,21 @@ class Database:
 
     # ---------- 凭证管理 ----------
 
+    @asynccontextmanager
+    async def locked_cooldown_state(self, email):
+        """Common lock order: breaker row, then credential row if needed."""
+        async with self.session() as session:
+            if self.backend_type == "sqlite":
+                await session.execute(text("BEGIN IMMEDIATE"))
+                from sqlalchemy.dialects.sqlite import insert
+            else:
+                from sqlalchemy.dialects.postgresql import insert
+            await session.execute(insert(Credential499State).values(email=email, state="{}")
+                                  .on_conflict_do_nothing(index_elements=["email"]))
+            state_row = await session.scalar(select(Credential499State).where(
+                Credential499State.email == email).with_for_update())
+            yield session, state_row
+
     async def get_import_identities(self):
         """Import-only identity index; never expose this result through an API."""
         async with self.session() as s:
@@ -403,17 +425,25 @@ class Database:
 
     async def delete_credential(self, email: str) -> bool:
         """删除凭证"""
-        async with self.session() as s:
+        async with self.locked_cooldown_state(email) as (s, state_row):
             row = await s.scalar(
-                select(AntigravityCredential).where(AntigravityCredential.email == email)
+                select(AntigravityCredential).where(AntigravityCredential.email == email).with_for_update()
             )
+            state = json.loads(state_row.state)
+            # Keep ownership of live transports: deleting lease keys would make
+            # heartbeat renewal cancel them. Removing groups fences old results
+            # even when the same email is imported again before they finish.
+            state.update(groups={}, seen={})
+            state_row.state = _dump_json(state)
+            # Retain this empty lock row even with no leases. Removing it could
+            # race a worker between its INSERT ON CONFLICT and SELECT FOR UPDATE.
             if row:
                 await s.delete(row)
                 return True
             return False
 
     async def get_next_available_credential(
-        self, model_name: Optional[str] = None
+        self, model_name: Optional[str] = None, exclude_emails=None
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
         """随机获取一个可用凭证（负载均衡 + 模型家族级冷却过滤），返回 (email, credential)"""
         current_time = time.time()
@@ -423,6 +453,7 @@ class Database:
                 await s.scalars(
                     select(AntigravityCredential)
                     .where(AntigravityCredential.disabled == False)  # noqa: E712
+                    .where(AntigravityCredential.email.not_in(exclude_emails or []))
                     .order_by(func.random())
                 )
             ).all()
@@ -659,6 +690,16 @@ class Database:
 
     # ---------- 模型级冷却 ----------
 
+    @asynccontextmanager
+    async def _locked_credential_update(self, email):
+        """Serialize quota read/modify/write with manual cooldown resets."""
+        async with self.session() as session:
+            if self.backend_type == "sqlite":
+                await session.execute(text("BEGIN IMMEDIATE"))
+            row = await session.scalar(select(AntigravityCredential).where(
+                AntigravityCredential.email == email).with_for_update())
+            yield row
+
     async def set_model_cooldown(
         self,
         email: str,
@@ -667,10 +708,7 @@ class Database:
     ) -> bool:
         """设置/清除模型的冷却时间（按家族分组：argon / gemini / claude_gpt / 其他原名）"""
         cd_group = get_cooldown_group(model_name)
-        async with self.session() as s:
-            row = await s.scalar(
-                select(AntigravityCredential).where(AntigravityCredential.email == email)
-            )
+        async with self._locked_credential_update(email) as row:
             if not row:
                 return False
             cooldowns = _load_json(row.model_cooldowns, {})
@@ -684,10 +722,7 @@ class Database:
 
     async def clear_all_model_cooldowns(self, email: str) -> bool:
         """清除某凭证的所有模型冷却"""
-        async with self.session() as s:
-            row = await s.scalar(
-                select(AntigravityCredential).where(AntigravityCredential.email == email)
-            )
+        async with self._locked_credential_update(email) as row:
             if not row:
                 return False
             row.model_cooldowns = "{}"
@@ -698,10 +733,7 @@ class Database:
         self, email: str, model_name: Optional[str] = None
     ) -> None:
         """成功调用后的条件写入（清除错误 + 该模型家族的CD）"""
-        async with self.session() as s:
-            row = await s.scalar(
-                select(AntigravityCredential).where(AntigravityCredential.email == email)
-            )
+        async with self._locked_credential_update(email) as row:
             if not row:
                 return
             changed = False

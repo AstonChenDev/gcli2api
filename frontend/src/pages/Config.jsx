@@ -1,10 +1,32 @@
 import { Loader2, Plus, RefreshCw, Save, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
 
 const CONFIG_GROUPS = [
+  {
+    title: "499 等待异常保护",
+    fields: [
+      { key: "cooldown_499_mode", label: "运行模式", type: "select", options: [
+        { value: "off", label: "关闭" }, { value: "observe", label: "仅观察（默认）" },
+        { value: "enforce", label: "执行冷却" },
+      ], note: "499 不一定是限流。仅统计等待超过下方时间、上游没有任何事件、下游没有输出的客户端断开。仅观察记录触发情况，不限制派发。" },
+      { key: "cooldown_499_threshold", label: "连续异常触发次数", type: "number", min: 1, max: 100, step: 1, note: "1–100 次；窗口内符合条件的异常累计，完整成功会清零。同一请求、同一账号只计一次。" },
+      { key: "cooldown_499_window_seconds", label: "统计窗口（秒）", type: "number", min: 1, max: 86400, step: 1, note: "1–86400 秒，默认 300 秒。" },
+      { key: "cooldown_499_min_wait_seconds", label: "最低等待时间（秒）", type: "number", min: 0, max: 3600, step: 1, note: "0–3600 秒，默认 90 秒。低于此值的客户端断开不触发保护；保存后用于新派发请求。" },
+      { key: "cooldown_499_duration_seconds", label: "闲置冷却时长（秒）", type: "number", min: 1, max: 86400, step: 1, note: "1–86400 秒，默认 1200 秒。触发后停止新派发，保留在途请求；全部结束后开始计时。已触发的冷却保留原时长。20 分钟是否恢复仍需实测。" },
+      { key: "cooldown_499_scope", label: "冷却范围", type: "select", options: [
+        { value: "account", label: "整个账号（默认）" }, { value: "family", label: "当前模型家族" },
+      ], note: "账号范围覆盖本服务的全部生成请求；模型家族范围只限制同一家族。改变模式或范围会清空保护历史并重新统计，已在途请求继续完成。" },
+      { key: "cooldown_499_custom_families_enabled", label: "启用自定义模型家族", type: "bool", showIf: cfg => cfg.cooldown_499_scope === "family", note: "关闭时沿用默认分组：Argon、其他 Gemini、Claude/GPT。开启后按下方规则划分，仅影响 499 保护。修改分组开关、规则或未匹配处理会重新统计保护历史，在途请求继续完成。" },
+      { key: "cooldown_499_family_fallback", label: "未匹配模型的处理", type: "select", showIf: cfg => cfg.cooldown_499_scope === "family" && cfg.cooldown_499_custom_families_enabled, options: [
+        { value: "default", label: "沿用默认家族" }, { value: "model", label: "每个模型单独冷却" },
+      ], note: "自定义组独立于默认家族，即使同名也不会合并。想让所有 Argon 变体共用一组，可填写 *argon*。" },
+      { key: "cooldown_499_family_rules", label: "自定义分组规则", type: "families", showIf: cfg => cfg.cooldown_499_scope === "family" && cfg.cooldown_499_custom_families_enabled, note: "最多 32 组，每组最多 32 条匹配规则。模型名不区分大小写，支持完整名称、*（任意字符）和 ?（一个字符）。多组命中时，以排在最前面的组为准；更具体的规则应放在前面。" },
+      { key: "cooldown_499_probe_concurrency", label: "恢复试探并发数", type: "number", min: 1, max: 32, step: 1, note: "1–32，默认 1。冷却结束后允许有限的自然请求试探；完整成功恢复派发，符合条件的异常再次冷却。全部账号不可用时返回 503 和 Retry-After。设置保存后对所有共享同一数据库的进程生效。" },
+    ],
+  },
   {
     title: "服务器配置",
     fields: [
@@ -130,6 +152,46 @@ export default function Config() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState(null);
+  const [cooldownStatus, setCooldownStatus] = useState(null);
+  const [familyModel, setFamilyModel] = useState("");
+  const [familyPreview, setFamilyPreview] = useState(null);
+  const [familyPreviewBusy, setFamilyPreviewBusy] = useState(false);
+  const familyDraftVersion = useRef(0);
+
+  const clearFamilyPreview = () => {
+    familyDraftVersion.current += 1;
+    setFamilyPreview(null);
+  };
+
+  const preparedConfig = () => ({
+    ...config,
+    cooldown_499_family_rules: (config.cooldown_499_family_rules || []).map(rule => ({
+      name: rule.name.trim(), patterns: rule.patterns.map(p => p.trim()).filter(Boolean),
+    })),
+  });
+
+  const previewFamily = async () => {
+    const version = familyDraftVersion.current;
+    setFamilyPreviewBusy(true);
+    try {
+      const draft = Object.fromEntries(Object.entries(preparedConfig()).filter(([key]) => key.startsWith("cooldown_499_")));
+      const res = await api.post("/config/cooldown499/resolve", { model: familyModel, config: draft });
+      if (version === familyDraftVersion.current) setFamilyPreview({ text: `匹配结果：${res.data.label}（按当前编辑内容，尚未保存的修改也会参与预览）` });
+    } catch (err) {
+      if (version === familyDraftVersion.current) setFamilyPreview({ error: true, text: err.response?.data?.detail || "无法预览分组" });
+    } finally {
+      setFamilyPreviewBusy(false);
+    }
+  };
+
+  const loadCooldownStatus = async () => {
+    try {
+      const res = await api.get("/config/cooldown499/status");
+      setCooldownStatus(res.data);
+    } catch {
+      setCooldownStatus(null);
+    }
+  };
 
   useEffect(() => {
     loadConfig();
@@ -140,7 +202,9 @@ export default function Config() {
     try {
       const res = await api.get("/config/get");
       setConfig(res.data.config || {});
+      clearFamilyPreview();
       setEnvLocked(res.data.env_locked || []);
+      await loadCooldownStatus();
       if (!silent) setMessage(null);
     } catch (err) {
       setMessage({ type: "error", text: err.response?.data?.detail || "加载配置失败" });
@@ -152,7 +216,7 @@ export default function Config() {
   const saveConfig = async () => {
     setSaving(true);
     try {
-      const res = await api.post("/config/save", { config });
+      const res = await api.post("/config/save", { config: preparedConfig() });
       setMessage({ type: "success", text: res.data.message || "配置保存成功" });
       // 静默刷新配置（不清空刚显示的弹窗消息）
       await loadConfig({ silent: true });
@@ -164,6 +228,7 @@ export default function Config() {
   };
 
   const setField = (key, value) => {
+    if (key.startsWith("cooldown_499_")) clearFamilyPreview();
     setConfig((prev) => ({ ...prev, [key]: value }));
   };
 
@@ -271,6 +336,48 @@ export default function Config() {
           placeholder={field.placeholder}
           className="w-full sm:w-64 px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder-slate-400 font-mono"
         />
+      );
+    }
+
+    if (field.type === "families") {
+      const groups = Array.isArray(value) ? value : [];
+      const updateGroup = (index, key, next) => setField(field.key, groups.map((group, i) => i === index ? { ...group, [key]: next } : group));
+      const moveGroup = (index, offset) => {
+        const next = [...groups];
+        [next[index], next[index + offset]] = [next[index + offset], next[index]];
+        setField(field.key, next);
+      };
+      return (
+        <div className="space-y-3">
+          {groups.length === 0 && <p className="text-sm text-slate-500">尚未添加分组，所有模型使用“未匹配模型的处理”。</p>}
+          {groups.map((group, index) => (
+            <div key={index} className="border border-slate-300 rounded-lg p-3 space-y-2">
+              <div className="flex flex-wrap gap-2 items-center">
+                <span className="text-sm text-slate-500">第 {index + 1} 组</span>
+                <input aria-label={`第 ${index + 1} 组名称`} value={group.name} maxLength={64}
+                  onChange={e => updateGroup(index, "name", e.target.value)} placeholder="分组名称，如 Argon 高档"
+                  className="flex-1 min-w-40 px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm" />
+                <button type="button" aria-label={`上移第 ${index + 1} 组`} disabled={index === 0} onClick={() => moveGroup(index, -1)} className="btn btn-secondary text-xs disabled:opacity-40">上移</button>
+                <button type="button" aria-label={`下移第 ${index + 1} 组`} disabled={index === groups.length - 1} onClick={() => moveGroup(index, 1)} className="btn btn-secondary text-xs disabled:opacity-40">下移</button>
+                <button type="button" aria-label={`删除第 ${index + 1} 组`} onClick={() => setField(field.key, groups.filter((_, i) => i !== index))} className="btn btn-secondary text-xs">删除</button>
+              </div>
+              <textarea aria-label={`第 ${index + 1} 组模型规则`} rows={3} value={group.patterns.join("\n")}
+                onChange={e => updateGroup(index, "patterns", e.target.value.split("\n"))}
+                placeholder={"每行一条，例如：\ngemini-4-argon-high\ngemini-4-argon-high-*"}
+                className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm font-mono" />
+            </div>
+          ))}
+          <button type="button" disabled={groups.length >= 32} onClick={() => setField(field.key, [...groups, { name: "", patterns: [] }])} className="btn btn-secondary text-xs disabled:opacity-40">添加模型家族</button>
+          <div className="border-t border-slate-200 pt-3 space-y-2">
+            <div className="flex flex-wrap gap-2">
+              <input aria-label="预览分组的模型名" value={familyModel} maxLength={128} onChange={e => { setFamilyModel(e.target.value); clearFamilyPreview(); }}
+                placeholder="输入实际调用的模型名，检查归属" className="flex-1 min-w-40 px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm" />
+              <button type="button" disabled={familyPreviewBusy || !familyModel.trim()} onClick={previewFamily} className="btn btn-secondary text-xs disabled:opacity-40">{familyPreviewBusy ? "检查中…" : "预览匹配"}</button>
+            </div>
+            <p className="text-xs text-slate-500">预览仅检查分组，不保存设置，也不发送生成请求。模型名应使用思考等级匹配、模型名复写后的实际名称。</p>
+            {familyPreview && <p role="status" className={`text-sm ${familyPreview.error ? "text-red-700" : "text-green-700"}`}>{familyPreview.text}</p>}
+          </div>
+        </div>
       );
     }
 
@@ -412,6 +519,25 @@ export default function Config() {
               <h3 className="text-base font-semibold text-purple-700 mb-4 border-b border-slate-200 pb-3">
                 {group.title}
               </h3>
+
+              {group.title === "499 等待异常保护" && (
+                <div className="mb-4 text-sm space-y-2">
+                  <button type="button" className="btn btn-secondary text-xs" onClick={loadCooldownStatus}>刷新保护状态</button>
+                  <p className="text-slate-600">{cooldownStatus ? `已保存模式：${{off: "关闭", observe: "仅观察", enforce: "执行冷却"}[cooldownStatus.mode]}；下方为最近一次刷新的状态。` : "保护状态暂时无法读取"}</p>
+                  {cooldownStatus?.items.length === 0 && <p className="text-slate-500">暂无符合触发条件的异常记录。</p>}
+                  {!!cooldownStatus?.items.length && <div className="overflow-x-auto"><table className="w-full text-left text-xs">
+                    <thead><tr>{["账号 / 范围", "状态", "窗口内异常", "在途请求", "冷却结束", "触发 / 停发机会"].map(label => <th className="p-2" key={label}>{label}</th>)}</tr></thead>
+                    <tbody>{cooldownStatus.items.map(item => <tr key={`${item.email}/${item.group}`} className="border-t border-slate-200">
+                      <td className="p-2">{item.email} / {item.group_label || (item.group === "*" ? "整个账号" : item.group)}</td>
+                      <td className="p-2">{{closed: "正常", draining: "等待在途结束", cooling: "冷却中", probe: "等待恢复试探"}[item.phase]}</td>
+                      <td className="p-2">{item.failure_count}</td><td className="p-2">{item.active}</td>
+                      <td className="p-2">{item.until ? new Date(item.until * 1000).toLocaleString() : "—"}</td>
+                      <td className="p-2">{item.trips} / {item.would_block}</td>
+                    </tr>)}</tbody>
+                  </table></div>}
+                  <p className="text-xs text-slate-500">仅观察模式显示模拟保护状态，实际请求继续派发。其他服务或不同数据库上的调用不受此处控制。</p>
+                </div>
+              )}
 
               {group.title === "端点配置" && (
                 <div className="flex flex-wrap gap-2 mb-4">

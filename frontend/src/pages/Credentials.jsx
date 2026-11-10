@@ -51,6 +51,24 @@ export default function Credentials() {
   const [selected, setSelected] = useState(new Set());
   const [message, setMessage] = useState(null);
   const [errorModal, setErrorModal] = useState(null);
+  const [clearTargets, setClearTargets] = useState(null);
+  const [clearScope, setClearScope] = useState("all");
+  const [clearing, setClearing] = useState(false);
+  const [clearError, setClearError] = useState("");
+  const openClearCooldown = (emails) => {
+    setClearTargets(emails); setClearScope("all"); setClearError("");
+  };
+  const clearCooldown = async (event) => {
+    event.preventDefault(); setClearing(true); setClearError("");
+    try {
+      const { data } = await api.post("/creds/clear-cooldown", { emails: clearTargets, scope: clearScope });
+      setClearTargets(null);
+      showMessage(data.errors?.length ? "error" : "success", data.message);
+      await fetchCreds();
+    } catch (err) {
+      setClearError(err.response?.data?.detail || "清除 CD 失败");
+    } finally { setClearing(false); }
+  };
   const [busyFiles, setBusyFiles] = useState(new Set());
   const [now, setNow] = useState(Date.now() / 1000);
   // 额度预览相关状态
@@ -96,6 +114,10 @@ export default function Credentials() {
       setTotal(res.data.total);
       setStats(res.data.stats || { total: 0, normal: 0, disabled: 0 });
       setSelected(new Set());
+      // Clearing CD can remove the last page from the filtered result.
+      // Clamp the page so the effect reloads the remaining credentials.
+      const lastPage = Math.max(1, Math.ceil(res.data.total / pageSize));
+      if (page > lastPage) setPage(lastPage);
     } catch (err) {
       showMessage("error", err.response?.data?.detail || "加载凭证失败");
     } finally {
@@ -484,9 +506,9 @@ export default function Credentials() {
           }}
           className="w-full sm:w-32"
           options={[
-            { value: "all", label: "冷却: 全部" },
-            { value: "in_cooldown", label: "CD中" },
-            { value: "no_cooldown", label: "未CD" },
+            { value: "all", label: "配额CD: 全部" },
+            { value: "in_cooldown", label: "配额CD中" },
+            { value: "no_cooldown", label: "无配额CD" },
           ]}
         />
         <Select
@@ -538,6 +560,7 @@ export default function Credentials() {
           <div className="flex flex-wrap gap-2">
             <button onClick={batchTest} disabled={!selected.size || !testModel.trim() || busyFiles.has("__batch__")} className="btn btn-primary text-xs px-3 py-1.5 disabled:opacity-40">批量测试</button>
             <button onClick={downloadSelected} disabled={!selected.size || busyFiles.has("__batch__")} className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">导出选中</button>
+            <button onClick={() => openClearCooldown([...selected])} disabled={!selected.size || busyFiles.has("__batch__")} className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">批量清除 CD</button>
             <button
               onClick={() => doBatchAction("enable")}
               disabled={selected.size === 0 || busyFiles.has("__batch__")}
@@ -583,7 +606,7 @@ export default function Credentials() {
         </div>
       ) : items.length === 0 ? (
         <div className="card text-center py-12 text-slate-500 text-sm">
-          没有凭证。请先通过 OAuth 认证或批量导入添加凭证。
+          {stats.total > 0 ? "没有符合当前筛选条件的凭证。" : "没有凭证。请先通过 OAuth 认证或批量导入添加凭证。"}
         </div>
       ) : (
         <div className="grid gap-3 sm:gap-4 grid-cols-1 md:grid-cols-2 xl:grid-cols-3">
@@ -637,11 +660,11 @@ export default function Credentials() {
                   <div className="flex items-center justify-between gap-2">
                     {cooldownText ? (
                       <span className="text-cyan-700 flex items-center gap-1">
-                        <Snowflake size={12} /> CD {cooldownText}
+                        <Snowflake size={12} /> 配额CD {cooldownText}
                       </span>
                     ) : (
                       <span className="text-slate-500 flex items-center gap-1">
-                        <Clock size={12} /> 无CD
+                        <Clock size={12} /> 无配额CD
                       </span>
                     )}
                     {cred.error_codes?.length ? (
@@ -708,6 +731,11 @@ export default function Credentials() {
                       >
                         <Download size={13} /> 导出
                       </button>
+                      <button onClick={() => openClearCooldown([cred.email])}
+                        className="text-xs px-2 py-1.5 rounded-lg bg-cyan-600/10 hover:bg-cyan-600/20 text-cyan-700 flex items-center justify-center gap-1"
+                        title="清除该凭证的冷却">
+                        <Snowflake size={13} /> 清除 CD
+                      </button>
                       <button
                         onClick={() =>
                           doAction(cred.email, cred.disabled ? "enable" : "disable")
@@ -766,6 +794,25 @@ export default function Credentials() {
       )}
 
 
+      {clearTargets && <Modal title="清除凭证 CD" onClose={() => { if (!clearing) setClearTargets(null); }}>
+        <form onSubmit={clearCooldown} className="space-y-3">
+          <p>将清除以下 {clearTargets.length} 个凭证的冷却：</p>
+          <div className="max-h-28 overflow-auto text-xs text-slate-600">{clearTargets.map(email => <div key={email}>{email}</div>)}</div>
+          <label className="block space-y-1">
+            <span>清除类型</span>
+            <select aria-label="清除类型" value={clearScope} disabled={clearing} onChange={e => setClearScope(e.target.value)} className="input w-full">
+              <option value="all">全部：配额冷却 + 499 保护冷却</option>
+              <option value="quota">仅配额冷却（所有模型家族）</option>
+              <option value="protection">仅 499 保护冷却（账号及所有家族）</option>
+            </select>
+          </label>
+          <p className="text-xs text-slate-600">清除所选类型下的全部家族冷却；499 保护同时重置本轮失败计数。正在进行的请求继续运行，禁用状态不变。</p>
+          {clearScope === "quota" && <p className="text-xs text-slate-600">499 保护仍可能限制派发；可在“配置管理 → 499 等待异常保护”查看其状态。</p>}
+          <p className="text-xs text-amber-700">此操作仅解除本服务的冷却，不会重置上游额度；再次触发限制时会重新进入冷却。</p>
+          {clearError && <p role="alert" className="text-red-700">{typeof clearError === "string" ? clearError : "清除 CD 失败"}</p>}
+          <button disabled={clearing} className="btn btn-primary">{clearing ? "清除中…" : "确认清除"}</button>
+        </form>
+      </Modal>}
       {/* 额度弹窗 */}
       {noteCredential && <Modal title="凭证备注" onClose={() => { if (!noteSaving) setNoteCredential(null); }}>
         <form onSubmit={saveNote} className="space-y-3">

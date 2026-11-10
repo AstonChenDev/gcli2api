@@ -14,7 +14,7 @@ from contextlib import aclosing
 import httpx
 from anyio import CancelScope, create_task_group
 from urllib.parse import quote
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Response, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -45,6 +45,8 @@ from src.utils import (
     ANTIGRAVITY_CLIENT_SECRET,
 )
 from src.api.antigravity import fetch_quota_info, build_antigravity_headers
+from src.credential_cooldown import acquire_test_dispatch, CooldownStore, PoolCooling
+from anyio import CancelScope
 from src.google_oauth_api import (
     Credentials,
     fetch_project_id_and_tier,
@@ -59,6 +61,36 @@ router = APIRouter(prefix="/creds", tags=["credentials"])
 
 class CredentialNoteRequest(BaseModel):
     note: str = Field(max_length=1000, strict=True)
+
+
+class ClearCooldownRequest(BaseModel):
+    emails: List[str] = Field(min_length=1, max_length=1000)
+    scope: Literal["all", "quota", "protection"] = "all"
+
+
+@router.post("/clear-cooldown")
+async def clear_credential_cooldowns(request: ClearCooldownRequest,
+                                   token: str = Depends(verify_panel_token)):
+    emails = list(dict.fromkeys(request.emails))
+    if any(not email.strip() or len(email) > 320 for email in emails):
+        raise HTTPException(422, "凭证标识不能为空或超过 320 字符")
+    store = CooldownStore(await get_database())
+    succeeded, errors = [], []
+    for email in emails:
+        try:
+            if await store.clear(email, request.scope):
+                succeeded.append(email)
+            else:
+                errors.append(f"{email}: 凭证不存在")
+        except Exception as exc:
+            log.error(f"清除凭证 CD 失败 ({type(exc).__name__})")
+            errors.append(f"{email}: 清除失败，请查看服务日志")
+    label = {"all": "全部冷却", "quota": "配额冷却", "protection": "499 保护冷却"}[request.scope]
+    message = f"已清除{label}：成功 {len(succeeded)}/{len(emails)} 个凭证"
+    if errors:
+        message += "\n" + "\n".join(errors)
+    return {"scope": request.scope, "success_count": len(succeeded),
+            "total_count": len(emails), "errors": errors, "message": message}
 
 
 @router.patch("/note/{email}")
@@ -891,6 +923,7 @@ async def test_credential(
         - 429: 凭证被限流但有效
         - 其他: 凭证失败（返回实际错误码）
     """
+    lease = None
     try:
         database = await get_database()
 
@@ -925,6 +958,10 @@ async def test_credential(
         api_base_url = await get_antigravity_api_url()
         headers = build_antigravity_headers(access_token)
 
+        try:
+            lease = await acquire_test_dispatch(email, test_model)
+        except PoolCooling as exc:
+            raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": str(exc.retry_after)})
         response = await post_async(
             url=f"{api_base_url}/v1internal:generateContent",
             json={
@@ -951,6 +988,7 @@ async def test_credential(
                 status_code = classified.status_code
                 response = httpx.Response(status_code, content=classified.body)
 
+        await lease.result(success=status_code == 200)
         if status_code == 200 or status_code == 429:
             log.info(f"凭证测试成功: {email} (status={status_code})")
             if status_code == 200:
@@ -1000,3 +1038,8 @@ async def test_credential(
     except Exception as e:
         log.error(f"测试凭证失败 {email}: {e}")
         raise HTTPException(status_code=500, detail=f"测试失败: {str(e)}")
+    finally:
+        if lease:
+            with CancelScope(shield=True):
+                await lease.result()
+                await lease.close()

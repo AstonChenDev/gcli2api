@@ -36,6 +36,7 @@ def _reset_sticky() -> None:
 async def get_valid_credential(
     model_name: Optional[str] = None,
     session_key: Optional[str] = None,
+    exclude_emails=None,
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """
     获取可用凭证：按凭证选择模式选取，自动跳过禁用/冷却凭证。
@@ -50,13 +51,14 @@ async def get_valid_credential(
         (email, credential_data) 或 None
     """
     global _sticky_email
+    exclude_emails = set(exclude_emails or ())
     database = await get_database()
     mode = await get_credential_select_mode()
 
     # cache 模式：先查会话绑定
     if mode == "cache" and session_key:
         bound_email = await session_cache.get_session_binding(session_key)
-        if bound_email:
+        if bound_email and bound_email not in exclude_emails:
             result = await database.get_available_credential_by_email(
                 bound_email, model_name=model_name
             )
@@ -73,7 +75,7 @@ async def get_valid_credential(
                 await session_cache.delete_session_binding(session_key)
 
     # sticky 模式：优先当前粘性凭证
-    if mode == "sticky" and _sticky_email:
+    if mode == "sticky" and _sticky_email and _sticky_email not in exclude_emails:
         result = await database.get_available_credential_by_email(
             _sticky_email, model_name=model_name
         )
@@ -87,7 +89,7 @@ async def get_valid_credential(
     # 通用随机选取（random 模式 / cache 未命中 / sticky 无可用粘性凭证）
     max_retries = 3
     for attempt in range(max_retries):
-        result = await database.get_next_available_credential(model_name=model_name)
+        result = await database.get_next_available_credential(model_name=model_name, exclude_emails=exclude_emails)
 
         if not result:
             if attempt == 0:
@@ -105,6 +107,7 @@ async def get_valid_credential(
             log.warning(
                 f"Token刷新失败，尝试下一个凭证: {email} (attempt={attempt + 1}/{max_retries})"
             )
+            exclude_emails.add(email)
             continue
 
         await _after_picked(mode, email, session_key)

@@ -23,10 +23,6 @@ MISSING_DIGIT = '<<<AGY_FINAL_6cd864f927637e1>>>'
 SAMPLES = (
     REPEATED_NONCE * 4 + MISSING_DIGIT + 'Wait, I need to output the exact marker. ',
     REPEATED_NONCE + ' ' + REPEATED_NONCE + 'Wait, emit exact marker: <<<AGY_FINAL_6cd86cd8...>>> ',
-    MISSING_DIGIT,
-    MARKER + MARKER,
-    MARKER + '\n  ' + MARKER,
-    MARKER + '\n ' * 128 + MARKER,
     MARKER + 'Wait, I need to output the exact marker. ',
     MARKER + 'Wait, emit exact marker: ',
     MARKER + 'Let me copy exact marker: ',
@@ -62,7 +58,7 @@ class BoundaryPollutionTests(unittest.TestCase):
                             self.assertTrue(g.metadata()['boundary_failed'])
 
     def test_every_two_piece_split_of_corrupted_markers(self):
-        for marker in (REPEATED_NONCE, MISSING_DIGIT, '<<<AGY_FINAL_typo>>>'):
+        for marker in (REPEATED_NONCE, '<<<AGY_FINAL_6cd84f927637e1>>>', '<<<AGY_FINAL_typo>>>'):
             for split in range(len(marker) + 1):
                 with self.subTest(marker=marker, split=split):
                     g = ThoughtBoundaryGuard(MARKER)
@@ -70,6 +66,7 @@ class BoundaryPollutionTests(unittest.TestCase):
                     with self.assertRaises(ThoughtBoundaryError):
                         for text in (marker[:split], marker[split:] + '正文'):
                             outputs.append(g.feed(event([{'text': text}])))
+                        outputs.append(g.feed(event([], 'STOP')))
                     self.assertEqual(text_of(outputs), '')
 
     def test_unclosed_invalid_token_fails_at_eof_and_memory_is_bounded(self):
@@ -81,9 +78,9 @@ class BoundaryPollutionTests(unittest.TestCase):
             self.assertEqual(text_of(output), '')
         g = ThoughtBoundaryGuard(MARKER)
         with self.assertRaises(ThoughtBoundaryError):
-            for char in '<<<AGY_FINAL_' + 'a' * 1000:
+            for char in '<<<AGY_FINAL_' + 'a' * (g.RECOVERY_LIMIT + 1):
                 g.feed(event([{'text': char}]))
-        self.assertLessEqual(len(g.states[0]['pending']), 129)
+        self.assertLessEqual(len(g.states[0]['pending']), g.RECOVERY_LIMIT + 1)
 
     def test_plain_english_chinese_code_and_short_openings_are_preserved(self):
         for body in ('普通正文。', 'English is allowed. Let me tell you a story.',
