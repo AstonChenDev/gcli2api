@@ -52,6 +52,10 @@ def _validate_refresh_token(value: Any) -> Tuple[Optional[str], Optional[str], O
         return None, "invalid_refresh_token", "Refresh Token 长度无效"
     if any(character.isspace() or ord(character) < 32 for character in token):
         return None, "invalid_refresh_token", "Refresh Token 不能包含空白或控制字符"
+    try:
+        token.encode("utf-8")
+    except UnicodeEncodeError:
+        return None, "invalid_refresh_token", "Refresh Token 包含无效的 Unicode 字符"
     return token, None, None
 
 

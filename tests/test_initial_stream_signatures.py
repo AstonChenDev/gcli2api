@@ -9,10 +9,9 @@ from fastapi import Response
 import test_custom_audit
 from src.api import antigravity as api
 from src.router.stream_passthrough import build_streaming_response_or_error
-from test_thought_boundary import event, decode, text_of
+from stream_fixtures import event, decode, text_of
 
 BODY = {'model': 'gemini-4-argon-medium', 'request': {'contents': []}}
-MARKER = 'BOUNDARY'
 
 
 def parts_of(chunks):
@@ -31,33 +30,30 @@ class InitialSignatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_index[0], [{'text': 'candidate zero'}])
         self.assertEqual(by_index[1], [{'text': '', 'thoughtSignature': 'candidate-one-signature'}])
 
-    async def test_initial_signature_preserved_before_buffered_answer_with_and_without_guard(self):
-        for guard_enabled in (False, True):
-            self.saved.reset_mock()
-            signature = {'text': '', 'thought': True, 'thoughtSignature': 'initial-signature'}
-            async def upstream(**kwargs):
-                yield event([signature])
-                yield event([{'text': (MARKER if guard_enabled else '') + 'answer'}])
-                yield event([], 'STOP')
-            with patch.object(api, 'stream_post_async', upstream), patch.object(
-                    api, 'prepare_thought_boundary', lambda m, r: (r, MARKER if guard_enabled else None)):
-                out = [c async for c in api.stream_request(BODY)]
-            self.assertEqual(parts_of(out), [signature, {'text': 'answer'}])
-            self.assertEqual(text_of(out), 'answer')
-            self.assertTrue(self.saved.call_args.args[0]['success'])
+    async def test_initial_signature_preserved_before_answer(self):
+        self.saved.reset_mock()
+        signature = {'text': '', 'thought': True, 'thoughtSignature': 'initial-signature'}
+        async def upstream(**kwargs):
+            yield event([signature])
+            yield event([{'text': 'answer'}])
+            yield event([], 'STOP')
+        with patch.object(api, 'stream_post_async', upstream):
+            out = [c async for c in api.stream_request(BODY)]
+        self.assertEqual(parts_of(out), [signature, {'text': 'answer'}])
+        self.assertEqual(text_of(out), 'answer')
+        self.assertTrue(self.saved.call_args.args[0]['success'])
 
-    async def test_signature_only_eof_is_still_empty_and_thought_optout_is_respected(self):
+    async def test_signature_only_eof_is_empty_but_returned_signatures_are_preserved(self):
         for has_answer in (False, True):
             self.saved.reset_mock()
             async def upstream(**kwargs):
                 yield event([{'text': '', 'thought': True, 'thoughtSignature': 'hidden-signature'}])
                 if has_answer:
-                    yield event([{'text': MARKER + 'answer'}], 'STOP')
-            with patch.object(api, 'stream_post_async', upstream), patch.object(
-                    api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)):
+                    yield event([{'text': 'answer'}], 'STOP')
+            with patch.object(api, 'stream_post_async', upstream):
                 out = [c async for c in api.stream_request({'model': BODY['model'], 'request': {
                     'contents': [], 'generationConfig': {'thinkingConfig': {'includeThoughts': False}}}})]
-            self.assertNotIn('hidden-signature', str(parts_of(out)))
+            self.assertEqual('hidden-signature' in str(parts_of(out)), has_answer)
             self.assertEqual(text_of(out), 'answer' if has_answer else '')
             self.assertEqual(self.saved.call_args.args[0]['status_code'], 200 if has_answer else 502)
         # Visible signatures alone also cannot count as output or leak a 200.
@@ -74,9 +70,8 @@ class InitialSignatureTests(unittest.IsolatedAsyncioTestCase):
         async def upstream(**kwargs):
             yield event([{'text': '', 'thought': True, 'thoughtSignature': 'initial-signature'}])
             entered.set(); await release.wait()
-            yield event([{'text': MARKER + 'answer'}], 'STOP')
-        with patch.object(api, 'stream_post_async', upstream), patch.object(
-                api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)):
+            yield event([{'text': 'answer'}], 'STOP')
+        with patch.object(api, 'stream_post_async', upstream):
             task = asyncio.create_task(build_streaming_response_or_error(api.stream_request(BODY)))
             await entered.wait(); await asyncio.sleep(0)
             self.assertFalse(task.done())
@@ -99,10 +94,9 @@ class InitialSignatureTests(unittest.IsolatedAsyncioTestCase):
             if calls == 1:
                 yield Response(status_code=503, content='{"error":{"code":503}}')
             else:
-                yield event([{'text': MARKER + 'answer'}], 'STOP')
+                yield event([{'text': 'answer'}], 'STOP')
         with ExitStack() as stack:
             stack.enter_context(patch.object(api, 'stream_post_async', upstream))
-            stack.enter_context(patch.object(api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)))
             stack.enter_context(patch.object(api, 'get_retry_config', AsyncMock(return_value={
                 'retry_enabled': True, 'max_retries': 1, 'retry_interval': 0})))
             stack.enter_context(patch.object(api, 'record_api_call_error', AsyncMock()))

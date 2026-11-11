@@ -5,9 +5,11 @@ Antigravity API Client - Handles communication with Google's Antigravity API
 
 import asyncio
 import copy
+import httpx
 import hashlib
 import json
 import time
+import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Callable, Tuple
@@ -35,10 +37,15 @@ from src.stream_metadata import StreamMetadata, StreamCompletion
 from src.stream_events import inspect_line, stream_error
 from src.stream_delivery import current_delivery
 from src.converter.request_fields import normalize_gemini_request_fields
+from src import usage_log
 from src.usage_log import extract_response_id
-from src.thought_boundary import (prepare_thought_boundary, ThoughtBoundaryGuard,
-                                 ThoughtBoundaryError, POLLUTION_ERROR_CODE)
 from src.utils import ANTIGRAVITY_USER_AGENT
+from src.session_cache import derive_session_key
+from src.usage_log import (
+    extract_usage_tokens,
+    new_request_id,
+)
+from src.request_body_log import record_request_body
 
 # 导入共同的基础功能
 from src.api.utils import (
@@ -129,9 +136,6 @@ async def wrap_cli_request(
     inner = copy.deepcopy(normalize_gemini_request_fields(gemini_request))
     first_user_text = _extract_first_user_text(inner)
 
-    # 移除 safetySettings（CLI 不发送）
-    inner.pop("safetySettings", None)
-
     # 注入 sessionId
     session_id = str(inner.get("sessionId") or "").strip()
     if not session_id:
@@ -146,10 +150,12 @@ async def wrap_cli_request(
     # 注入 labels
     inner["labels"] = _build_labels(model, session_id, 1)
 
-    # toolConfig 默认 VALIDATED
-    tool_config = inner.get("toolConfig") or {}
-    func_config = tool_config.get("functionCallingConfig") or {}
+    # toolConfig 默认 VALIDATED（重建这两层，不污染调用方的 dict）
+    src_tool_config = inner.get("toolConfig") or {}
+    src_func_config = src_tool_config.get("functionCallingConfig") or {}
+    func_config = dict(src_func_config)
     func_config["mode"] = "VALIDATED"
+    tool_config = dict(src_tool_config)
     tool_config["functionCallingConfig"] = func_config
     inner["toolConfig"] = tool_config
 
@@ -288,8 +294,6 @@ def _derive_session_key(model_name: str, body: Dict[str, Any]) -> Optional[str]:
     body 格式: {"model": ..., "request": <Gemini 规范化请求>}
     hash(模型 + systemInstruction 或 第一条 user 消息) —— 后者必须是经过所有格式处理后的内容
     """
-    from src.session_cache import derive_session_key
-
     inner = body.get("request") if isinstance(body.get("request"), dict) else body
     return derive_session_key(model_name, inner)
 
@@ -305,8 +309,6 @@ def _base_log_entry(
     model_name: 后端实际使用的真实模型名（映射后）
     log_ctx.client_model: 客户端请求的原始模型名（可能带功能前缀）
     """
-    from src.usage_log import new_request_id
-
     ctx = log_ctx or {}
     return {
         "request_id": ctx.get("request_id") or (current_delivery.get().request_id if current_delivery.get() else new_request_id()),
@@ -338,10 +340,10 @@ async def _record_request_body_detail(
     try:
         if not await get_request_log_enabled():
             return ""
+        if not await usage_log.config.get_usage_log_enabled():
+            return ""
         if not await get_request_log_all_requests() and status_code not in await get_request_log_error_codes():
             return ""
-
-        from src.request_body_log import record_request_body
 
         rel_path = await record_request_body(
             request_id=str(log_entry.get("request_id", "")),
@@ -396,7 +398,6 @@ async def stream_request(
         nonlocal preparation_logged
         if preparation_logged:
             return
-        from src.usage_log import record_usage_log
         disconnected = delivery and delivery.disconnect_source
         status = 499 if disconnected else 500
         message = ("CLIENT_DISCONNECTED_BEFORE_UPSTREAM: 获取凭证或准备请求时客户端断开，尚未调用上游"
@@ -407,7 +408,7 @@ async def stream_request(
                 response_body="", is_stream=True,
                 diagnostics={"upstream_request_started": False},
             )
-            await record_usage_log({**log_entry, "status_code": status, "success": False,
+            await usage_log.record_usage_log({**log_entry, "status_code": status, "success": False,
                 "error_message": message, "use_time": time.time() - log_start_time,
                 "request_log_file": detail})
             preparation_logged = True
@@ -430,13 +431,12 @@ async def stream_request(
             "status_code": 500, "success": False,
             "error_message": "当前无可用凭证", "use_time": time.time() - log_start_time,
         })
-        from src.usage_log import record_usage_log
         with CancelScope(shield=True):
             log_entry["request_log_file"] = await _record_request_body_detail(
                 500, log_entry["error_message"], log_entry,
                 url="", headers=None, payload=body, response_body="", is_stream=True,
             )
-            await record_usage_log(log_entry)
+            await usage_log.record_usage_log(log_entry)
             preparation_logged = True
         yield Response(
             content=json.dumps({"error": "当前无可用凭证"}),
@@ -457,13 +457,12 @@ async def stream_request(
             "status_code": 500, "success": False,
             "error_message": "凭证中没有访问令牌", "use_time": time.time() - log_start_time,
         })
-        from src.usage_log import record_usage_log
         with CancelScope(shield=True):
             log_entry["request_log_file"] = await _record_request_body_detail(
                 500, log_entry["error_message"], log_entry,
                 url="", headers=None, payload=body, response_body="", is_stream=True,
             )
-            await record_usage_log(log_entry)
+            await usage_log.record_usage_log(log_entry)
             preparation_logged = True
         yield Response(
             content=json.dumps({"error": "凭证中没有访问令牌"}),
@@ -479,9 +478,7 @@ async def stream_request(
 
     # 构建 CLI 格式请求体
     inner_request = body.get("request", body)
-    boundary_marker = None
-    if native is False:
-        inner_request, boundary_marker = prepare_thought_boundary(model_name, inner_request)
+    inner_request = normalize_gemini_request_fields(inner_request)
     final_payload, _ = await wrap_cli_request(inner_request, model_name, project_id)
 
     # 3. 调用stream_post_async进行请求
@@ -553,9 +550,6 @@ async def stream_request(
             completion = StreamCompletion((inner_request.get("generationConfig") or {}).get("candidateCount", 1))
             if delivery:
                 delivery.gemini_completion.expected_candidates = completion.expected_candidates
-            thought_guard = (ThoughtBoundaryGuard(boundary_marker,
-                (inner_request.get("generationConfig", {}).get("thinkingConfig") or {}).get("includeThoughts", True))
-                if boundary_marker else None)
 
             async def _write_stream_result(status_code: int, success: bool, error_message: str = "") -> None:
                 """
@@ -570,7 +564,6 @@ async def stream_request(
                         status_code == 499 and delivery and delivery.disconnect_source
                         and not delivery.conversion_error and not upstream_event_seen
                         and not content_delivered and delivery.bytes_sent == 0))
-                from src.usage_log import record_usage_log
 
                 log.info("[UPSTREAM_STREAM_METADATA] " + json.dumps({
                     "request_id": log_entry.get("request_id", ""),
@@ -578,7 +571,6 @@ async def stream_request(
                     "attempt": attempt + 1, "outcome": outcome,
                     "event_counts": event_counts, "content_delivered": content_delivered,
                     **stream_metadata.as_dict(), **completion.as_dict(),
-                    **(thought_guard.metadata() if thought_guard else {}),
                     **(delivery.metadata() if delivery else {}),
                 }, ensure_ascii=True))
 
@@ -599,13 +591,12 @@ async def stream_request(
                     diagnostics={
                         "outcome": outcome, "event_counts": event_counts,
                         **stream_metadata.as_dict(), **completion.as_dict(),
-                        **(thought_guard.metadata() if thought_guard else {}),
                         **(delivery.metadata() if delivery else {}),
                     },
                 )
 
                 # 每条日志记录本次调用实际使用的凭证
-                await record_usage_log({
+                await usage_log.record_usage_log({
                     **attempt_entry,
                     "credential_email": current_file,
                     "status_code": status_code,
@@ -633,7 +624,7 @@ async def stream_request(
                 if delivery:
                     # The response owner finalizes after receive/send has settled.
                     return
-                if completion.complete and meaningful_content and (not thought_guard or thought_guard.complete):
+                if completion.complete and meaningful_content:
                     outcome = "complete"
                     await _log_stream_result(200, True)
                 else:
@@ -670,8 +661,6 @@ async def stream_request(
             def observe_output(chunk):
                 nonlocal content_delivered, meaningful_content, deferred_signature_bytes
                 completion.observe(chunk)
-                if thought_guard and thought_guard.reclassified_chars:
-                    meaningful_content = True
                 if native or inspect_line(chunk)[0] == "content":
                     content_delivered = meaningful_content = True
                 if deferred_signatures and (meaningful_content or content_delivered):
@@ -679,25 +668,6 @@ async def stream_request(
                     deferred_signatures.clear()
                     deferred_signature_bytes = 0
                 return chunk
-
-            def flush_guard():
-                pending = thought_guard.flush() if thought_guard else None
-                if pending is not None:
-                    pending = observe_output(pending)
-                    if not (meaningful_content or content_delivered):
-                        return None
-                return pending
-
-            async def invalid_boundary_response():
-                nonlocal outcome, last_error_body
-                outcome = "invalid_output_boundary"
-                completion.error = True
-                error = stream_error(502, POLLUTION_ERROR_CODE,
-                    "上游正文分隔异常，已停止输出以避免内部标记或分析混入正文")
-                last_error_body = error.body.decode("utf-8")
-                await _log_stream_result(502, False, last_error_body)
-                await _close_upstream_stream(upstream_stream, delivery)
-                return error
 
             upstream_stream = None
             try:
@@ -724,12 +694,11 @@ async def stream_request(
                     delivery.closers.append(upstream_stream.aclose)
                 async for chunk in lease.iterate(upstream_stream):
                     upstream_event_seen = True
-                    # Parse protocol events before applying the text boundary guard.
+                    # Validate protocol events without reclassifying response text.
                     # Comments keep long connections alive but are never content.
                     event_kind = "http_error"
                     if not isinstance(chunk, Response) and not native:
                         stream_metadata.observe(chunk)
-                        from src.usage_log import extract_usage_tokens
                         extracted = extract_usage_tokens(chunk)
                         if extracted:
                             usage_tokens = extracted
@@ -747,11 +716,9 @@ async def stream_request(
                             if event_kind == "metadata":
                                 value = json.loads(chunk[5:])
                                 value = value.get("response", value)
-                                include_thoughts = (inner_request.get("generationConfig", {}).get("thinkingConfig") or {}).get("includeThoughts", True)
                                 for index, candidate in enumerate(value.get("candidates", [])):
                                     for part in (candidate.get("content") or {}).get("parts", []):
-                                        if (not part.get("text") and part.get("thoughtSignature")
-                                                and (include_thoughts or part.get("thought") is not True)):
+                                        if not part.get("text") and part.get("thoughtSignature"):
                                             deferred_signatures.append((candidate.get("index", index), copy.deepcopy(part)))
                                             deferred_signature_bytes += len(json.dumps(part, ensure_ascii=True))
                             if deferred_signature_bytes <= 1024 * 1024:
@@ -759,25 +726,9 @@ async def stream_request(
                             event_kind = "invalid"
                             chunk = stream_error(500, "UPSTREAM_INVALID_EVENT", "上游首段签名元数据超过缓冲限制")
                     if event_kind in ("blocked", "error") and getattr(chunk, "upstream_content", None):
-                        try:
-                            partial = thought_guard.feed(chunk.upstream_content) if thought_guard else chunk.upstream_content
-                        except ThoughtBoundaryError:
-                            # The explicit upstream error is authoritative; keep
-                            # its status/reason while discarding unsafe text.
-                            partial = None
-                        if partial is not None:
-                            partial = observe_output(partial)
-                            if meaningful_content:
-                                yield partial
-                    if isinstance(chunk, Response) or event_kind == "done":
-                        try:
-                            pending = flush_guard()
-                        except ThoughtBoundaryError:
-                            if not isinstance(chunk, Response):
-                                raise
-                            pending = None
-                        if pending is not None:
-                            yield pending
+                        partial = observe_output(chunk.upstream_content)
+                        if meaningful_content:
+                            yield partial
                     if event_kind in ("blocked", "invalid"):
                         outcome = event_kind
                         completion.error = True
@@ -864,24 +815,11 @@ async def stream_request(
                         else:
                             log.debug(f"[ANTIGRAVITY STREAM RAW] chunk(str): {chunk}")
 
-                        # Hidden native thought is still real upstream output, but
-                        # does not prevent a safe retry before any visible content.
-                        if event_kind == "content" and thought_guard and not thought_guard.include_thoughts:
-                            raw_event = json.loads(chunk[5:])
-                            inner = raw_event.get("response", raw_event)
-                            meaningful_content |= any(p.get("thought") is True and bool(p.get("text"))
-                                for c in inner.get("candidates", []) for p in c.get("content", {}).get("parts", []))
-                        protected = thought_guard.feed(chunk) if thought_guard else chunk
-                        if protected is not None:
-                            protected = observe_output(protected)
-                            if meaningful_content or content_delivered:
-                                yield protected
+                        chunk = observe_output(chunk)
+                        if meaningful_content or content_delivered:
+                            yield chunk
 
                 completion.eof = not need_retry
-                if not need_retry:
-                    pending = flush_guard()
-                    if pending is not None:
-                        yield pending
                 # A clean socket EOF is not a protocol completion marker.
                 if meaningful_content and not need_retry:
                     if not completion.complete and not native:
@@ -936,13 +874,6 @@ async def stream_request(
                         return
                     continue  # 重试
 
-            except ThoughtBoundaryError:
-                # Framing violations are output failures, never a credential
-                # failure or a successful STOP. Do not flush ambiguous text or
-                # automatically retry an answer that may already be visible.
-                yield await invalid_boundary_response()
-                return
-
             except (asyncio.CancelledError, GeneratorExit):
                 # A client may close immediately after the final protocol event.
                 # Preserve completed/error outcomes; only unfinished streams are 499.
@@ -956,19 +887,11 @@ async def stream_request(
                 # A transport teardown failure cannot invalidate an already
                 # complete protocol answer. Explicit upstream error events still
                 # take their normal error path above.
-                if (isinstance(e, TransportError) and completion.complete and meaningful_content
-                        and (not thought_guard or thought_guard.complete)):
+                if isinstance(e, TransportError) and completion.complete and meaningful_content:
                     outcome = "complete"
                     log.warning(f"[ANTIGRAVITY STREAM] 完整结束事件之后连接关闭异常: {type(e).__name__}, request_id={log_entry.get('request_id')}")
                     await _log_stream_result(200, True)
                     return
-                try:
-                    pending = flush_guard()
-                except ThoughtBoundaryError:
-                    yield await invalid_boundary_response()
-                    return
-                if pending is not None:
-                    yield pending
                 outcome = "transport_error"
                 completion.error = True
                 error_status = 504 if isinstance(e, ConnectTimeout) else 500
@@ -1065,7 +988,6 @@ async def non_stream_request(
         """
         if lease:
             await lease.result(success=success)
-        from src.usage_log import record_usage_log, extract_usage_tokens
 
         if response_content is None:
             response_content = upstream_response_content
@@ -1089,7 +1011,7 @@ async def non_stream_request(
         # Keep it independent of success, using the original upstream body.
         tokens = extract_usage_tokens(response_content)
         # 每条日志记录本次调用实际使用的凭证
-        await record_usage_log({
+        await usage_log.record_usage_log({
             **attempt_entry,
             "credential_email": current_file,
             "status_code": status_code,
@@ -1234,7 +1156,6 @@ async def non_stream_request(
                                             media_type="application/json")
                         # Explicit embedded HTTP errors use the same credential and
                         # retry policy as transport-level errors; do not fake 200.
-                        import httpx
                         response = httpx.Response(classified.status_code, content=error_body,
                                                   headers={"content-type": "application/json"})
                         status_code = classified.status_code
@@ -1338,7 +1259,7 @@ async def non_stream_request(
 
             except Exception as e:
                 log.error(f"[ANTIGRAVITY] 非流式请求异常: {e}, 凭证: {current_file}")
-                if attempt < max_retries:
+                if retry_config["retry_enabled"] and attempt < max_retries:
                     log.info(f"[ANTIGRAVITY] 异常后重试 (attempt {attempt + 2}/{max_retries + 1})...")
                     # 本次上游调用（异常）产生一条日志
                     await _log_result(500, False, error_message=f"异常: {type(e).__name__}: {e}")
@@ -1472,7 +1393,6 @@ async def fetch_available_models() -> List[Dict[str, Any]]:
             return []
 
     except Exception as e:
-        import traceback
         log.error(f"[ANTIGRAVITY] Failed to fetch models: {e}")
         log.error(f"[ANTIGRAVITY] Traceback: {traceback.format_exc()}")
         return []
@@ -1621,7 +1541,6 @@ async def fetch_quota_info(access_token: str, project_id: str = "") -> Dict[str,
             "source": "retrieveUserQuotaSummary",
         }
     except Exception as e:
-        import traceback
         log.error(f"[ANTIGRAVITY QUOTA] Failed to fetch quota: {e}")
         log.error(f"[ANTIGRAVITY QUOTA] Traceback: {traceback.format_exc()}")
         return {

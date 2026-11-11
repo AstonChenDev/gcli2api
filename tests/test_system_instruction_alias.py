@@ -1,4 +1,4 @@
-"""Regression: custom prompt injection must never emit two oneof aliases."""
+"""Regression: request normalization must never emit two oneof aliases."""
 import copy
 import json
 import os
@@ -14,7 +14,7 @@ from src.converter.request_fields import normalize_system_instruction
 from src.converter.antigravity_fix import normalize_antigravity_request
 from src.converter.anti_truncation import apply_anti_truncation
 from src.router.antigravity import gemini
-from src.thought_boundary import prepare_thought_boundary
+from src.converter.request_fields import normalize_gemini_request_fields
 
 SYSTEM = {'role': 'system', 'parts': [{'text': '保留原提示词。'}, {'text': 'Keep the second rule.'}]}
 CONTENTS = [{'role': 'user', 'parts': [{'text': 'Please reply OK.'}]}]
@@ -23,7 +23,6 @@ CONTENTS = [{'role': 'user', 'parts': [{'text': 'Please reply OK.'}]}]
 class SystemAliasTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.stack = ExitStack(); self.addCleanup(self.stack.close)
-        self.stack.enter_context(patch.dict(os.environ, {'ARGON_THOUGHT_BOUNDARY_ENABLED': 'true'}))
         for name, value in {'get_valid_credential': ('test@example.invalid', {'access_token': 'synthetic', 'project_id': 'test'}),
             'get_antigravity_api_url': 'https://example.invalid', 'get_auto_ban_error_codes': [],
             'get_retry_config': {'max_retries': 0, 'retry_interval': 0, 'retry_enabled': False},
@@ -37,29 +36,25 @@ class SystemAliasTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('system_instruction', request)
         self.assertEqual(request['systemInstruction']['parts'][:2], SYSTEM['parts'])
 
-    def test_snake_camel_and_identical_aliases_preserve_original_and_stable_marker(self):
-        markers = []
+    def test_snake_camel_and_identical_aliases_preserve_original(self):
         for keys in [('system_instruction',), ('systemInstruction',), ('system_instruction', 'systemInstruction')]:
             request = {'contents': copy.deepcopy(CONTENTS), **{key: copy.deepcopy(SYSTEM) for key in keys}}
             original = copy.deepcopy(request)
-            result, marker = prepare_thought_boundary('gemini-4-argon-medium', request)
+            result = normalize_gemini_request_fields(request)
             self.assert_system(result)
             self.assertEqual(result['systemInstruction']['role'], 'system')
-            self.assertEqual(len(result['systemInstruction']['parts']), 3)
-            self.assertIn(marker, result['systemInstruction']['parts'][-1]['text'])
+            self.assertEqual(len(result['systemInstruction']['parts']), 2)
             self.assertEqual(original, request)
-            markers.append(marker)
-        self.assertEqual(len(set(markers)), 1)
 
-    def test_disabled_guard_and_structured_tools_still_have_one_system_field(self):
+    def test_structured_tools_still_have_one_system_field(self):
         request = {'contents': CONTENTS, 'system_instruction': SYSTEM}
         for extra in [{'tools': [{'functionDeclarations': []}]}, {'generationConfig': {'responseMimeType': 'application/json'}}]:
-            result, marker = prepare_thought_boundary('gemini-4-argon-medium', {**request, **extra})
-            self.assertIsNone(marker); self.assert_system(result)
+            result = normalize_gemini_request_fields({**request, **extra})
+            self.assert_system(result)
             self.assertEqual(len(result['systemInstruction']['parts']), 2)
         with patch.dict(os.environ, {'ARGON_THOUGHT_BOUNDARY_ENABLED': 'false'}):
-            result, marker = prepare_thought_boundary('gemini-4-argon-medium', request)
-            self.assertIsNone(marker); self.assert_system(result)
+            result = normalize_gemini_request_fields(request)
+            self.assert_system(result)
 
     def test_null_missing_aliases_and_private_copy(self):
         for request in [{}, {'systemInstruction': None}, {'system_instruction': None, 'systemInstruction': None}]:
@@ -73,7 +68,7 @@ class SystemAliasTests(unittest.IsolatedAsyncioTestCase):
         request = {'systemInstruction': SYSTEM, 'system_instruction': {'parts': [{'text': 'different'}]}}
         original = copy.deepcopy(request)
         with self.assertRaises(HTTPException) as context:
-            prepare_thought_boundary('gemini-4-argon-medium', request)
+            normalize_gemini_request_fields(request)
         self.assertEqual(context.exception.status_code, 400)
         self.assertEqual(request, original)
 
@@ -94,10 +89,9 @@ class SystemAliasTests(unittest.IsolatedAsyncioTestCase):
         async def streaming(**kwargs):
             inner = kwargs['body']['request']; self.assert_system(inner)
             captured.append(copy.deepcopy(inner))
-            contract = inner['systemInstruction']['parts'][-1]['text']
-            marker = re.search(r'<<<AGY_FINAL_[0-9a-f]+>>>', contract)[0]
+            self.assertEqual(inner['systemInstruction']['parts'], SYSTEM['parts'])
             # Verify the existing thought/body separation still works end to end.
-            for part in [{'text': 'native thought', 'thought': True}, {'text': 'unmarked thought' + marker + 'OK'}]:
+            for part in [{'text': 'native thought', 'thought': True}, {'text': 'unmarked thoughtOK'}]:
                 yield 'data: ' + json.dumps({'response': {'responseId': 'test-alias', 'candidates': [{'finishReason': 'STOP' if part['text'].endswith('OK') else 'FINISH_REASON_UNSPECIFIED', 'content': {'role': 'model', 'parts': [part]}}]}}) + '\n\n'
         async def nonstream(**kwargs):
             inner = kwargs['json']['request']; self.assert_system(inner)
@@ -113,8 +107,8 @@ class SystemAliasTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(response.status_code, 200)
                         if method.startswith('stream'):
                             parts = [p for line in response.text.splitlines() if line.startswith('data: ') for c in json.loads(line[6:]).get('candidates', []) for p in c.get('content', {}).get('parts', [])]
-                            self.assertEqual(''.join(p.get('text','') for p in parts if not p.get('thought')), 'OK')
-                            self.assertEqual(''.join(p.get('text','') for p in parts if p.get('thought')), 'native thoughtunmarked thought')
+                            self.assertEqual(''.join(p.get('text','') for p in parts if not p.get('thought')), 'unmarked thoughtOK')
+                            self.assertEqual(''.join(p.get('text','') for p in parts if p.get('thought')), 'native thought')
         self.assertEqual(len(captured), 4)
 
     async def test_conflict_returns_http_400_before_stream_headers_or_upstream(self):

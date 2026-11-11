@@ -42,7 +42,7 @@ class CredentialToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all("/" not in name for name in archive.namelist()))
             records = [json.loads(archive.read(name)) for name in archive.namelist()]
         self.assertEqual({row["email"] for row in records}, set(selected))
-        self.assertTrue(all(set(row) == {"email", "refresh_token", "project_id", "tier"} for row in records))
+        self.assertTrue(all(set(row) == {"email", "refresh_token", "access_token", "expiry", "project_id", "tier"} for row in records))
         self.db.store_credential.assert_not_called()
 
     async def test_missing_selection_fails_instead_of_partial_export(self):

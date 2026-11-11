@@ -10,10 +10,19 @@ Antigravity Format Utilities - 独立的 Antigravity 请求处理和转换工具
 - 使用 print 输出 warning/error，去掉 debug 日志
 """
 import json
+import re
+from fastapi import HTTPException
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+import config
+from config import (
+    apply_sensitive_word_filter,
+    get_model_rewrite_filter,
+    get_sensitive_word_filter,
+    rewrite_model_name,
+)
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
 from src.converter.request_fields import normalize_gemini_request_fields
 
@@ -494,8 +503,6 @@ def _parse_size_to_image_config(size_str: str) -> Dict[str, str]:
     Returns:
         包含 aspectRatio 和/或 imageSize 的字典
     """
-    import re
-
     config = {}
     size_str = size_str.strip()
 
@@ -602,7 +609,6 @@ _UPSTREAM_ALIASES: Dict[str, str] = {
 
 async def _get_model_rewrite_rules():
     """读取生效的模型名复写规则；未启用时返回 None"""
-    from config import get_model_rewrite_filter
     enabled, rules = await get_model_rewrite_filter()
     return rules if enabled and rules else None
 
@@ -676,14 +682,12 @@ def _apply_thinking(profile: ModelProfile, generation_config: Dict[str, Any], re
 
 async def _get_sensitive_word_patterns():
     """读取生效的敏感词正则列表；未启用时返回 None（避免无谓的配置读取开销为 0 时的开销可忽略）"""
-    from config import get_sensitive_word_filter
     enabled, patterns = await get_sensitive_word_filter()
     return patterns if enabled and patterns else None
 
 
 def _filter_text(text: str, patterns) -> str:
     """对文本应用敏感词过滤（大小写不敏感，命中替换为空）"""
-    from config import apply_sensitive_word_filter
     return apply_sensitive_word_filter(text, patterns)
 
 
@@ -868,8 +872,7 @@ async def normalize_antigravity_request(
     generation_config = (result.get("generationConfig") or {}).copy()
 
     # The panel controls the default; an explicit per-request opt-out must survive.
-    from config import get_return_thoughts_to_frontend
-    return_thoughts = await get_return_thoughts_to_frontend()
+    return_thoughts = await config.get_return_thoughts_to_frontend()
     requested_thinking = generation_config.get("thinkingConfig") or {}
     if requested_thinking.get("includeThoughts") is False:
         return_thoughts = False
@@ -879,7 +882,6 @@ async def normalize_antigravity_request(
     # 命中规则的模型名被替换为规则指定的模型名（支持正则与反向引用）
     rewrite_rules = await _get_model_rewrite_rules()
     if rewrite_rules and model:
-        from config import rewrite_model_name
         rewritten = rewrite_model_name(model, rewrite_rules)
         if rewritten != model:
             result["model"] = rewritten
@@ -946,7 +948,6 @@ async def normalize_antigravity_request(
         # established default when absent and leave Claude budgeting unchanged.
         limit = generation_config.get("maxOutputTokens") if profile.family in ("gemini3", "gemini4") else None
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
-            from fastapi import HTTPException
             raise HTTPException(400, "maxOutputTokens 必须是正整数")
         generation_config["maxOutputTokens"] = min(limit, MAX_OUTPUT_TOKENS) if limit is not None else MAX_OUTPUT_TOKENS
         generation_config["topK"] = TOP_K

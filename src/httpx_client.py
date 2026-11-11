@@ -3,13 +3,18 @@
 为所有需要使用httpx的模块提供统一的客户端配置和方法
 保持通用性，不与特定业务逻辑耦合
 
-无状态函数风格：无全局实例，每次调用独立构建/销毁客户端
+按事件循环、代理和超时配置复用连接；配置变化后旧连接待在途请求结束再关闭。
 """
 
+import asyncio
+import json
+from weakref import WeakKeyDictionary
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, Optional
 
 import httpx
+from fastapi import Response
 from anyio import CancelScope, fail_after
 
 from config import get_proxy_config, get_stream_handshake_timeout_enabled, get_stream_handshake_timeout_seconds
@@ -64,53 +69,103 @@ class _StreamingClient(httpx.AsyncClient):
                     request.extensions["trace"] = original_trace
 
 
-async def get_client_kwargs(timeout: float = 30.0, **kwargs) -> Dict[str, Any]:
-    """获取httpx客户端的通用配置参数"""
-    client_kwargs = {"timeout": timeout, **kwargs}
+@dataclass
+class _ClientLease:
+    client: httpx.AsyncClient
+    users: int = 0
+    retired: bool = False
 
-    # 动态读取代理配置，支持热更新
-    current_proxy_config = await get_proxy_config()
-    if current_proxy_config:
-        client_kwargs["proxy"] = current_proxy_config
 
-    return client_kwargs
+# Each application loop owns its clients; never share transports across loops.
+_client_pools = WeakKeyDictionary()
+
+
+async def _safe_aclose(client):
+    with CancelScope(shield=True):
+        try:
+            await client.aclose()
+        except Exception as exc:
+            log.warning(f"HTTP client cleanup failed: {type(exc).__name__}")
+
+
+async def get_client_kwargs(timeout=30.0, **kwargs):
+    options = {"timeout": timeout, **kwargs}
+    proxy = await get_proxy_config()
+    if proxy and "proxy" not in options:
+        options["proxy"] = proxy
+    return options
 
 
 @asynccontextmanager
-async def get_client(
-    timeout: float = 30.0, **kwargs
-) -> AsyncGenerator[httpx.AsyncClient, None]:
-    """获取配置好的异步HTTP客户端"""
-    client_kwargs = await get_client_kwargs(timeout=timeout, **kwargs)
+async def _lease_client(*, timeout, streaming=False, handshake_timeout=None, **kwargs):
+    options = await get_client_kwargs(timeout=timeout, **kwargs)
+    factory = _StreamingClient if streaming else httpx.AsyncClient
+    if streaming:
+        options["handshake_timeout"] = handshake_timeout
+    # Explicit transports, hooks, certificates etc. belong only to this caller.
+    if kwargs:
+        client = factory(**options)
+        try:
+            yield client
+        finally:
+            await _safe_aclose(client)
+        return
 
-    async with httpx.AsyncClient(**client_kwargs) as client:
+    pool = _client_pools.setdefault(asyncio.get_running_loop(), {})
+    proxy = options.get("proxy", "")
+    timeout_key = tuple(httpx.Timeout(timeout).as_dict().items())
+    key = (proxy, streaming, handshake_timeout, timeout_key)
+    # Construction may reject an invalid proxy. Keep the old pool managed until
+    # its replacement exists, so failure cannot orphan idle sockets.
+    entry = pool.get(key)
+    if entry is None or entry.client.is_closed:
+        entry = pool[key] = _ClientLease(factory(**options))
+    # No awaits between lookup, retirement and lease acquisition. A proxy or
+    # handshake setting change must not close another request's active stream.
+    stale = []
+    for old_key, old in list(pool.items()):
+        if old_key[0] != proxy or (streaming and old_key[1] and old_key[2] != handshake_timeout):
+            del pool[old_key]
+            old.retired = True
+            if not old.users:
+                stale.append(old.client)
+    entry.users += 1
+    try:
+        for client in stale:
+            await _safe_aclose(client)
+        yield entry.client
+    finally:
+        entry.users -= 1
+        if entry.retired and not entry.users:
+            await _safe_aclose(entry.client)
+
+
+async def close_shared_clients():
+    """Retire this loop's pool; active streams close upon their final release."""
+    pool = _client_pools.pop(asyncio.get_running_loop(), {})
+    for entry in pool.values():
+        entry.retired = True
+        if not entry.users:
+            await _safe_aclose(entry.client)
+
+
+@asynccontextmanager
+async def get_client(timeout=30.0, **kwargs):
+    async with _lease_client(timeout=timeout, **kwargs) as client:
         yield client
 
 
 @asynccontextmanager
-async def get_streaming_client(
-    timeout: float = None, **kwargs
-) -> AsyncGenerator[httpx.AsyncClient, None]:
-    """流式读取默认不限时；每次调用读取当前握手超时设置。"""
+async def get_streaming_client(timeout=None, **kwargs):
     handshake_timeout = (
         await get_stream_handshake_timeout_seconds()
         if await get_stream_handshake_timeout_enabled() else None
     )
     if timeout is None:
         timeout = httpx.Timeout(None, connect=handshake_timeout)
-    client_kwargs = await get_client_kwargs(timeout=timeout, **kwargs)
-
-    # 创建独立的客户端实例用于流式处理
-    client = _StreamingClient(handshake_timeout=handshake_timeout, **client_kwargs)
-    try:
+    async with _lease_client(timeout=timeout, streaming=True,
+                             handshake_timeout=handshake_timeout, **kwargs) as client:
         yield client
-    finally:
-        # 确保无论发生什么都关闭客户端
-        try:
-            with CancelScope(shield=True):
-                await client.aclose()
-        except Exception as e:
-            log.warning(f"Error closing streaming client: {e}")
 
 
 # 通用的异步方法
@@ -118,8 +173,8 @@ async def get_async(
     url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 30.0, **kwargs
 ) -> httpx.Response:
     """通用异步GET请求"""
-    async with get_client(timeout=timeout, **kwargs) as client:
-        return await client.get(url, headers=headers)
+    async with get_client(timeout=timeout) as client:
+        return await client.get(url, headers=headers, **kwargs)
 
 
 async def post_async(
@@ -131,8 +186,8 @@ async def post_async(
     **kwargs,
 ) -> httpx.Response:
     """通用异步POST请求"""
-    async with get_client(timeout=timeout, **kwargs) as client:
-        return await client.post(url, data=data, json=json, headers=headers)
+    async with get_client(timeout=timeout) as client:
+        return await client.post(url, data=data, json=json, headers=headers, **kwargs)
 
 
 # 调试用：设为 True 时所有流式请求都返回 429
@@ -147,8 +202,6 @@ async def stream_post_async(
 ):
     """流式异步POST请求"""
     if _MOCK_STREAM_429:
-        from fastapi import Response
-        import json
         log.warning(f"[MOCK] stream_post_async: 返回模拟429错误")
         yield Response(
             content=json.dumps({"error": {"code": 429, "message": "mock rate limit", "status": "RESOURCE_EXHAUSTED"}}),
@@ -160,7 +213,6 @@ async def stream_post_async(
         async with client.stream("POST", url, json=body, headers=headers) as r:
             # 错误直接返回
             if r.status_code != 200:
-                from fastapi import Response
                 yield Response(await r.aread(), r.status_code, dict(r.headers))
                 return
 

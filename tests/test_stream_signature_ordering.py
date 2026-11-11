@@ -1,4 +1,4 @@
-"""Signatures around framing/buffering survive without turning empty output into 200."""
+"""Native signatures survive without turning empty output into 200."""
 import json
 import unittest
 from contextlib import ExitStack
@@ -9,11 +9,10 @@ from fastapi import FastAPI, Response
 import test_custom_audit
 from src.api import antigravity as api
 from src.router.antigravity import gemini, openai, anthropic
-from test_thought_boundary import event, decode, text_of
+from stream_fixtures import event, decode, text_of
 
-MARKER = 'BOUNDARY'
 BODY = {'model': 'gemini-4-argon-medium', 'request': {'contents': []}}
-SIGNATURE = {'text': '', 'thought': True, 'thoughtSignature': 'keep-between-frame-and-answer'}
+SIGNATURE = {'text': '', 'thought': True, 'thoughtSignature': 'keep-between-parts-and-answer'}
 
 
 def parts(chunks):
@@ -21,14 +20,14 @@ def parts(chunks):
             for c in decode(chunk).get('candidates', []) for p in c.get('content', {}).get('parts', [])]
 
 
-class SignatureBoundaryCombinationTests(unittest.IsolatedAsyncioTestCase):
+class StreamSignatureOrderingTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_custom_audit.CustomAuditTests.asyncSetUp
 
-    async def test_signature_around_frame_and_short_pending_body_keeps_original_order(self):
+    async def test_signature_between_native_parts_keeps_original_order(self):
         cases = [
-            ([{'text': MARKER}], [{'text': 'answer'}], [SIGNATURE, {'text': 'answer'}]),
-            ([{'text': 'Thinking Process:\nplan'}], [{'text': MARKER + 'answer'}],
-             [{'text': 'Thinking Process:\nplan', 'thought': True}, SIGNATURE, {'text': 'answer'}]),
+            ([{'text': ''}], [{'text': 'answer'}], [SIGNATURE, {'text': 'answer'}]),
+            ([{'text': 'Thinking Process:\nplan'}], [{'text': 'answer'}],
+             [{'text': 'Thinking Process:\nplan'}, SIGNATURE, {'text': 'answer'}]),
             ([{'text': 'short prefix '}], [{'text': 'suffix'}],
              [{'text': 'short prefix '}, SIGNATURE, {'text': 'suffix'}]),
         ]
@@ -42,13 +41,12 @@ class SignatureBoundaryCombinationTests(unittest.IsolatedAsyncioTestCase):
                         yield event(after, 'STOP' if terminal == 'STOP' else None)
                         if terminal == 'DONE':
                             yield 'data: [DONE]\n\n'
-                    with patch.object(api, 'stream_post_async', upstream), patch.object(
-                            api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)):
+                    with patch.object(api, 'stream_post_async', upstream):
                         out = [c async for c in api.stream_request(BODY)]
                     self.assertEqual(parts(out), expected)
                     self.assertEqual(self.saved.call_args.args[0]['status_code'], 200)
 
-    async def test_frame_plus_signature_without_answer_stays_single_502_at_stop_and_eof(self):
+    async def test_empty_text_and_signature_without_answer_stays_single_502(self):
         for terminal in ('STOP', 'EOF', 'DONE'):
             for native in (False, True):
                 with self.subTest(terminal=terminal, native=native):
@@ -57,12 +55,11 @@ class SignatureBoundaryCombinationTests(unittest.IsolatedAsyncioTestCase):
                     if not native:
                         signature.pop('thought')
                     async def upstream(**kwargs):
-                        yield event([{'text': MARKER}])
+                        yield event([{'text': ''}])
                         yield event([signature], 'STOP' if terminal == 'STOP' else None)
                         if terminal == 'DONE':
                             yield 'data: [DONE]\n\n'
-                    with patch.object(api, 'stream_post_async', upstream), patch.object(
-                            api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)):
+                    with patch.object(api, 'stream_post_async', upstream):
                         out = [c async for c in api.stream_request(BODY)]
                     self.assertEqual(len(out), 1)
                     self.assertIsInstance(out[0], Response)
@@ -71,13 +68,12 @@ class SignatureBoundaryCombinationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_signature_queue_does_not_delay_following_native_text_until_answer(self):
         async def upstream(**kwargs):
-            yield event([{'text': MARKER}])
+            yield event([{'text': ''}])
             yield event([SIGNATURE])
             yield event([{**SIGNATURE, 'thoughtSignature': 'second-signature'}])
             yield event([{'text': 'native thinking', 'thought': True}])
             yield event([{'text': 'answer'}], 'STOP')
-        with patch.object(api, 'stream_post_async', upstream), patch.object(
-                api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)):
+        with patch.object(api, 'stream_post_async', upstream):
             stream = api.stream_request(BODY)
             first = await anext(stream)
             self.assertEqual(text_of([first], True), 'native thinking')
@@ -87,30 +83,28 @@ class SignatureBoundaryCombinationTests(unittest.IsolatedAsyncioTestCase):
                          [SIGNATURE['thoughtSignature'], 'second-signature'])
         self.assertEqual(text_of(rest), 'answer')
 
-    async def test_framed_signature_is_not_sent_before_explicit_error(self):
+    async def test_signature_is_not_sent_before_explicit_error(self):
         async def upstream(**kwargs):
-            yield event([{'text': MARKER}])
+            yield event([{'text': ''}])
             yield event([SIGNATURE])
             yield Response(status_code=429, content='{"error":{"code":429,"message":"original quota"}}')
         with patch.object(api, 'stream_post_async', upstream), patch.object(
-                api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)), patch.object(
                 api, 'record_api_call_error', AsyncMock()):
             out = [c async for c in api.stream_request(BODY)]
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].status_code, 429)
         self.assertNotIn('keep-between', out[0].body.decode())
 
-    async def test_framed_signature_with_thought_optout_never_leaks(self):
+    async def test_upstream_thought_signature_is_preserved_despite_request_preference(self):
         async def upstream(**kwargs):
-            yield event([{'text': MARKER}])
+            yield event([{'text': ''}])
             yield event([SIGNATURE])
             yield event([{'text': 'answer'}], 'STOP')
         body = {'model': BODY['model'], 'request': {'contents': [], 'generationConfig': {
             'thinkingConfig': {'includeThoughts': False}}}}
-        with patch.object(api, 'stream_post_async', upstream), patch.object(
-                api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)):
+        with patch.object(api, 'stream_post_async', upstream):
             out = [c async for c in api.stream_request(body)]
-        self.assertEqual(parts(out), [{'text': 'answer'}])
+        self.assertEqual(parts(out), [SIGNATURE, {'text': 'answer'}])
 
     async def test_all_http_protocols_preserve_text_and_anthropic_signature(self):
         app = FastAPI()
@@ -125,11 +119,10 @@ class SignatureBoundaryCombinationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(url=url):
                 self.saved.reset_mock()
                 async def upstream(**kwargs):
-                    yield event([{'text': MARKER}])
+                    yield event([{'text': ''}])
                     yield event([SIGNATURE])
                     yield event([{'text': 'answer'}], 'STOP')
-                with patch.object(api, 'stream_post_async', upstream), patch.object(
-                        api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)):
+                with patch.object(api, 'stream_post_async', upstream):
                     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
                         response = await client.post(url, json=body)
                 self.assertEqual(response.status_code, 200)

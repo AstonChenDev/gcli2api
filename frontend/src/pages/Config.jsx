@@ -4,6 +4,93 @@ import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
 
+// 错误码输入：编辑期间保留原始文本，仅在按键时把已解析的数组回写配置（保证保存时取到最新值），
+// 失焦时再归一化显示。原实现在每次按键即时解析并回写数组，导致分隔符与未成形的中间输入被即时
+// 过滤/截断，无法输入多个错误码，也无法输入小于 100 的中间数字。
+function CsvNumbersField({ value, onChange, placeholder, className }) {
+  const toText = (v) => (Array.isArray(v) ? v.join(", ") : (v ?? ""));
+  const [text, setText] = useState(() => toText(value));
+  const focusedRef = useRef(false);
+
+  // 仅在非编辑态（失焦）时同步外部配置变化，避免编辑过程中被即时覆盖
+  useEffect(() => {
+    if (!focusedRef.current) setText(toText(value));
+  }, [value]);
+
+  const commitText = (raw) => {
+    const nums = raw
+      .split(/[,\s]+/)
+      .map((x) => parseInt(x, 10))
+      .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599);
+    onChange([...new Set(nums)].sort((a, b) => a - b));
+  };
+
+  return (
+    <input
+      type="text"
+      value={text}
+      onFocus={() => {
+        focusedRef.current = true;
+      }}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setText(raw);
+        commitText(raw);
+      }}
+      onBlur={() => {
+        focusedRef.current = false;
+        commitText(text);
+      }}
+      placeholder={placeholder}
+      className={className}
+    />
+  );
+}
+
+// 多行文本（敏感词 / IP 白名单等，每行一条）：编辑期间保留原始文本（允许末尾空行与连续回车），
+// 仅在按键时把清洗后的数组回写配置（保证保存时取到最新值），失焦时再归一化显示。
+// 原实现在每次按键即时 split + 过滤空行，末尾按回车产生的新空行被立即移除，
+// 导致"最后一行按回车没反应"、无法换行新增词条。
+function LinesField({ value, onChange, placeholder, className, rows = 6 }) {
+  const toText = (v) => (Array.isArray(v) ? v.join("\n") : v ?? "");
+  const [text, setText] = useState(() => toText(value));
+  const focusedRef = useRef(false);
+
+  // 仅在非编辑态（失焦）时同步外部配置变化，避免编辑过程中被即时覆盖
+  useEffect(() => {
+    if (!focusedRef.current) setText(toText(value));
+  }, [value]);
+
+  const commitText = (raw) => {
+    const lines = raw
+      .split(/\r?\n/)
+      .map((w) => w.replace(/\s+$/, ""))
+      .filter((w) => w.trim() !== "");
+    onChange(lines);
+  };
+
+  return (
+    <textarea
+      value={text}
+      onFocus={() => {
+        focusedRef.current = true;
+      }}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setText(raw);
+        commitText(raw);
+      }}
+      onBlur={() => {
+        focusedRef.current = false;
+        commitText(text);
+      }}
+      placeholder={placeholder}
+      rows={rows}
+      className={className}
+    />
+  );
+}
+
 const CONFIG_GROUPS = [
   {
     title: "499 等待异常保护",
@@ -99,7 +186,7 @@ const CONFIG_GROUPS = [
   {
     title: "响应配置",
     fields: [
-      { key: "return_thoughts_to_frontend", label: "返回思维链到前端", type: "bool", note: "启用后思维链会在响应中返回；禁用后过滤掉" },
+      { key: "return_thoughts_to_frontend", label: "返回思维链到前端", type: "bool", note: "向上游请求返回思考内容；关闭时请求上游省略。如果上游仍返回思考字段，按原版规则转发" },
     ],
   },
   {
@@ -321,18 +408,10 @@ export default function Config() {
     }
 
     if (field.type === "csv_numbers") {
-      const text = Array.isArray(value) ? value.join(", ") : value || "";
       return (
-        <input
-          type="text"
-          value={text}
-          onChange={(e) => {
-            const nums = e.target.value
-              .split(/[,\s]+/)
-              .map((x) => parseInt(x, 10))
-              .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599);
-            setField(field.key, [...new Set(nums)]);
-          }}
+        <CsvNumbersField
+          value={value}
+          onChange={(v) => setField(field.key, v)}
           placeholder={field.placeholder}
           className="w-full sm:w-64 px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder-slate-400 font-mono"
         />
@@ -444,12 +523,9 @@ export default function Config() {
 
     if (field.type === "textarea") {
       return (
-        <textarea
-          value={Array.isArray(value) ? value.join("\n") : value || ""}
-          onChange={(e) => {
-            const lines = e.target.value === "" ? [] : e.target.value.split("\n");
-            setField(field.key, lines.map((w) => w.replace(/\s+$/, "")).filter((w) => w.trim() !== ""))
-          }}
+        <LinesField
+          value={value}
+          onChange={(v) => setField(field.key, v)}
           placeholder={field.placeholder}
           rows={6}
           className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder-slate-400 font-mono"

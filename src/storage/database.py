@@ -7,12 +7,14 @@
 import asyncio
 import json
 import os
+import random
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import (
+    event,
     Boolean,
     Float,
     Index,
@@ -30,6 +32,8 @@ from sqlalchemy import (
     text,
     tuple_,
 )
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -137,6 +141,7 @@ class UsageLog(Base):
         Index("idx_ul_created_email", "created_at", "credential_email"),
         Index("idx_ul_request_id", "request_id"),
         Index("idx_ul_response_id", "response_id"),
+        Index("idx_ul_request_log_file", "request_log_file"),
     )
 
 
@@ -233,8 +238,24 @@ class Database:
                 db_path = os.path.join(credentials_dir, "credentials.db")
                 self._engine = create_async_engine(
                     f"sqlite+aiosqlite:///{db_path}",
+                    # 连接池：多个长连接复用（默认 NullPool 每会话新建连接开销大）；
+                    # WAL 模式允许读写并发，单写者由 busy_timeout 兜底
+                    pool_size=5,
+                    max_overflow=10,
+                    pool_pre_ping=True,
                     connect_args={"timeout": 30},
                 )
+                # WAL + NORMAL：读写并发 + 减少每次提交的 fsync（PRAGMA 需在连接建立后执行）
+
+                @event.listens_for(self._engine.sync_engine, "connect")
+                def _set_sqlite_pragma(dbapi_conn, conn_record):
+                    cursor = dbapi_conn.cursor()
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                    cursor.execute("PRAGMA synchronous=NORMAL")
+                    cursor.execute("PRAGMA busy_timeout=15000")
+                    cursor.execute("PRAGMA cache_size=-8000")
+                    cursor.close()
+
                 self._backend_type = "sqlite"
 
             self._session_factory = async_sessionmaker(
@@ -331,9 +352,9 @@ class Database:
         async with self.session() as session:
             if self.backend_type == "sqlite":
                 await session.execute(text("BEGIN IMMEDIATE"))
-                from sqlalchemy.dialects.sqlite import insert
+                insert = sqlite_insert
             else:
-                from sqlalchemy.dialects.postgresql import insert
+                insert = postgresql_insert
             await session.execute(insert(Credential499State).values(email=email, state="{}")
                                   .on_conflict_do_nothing(index_elements=["email"]))
             state_row = await session.scalar(select(Credential499State).where(
@@ -348,9 +369,9 @@ class Database:
     async def insert_imported_credential(self, email, credential_data):
         """Atomic insert-only import: concurrent duplicates preserve all existing fields."""
         if self.backend_type == "postgresql":
-            from sqlalchemy.dialects.postgresql import insert
+            insert = postgresql_insert
         else:
-            from sqlalchemy.dialects.sqlite import insert
+            insert = sqlite_insert
         values = {k: credential_data[k] for k in (
             "access_token", "refresh_token", "client_id", "client_secret", "project_id", "expiry", "tier"
         )}
@@ -372,9 +393,8 @@ class Database:
             client_id = credential_data.get("client_id") or ""
             client_secret = credential_data.get("client_secret") or ""
             project_id = credential_data.get("project_id") or ""
-            expiry = credential_data.get("expiry") or ""
-            if isinstance(expiry, datetime):
-                expiry = expiry.isoformat()
+            expiry_val = credential_data.get("expiry") or ""
+            expiry = expiry_val.isoformat() if hasattr(expiry_val, "isoformat") else str(expiry_val)
             tier = credential_data.get("tier")
 
             if row:
@@ -449,22 +469,43 @@ class Database:
         current_time = time.time()
         cd_group = get_cooldown_group(model_name) if model_name else None
         async with self.session() as s:
+            # 轻量查询：只取必要的小字段（email/冷却/禁用），避免全表加载
+            # access_token/refresh_token 等大字段（凭证明文可达数 KB）
             rows = (
-                await s.scalars(
-                    select(AntigravityCredential)
+                await s.execute(
+                    select(
+                        AntigravityCredential.email,
+                        AntigravityCredential.model_cooldowns,
+                    )
                     .where(AntigravityCredential.disabled == False)  # noqa: E712
                     .where(AntigravityCredential.email.not_in(exclude_emails or []))
-                    .order_by(func.random())
+                    .order_by(AntigravityCredential.id)
                 )
             ).all()
-            for row in rows:
-                if cd_group:
-                    cooldowns = _load_json(row.model_cooldowns, {})
+            if not rows:
+                return None
+            # Python 侧随机负载均衡（过滤模型家族冷却）
+            candidates = rows
+            if cd_group:
+                candidates = []
+                for email, model_cooldowns in rows:
+                    cooldowns = _load_json(model_cooldowns, {})
                     cd = cooldowns.get(cd_group)
                     if cd is not None and current_time < cd:
                         continue
-                return row.email, _row_to_credential_dict(row)
-            return None
+                    candidates.append((email, model_cooldowns))
+            if not candidates:
+                return None
+            picked_email = random.choice(candidates)[0]
+            # 只取被选中凭证的完整数据
+            row = await s.scalar(
+                select(AntigravityCredential).where(
+                    AntigravityCredential.email == picked_email
+                )
+            )
+            if not row or row.disabled:
+                return None
+            return row.email, _row_to_credential_dict(row)
 
     async def get_available_credential_by_email(
         self, email: str, model_name: Optional[str] = None
@@ -1149,6 +1190,11 @@ class Database:
             rows = (await s.execute(query.order_by(func.count().desc(), source.c.status_code,
                 source.c.error_message).offset(offset).limit(limit))).all()
         return {"total": total, "items": [dict(row._mapping) for row in rows]}
+
+    async def has_request_body_log(self, path: str) -> bool:
+        async with self.session() as s:
+            return (await s.scalar(select(UsageLog.id).where(
+                UsageLog.request_log_file == path).limit(1))) is not None
 
     async def delete_usage_logs_with_files(self, before_timestamp: float):
         """Atomically delete old rows and return only their detailed-log paths.

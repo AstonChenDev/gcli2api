@@ -80,8 +80,7 @@ class SyntheticTruncationProtocolTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(url=url):
                 self.saved.reset_mock()
                 async def upstream(**kwargs):
-                    # Real prepare_thought_boundary bypasses the synthetic tool
-                    # request. Only the network response is replaced in this test.
+                    # Keep the real synthetic-tool request; only replace the network response.
                     self.assertTrue(kwargs['body']['request'].get('tools'))
                     yield 'data: ' + json.dumps(synthetic('partial answer', 'MAX_TOKENS'))
                 with ExitStack() as stack:

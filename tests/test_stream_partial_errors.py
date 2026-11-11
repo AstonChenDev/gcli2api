@@ -1,55 +1,7 @@
 import json
 import unittest
-from src.thought_boundary import ThoughtBoundaryGuard
 import test_stream_event_recovery as recovery
 from test_stream_event_recovery import event, parts_of
-from test_marker_copy_recovery import MARKER
-
-
-class ExplicitTextHeadingTests(unittest.TestCase):
-    def test_false_flag_on_every_chunk_does_not_expose_confirmed_planning(self):
-        plan = 'Thinking Process:\n\n1. **Analyze:** Read constraints.\n2. **Plan:** Build the answer.\n'
-        for heading in ['Thinking Process:\n', '**Thinking Process:**\n', '## Thinking Process:\n',
-                        '# **Thinking Process:**\n', '__Thinking Process:__\r\n']:
-            text = heading + plan.split('\n', 1)[1] + MARKER + '最后的正文。'
-            for width in [1, 2, 7, 24, 128, 4096]:
-                with self.subTest(heading=heading, width=width):
-                    guard = ThoughtBoundaryGuard(MARKER)
-                    out = [guard.feed(event([{'text': text[i:i+width], 'thought': False}])) for i in range(0, len(text), width)]
-                    out.append(guard.flush())
-                    # event() uses Google's wrapped response format.
-                    ps = parts_of([x for x in out if x])
-                    self.assertEqual(''.join(p.get('text','') for p in ps if not p.get('thought')), '最后的正文。')
-                    self.assertEqual(''.join(p.get('text','') for p in ps if p.get('thought')), text.split(MARKER)[0])
-
-    def test_unmarked_false_flag_continuation_stays_thought(self):
-        g = ThoughtBoundaryGuard(MARKER)
-        out = [g.feed(event([{'text': text, 'thought': False}])) for text in ['Thinking Process:\n', 'Still analyzing the request.']]
-        out.append(g.flush())
-        ps = parts_of([x for x in out if x])
-        self.assertTrue(all(p.get('thought') is True for p in ps))
-        self.assertTrue(g.metadata()['boundary_uncertain'])
-
-    def test_new_explicit_body_flag_after_unflagged_planning_still_works(self):
-        g = ThoughtBoundaryGuard(MARKER)
-        out = [g.feed(event([{'text': 'Thinking Process:\nAnalysis.'}])),
-               g.feed(event([{'text': '真正正文。', 'thought': False}], 'STOP'))]
-        ps = parts_of(out)
-        self.assertEqual(''.join(p['text'] for p in ps if not p.get('thought')), '真正正文。')
-
-    def test_ordinary_false_flag_text_is_not_delayed_or_reclassified(self):
-        for text in ['普通正文。', 'Thinking Process: this is an ordinary sentence.', 'The answer is 42.']:
-            g = ThoughtBoundaryGuard(MARKER)
-            out = g.feed(event([{'text': text, 'thought': False}]))
-            self.assertEqual(parts_of([out]), [{'text': text}])
-
-    def test_empty_false_placeholder_is_not_evidence_about_the_heading(self):
-        g = ThoughtBoundaryGuard(MARKER)
-        out = [g.feed(event([{'text':'', 'thought':False}])),
-               g.feed(event([{'text':'Thinking Process:\nAnalysis.'}])),
-               g.feed(event([{'text':'真正正文。', 'thought':False}], 'STOP'))]
-        ps = parts_of(out)
-        self.assertEqual(''.join(p.get('text','') for p in ps if not p.get('thought')), '真正正文。')
 
 
 class ErrorWithContentTests(unittest.IsolatedAsyncioTestCase):
@@ -60,7 +12,7 @@ class ErrorWithContentTests(unittest.IsolatedAsyncioTestCase):
         for status in [400, 429, 503]:
             self.saved.reset_mock()
             payload = json.loads(event([{'text':'native thinking','thought':True,'thoughtSignature':'keep'},
-                                        {'text':'BOUNDARYpartial answer'}], 'STOP')[5:])
+                                        {'text':'partial answer'}], 'STOP')[5:])
             error = {'code':status,'status':'UPSTREAM_REPORTED_ERROR','message':'original detail'}
             payload['response']['error'] = error
             chunks, rows = await self.run_attempts([['data: '+json.dumps(payload)]])
@@ -98,12 +50,11 @@ class ErrorWithContentTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(anti=anti, url=url):
                     self.saved.reset_mock()
                     async def upstream(**kwargs):
-                        d = json.loads(event([{'text':'native-thought','thought':True}, {'text':'BOUNDARYpartial-answer'}], 'STOP')[5:])
+                        d = json.loads(event([{'text':'native-thought','thought':True}, {'text':'partial-answer'}], 'STOP')[5:])
                         d['response']['error'] = {'code':400,'status':'INVALID_ARGUMENT','message':'original-error-detail'}
                         yield 'data: '+json.dumps(d)
                     with ExitStack() as stack:
                         stack.enter_context(patch.object(api,'stream_post_async',upstream))
-                        stack.enter_context(patch.object(api,'prepare_thought_boundary',lambda m,r:(r,'BOUNDARY')))
                         stack.enter_context(patch.object(api,'record_api_call_error',AsyncMock()))
                         for module in (gemini, openai, anthropic):
                             stack.enter_context(patch.object(module,'is_anti_truncation_model',return_value=anti))

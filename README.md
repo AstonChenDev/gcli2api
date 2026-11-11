@@ -132,7 +132,7 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 基于 React + Vite + Tailwind 编译的现代化前端界面：
 - Antigravity OAuth 认证流程（支持回调 URL 快捷方式）
 - 凭证文件上传（JSON/ZIP）、下载、详情查看
-- 凭证导出（规范 JSON：refresh_token/email/tier/project_id）
+- 凭证导出（规范 JSON：refresh_token/access_token/expiry/email/tier/project_id）
 - 系统配置管理（环境变量锁定提示、热更新）
 - 批量凭证操作和状态筛选、批量导入（缺失字段自动获取）
 - 移动端自适应
@@ -182,7 +182,7 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 凭证以**邮箱（email）为唯一键**存储，字段为结构化数据库列（不再使用 JSON blob）：
 `email`、`access_token`、`refresh_token`、`client_id`、`client_secret`、`project_id`、`expiry`、`tier`
 
-凭证导入/导出使用规范 JSON 格式：`{"refresh_token": "...", "email": "...", "tier": "...", "project_id": "..."}`（仅 `refresh_token` 必填，其余字段可自动获取）。
+凭证导入/导出使用规范 JSON 格式：`{"refresh_token": "...", "access_token": "...", "expiry": "...", "email": "...", "tier": "...", "project_id": "..."}`（仅 `refresh_token` 必填，`access_token` 未过期时直接复用，其余字段可自动获取）。
 
 ### 环境变量配置
 
@@ -211,6 +211,7 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 - `OAUTH_PROXY_URL`: OAuth 认证代理端点
 - `GOOGLEAPIS_PROXY_URL`: Google APIs 代理端点
 - `ANTIGRAVITY_API_URL`: Antigravity API 端点
+- `PATH_PREFIX`: 反代保留路径前缀（如 `/AGY2API`）时配置，由后端在路由匹配前剥掉该前缀；默认：空（不剥离）
 
 **性能和稳定性配置**
 - `RETRY_429_ENABLED`: 启用错误自动重试（默认：true）
@@ -331,9 +332,9 @@ for part in response.candidates[0].content.parts:
 
 ```bash
 cd frontend
-npm install
-npm run dev     # 开发模式，端口 3000，代理后端 API
-npm run build    # 构建到 dist/（生产模式使用）
+pnpm install
+pnpm run dev     # 开发模式，端口 3000，代理后端 API
+pnpm run build    # 构建到 dist/（生产模式使用）
 ```
 
 后端直接托管 `dist/` 下编译后的静态文件，无需 Node.js 运行时。
@@ -371,7 +372,7 @@ npm run build    # 构建到 dist/（生产模式使用）
 
 ### 系统提示词字段兼容
 
-Gemini 请求的 `system_instruction` 与 `systemInstruction` 会在提示词注入前统一为一个 `systemInstruction` 字段，保留原始 parts，再追加思考分离或抗截断规则。两种写法同时传入且内容相同会去重；内容不同则在请求入口返回明确的 400，避免悄悄丢弃任意一方提示词。普通流式、非流式和抗截断路径使用相同规则。
+Gemini 请求的 `system_instruction` 与 `systemInstruction` 会先统一为一个 `systemInstruction` 字段，保留原始 parts；不追加私有思考分隔提示。抗截断模式仍按原有流程处理。两种写法同时传入且内容相同会去重；内容不同则在请求入口返回明确的 400，避免悄悄丢弃任意一方提示词。普通流式、非流式和抗截断路径使用相同字段兼容规则。
 
 ### 二开回归补充
 
@@ -418,14 +419,16 @@ THINKING_MODEL_ROUTING_BASES=gemini-4-argon
 
 多个基础模型用英文逗号分隔；空列表表示不匹配任何模型。此功能负责选择上游模型，不保证所有凭证都具有该模型权限。
 
+### 原项目的思考处理规则
+
+- 按上游原生 `thought` 字段转换思考与正文：OpenAI 格式使用 `reasoning_content`，Anthropic 格式使用 thinking 内容块，Gemini 格式保留原生字段。未标注为思考的文字按正文传递，不根据标题、语言、标签或内容自动重分类、隐藏或删除。
+- “返回思维链到前端”开关按原项目规则作用于请求中的 `includeThoughts`（适用的模型配置）。如果上游仍返回思考字段，按原生字段转发，不额外做本地强制过滤。
+- 已移除二开的私有分隔提示注入、`AGY_FINAL` 标记处理、正文边界恢复及被动分析识别。`ARGON_THOUGHT_BOUNDARY_ENABLED` 和 `ARGON_PASSIVE_THOUGHT_RECOVERY_ENABLED` 已失效，即使环境仍设为 `true` 也不会重新开启。用户原有系统提示及返回文字保持原样。
+- 移除提示注入消除了本次已复现的输入触发项；配额、容量等其他原因仍可能产生 429。原生签名、工具调用、流式错误处理、完成状态与用量统计保留。
+
 ### 流式连接与日志清理
 
-- Argon 普通文本流支持在同一次生成内恢复分隔异常：标记随机串漏一个字符、替换一个字符、重复连续 1–5 个字符时按本次预期标记纠正；正文前的连续重复标记合并。未知损坏标记或标记后的内部自言自语会暂存，继续读取同一条上游流，直到出现完整、独立成行的本次正确标记才恢复；不以中文或章节标题猜测正文起点，不重新生成。代码围栏中的标记示例不能用作恢复依据。
-- 恢复窗口最多 16,384 字符、256 个排队片段、64 KiB 片段元数据，重复标记最多 32 个。到 STOP、DONE 或 EOF 仍无法确定边界、恢复后没有正文、超过窗口，或正文已经开始后出现未知损坏，仍记为 502 / `UPSTREAM_OUTPUT_BOUNDARY_INVALID`。已发送正文不撤回或重新拼接；原生思考和签名保持顺序。
-- 若尚未发送响应，可直接返回 HTTP 502；若已发送思考或其他流事件，则通过流内错误结束，调用方应检查错误事件。该错误不自动禁用凭证或重试，日志包含 `boundary_failed` 与不含正文的 `boundary_failure_reason`，以及标记纠错、重复标记、恢复次数与丢弃字符数。
-- 正常中英文正文、原生思考和现有有限标记纠错仍保留。标记后的检查只识别有限的内部指令自言自语，不是通用语义审核，不能保证识别所有未标注分析文字。
-- 上游已明确返回错误时，保留原始状态码和原因；缓冲中的分隔异常不覆盖这些错误，有问题的文本仍隔离。详细请求日志同时保存边界诊断信息。
-- 独立签名在首段、分隔符之后或正文缓冲期间都会保留，并等有效输出出现后再发送；不提前提交成功响应，只有标记和签名仍按空回复处理，重试之间不混用签名。失败的上游流在重试前释放，取消或结束时也会回收。
+- 独立签名在有效输出之前暂存并按顺序转发；不提前提交成功响应，只有签名而无有效内容仍按空回复处理，重试之间不混用签名。失败的上游流在重试前释放，取消或结束时也会回收。
 - 抗截断达到续写次数上限时，合成工具正文仍因 Token 上限截断的会保留 `MAX_TOKENS`，OpenAI / Claude 格式分别返回 `length` / `max_tokens`；成功补全后才返回正常结束。
 
 - 在“配置管理 → 基础配置”中，可通过“启用握手超时”和“握手超时秒数”控制流式上游调用的建连阶段（TCP、代理协商、TLS）。默认开启、40 秒，可设置 1–3600 秒，关闭后取消建连时限但仍保留断连回收。保存后对新请求生效，已建立的请求保持原设置。

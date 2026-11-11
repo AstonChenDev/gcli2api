@@ -34,13 +34,12 @@ class CompletionTests(unittest.TestCase):
 class StreamAccountingTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_custom_audit.CustomAuditTests.asyncSetUp
 
-    async def run_close(self, chunks, expected, *, close=False, guard=False):
+    async def run_close(self, chunks, expected, *, close=False):
         blocked=asyncio.Event()
         async def upstream(**kwargs):
             for chunk in chunks:yield chunk
             blocked.set();await asyncio.Event().wait()
-        def prepare(model,request):return request, ('BOUNDARY' if guard else None)
-        with patch.object(api,'stream_post_async',upstream),patch.object(api,'prepare_thought_boundary',prepare):
+        with patch.object(api,'stream_post_async',upstream):
             stream=api.stream_request({'model':'gemini-4-argon-medium','request':{'contents':[]}})
             for _ in chunks:await anext(stream)
             if close:await stream.aclose()
@@ -53,25 +52,25 @@ class StreamAccountingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((row['status_code'],row['success']),expected)
 
     async def test_stop_then_cancel_is_success(self):
-        await self.run_close([event('BOUNDARYOK','STOP')],(200,True),guard=True)
+        await self.run_close([event('OK','STOP')],(200,True))
 
     async def test_stop_then_aclose_is_success(self):
-        await self.run_close([event('BOUNDARYOK','STOP')],(200,True),guard=True,close=True)
+        await self.run_close([event('OK','STOP')],(200,True),close=True)
 
     async def test_internal_cancel_is_unknown_interruption(self):
-        await self.run_close([event('BOUNDARYpartial')],(500,False),guard=True)
+        await self.run_close([event('partial')],(500,False))
 
     async def test_internal_generator_close_is_unknown_interruption(self):
-        await self.run_close([event('BOUNDARYpartial')],(500,False),guard=True,close=True)
+        await self.run_close([event('partial')],(500,False),close=True)
 
-    async def test_no_guard_internal_close_is_unknown_interruption(self):
+    async def test_short_internal_close_is_unknown_interruption(self):
         await self.run_close([event('partial')],(500,False),close=True)
 
     async def test_done_then_cancel_is_success(self):
         await self.run_close([event(),'data: [DONE]\n\n'],(200,True))
 
     async def test_unmarked_finished_answer_is_success_on_close(self):
-        await self.run_close([event('missing boundary','STOP')],(200,True),guard=True,close=True)
+        await self.run_close([event('ordinary answer','STOP')],(200,True),close=True)
 
     async def test_asyncio_cancel_during_success_log_preserves_outcome(self):
         entered=asyncio.Event();calls=0
@@ -81,7 +80,7 @@ class StreamAccountingTests(unittest.IsolatedAsyncioTestCase):
             if calls==1:entered.set();await asyncio.Event().wait()
             return ''
         async def upstream(**kwargs):yield event('OK', 'STOP')
-        with patch.object(api,'stream_post_async',upstream),patch.object(api,'prepare_thought_boundary',lambda m,r:(r,None)),patch.object(api,'_record_request_body_detail',detail):
+        with patch.object(api,'stream_post_async',upstream), patch.object(api,'_record_request_body_detail',detail):
             stream=api.stream_request({'model':'gemini-4-argon-medium','request':{'contents':[]}})
             await anext(stream)
             task=asyncio.create_task(anext(stream));await entered.wait();task.cancel()
@@ -98,7 +97,7 @@ class StreamAccountingTests(unittest.IsolatedAsyncioTestCase):
         async def upstream(**kwargs):yield event(reason="STOP")
         async def consume():
             async for _ in api.stream_request({'model':'gemini-4-argon-medium','request':{'contents':[]}}):pass
-        with patch.object(api,'stream_post_async',upstream),patch.object(api,'prepare_thought_boundary',lambda m,r:(r,None)),patch.object(api,'_record_request_body_detail',detail):
+        with patch.object(api,'stream_post_async',upstream), patch.object(api,'_record_request_body_detail',detail):
             async with anyio.create_task_group() as group:
                 group.start_soon(consume);await entered.wait();group.cancel_scope.cancel();release.set()
         self.assertEqual(self.saved.await_count,1)
@@ -108,14 +107,14 @@ class StreamAccountingTests(unittest.IsolatedAsyncioTestCase):
         from starlette.responses import StreamingResponse
         disconnected=asyncio.Event();sent=[]
         async def upstream(**kwargs):
-            yield event('BOUNDARYOK', 'STOP' if finished else None)
+            yield event('OK', 'STOP' if finished else None)
             await asyncio.Event().wait()
         async def receive():
             await disconnected.wait();return {'type':'http.disconnect'}
         async def send(message):
             if message['type']=='http.response.body' and message.get('body'):
                 sent.append(message['body']);disconnected.set()
-        with patch.object(api,'stream_post_async',upstream),patch.object(api,'prepare_thought_boundary',lambda m,r:(r,'BOUNDARY')):
+        with patch.object(api,'stream_post_async',upstream):
             from src.router.stream_passthrough import build_streaming_response_or_error
             response=await build_streaming_response_or_error(api.stream_request({'model':'gemini-4-argon-medium','request':{'contents':[]}}))
             await asyncio.wait_for(response({'type':'http','asgi':{'spec_version':'2.3'}},receive,send),5)

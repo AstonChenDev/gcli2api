@@ -33,9 +33,7 @@ class FollowupRepairTests(unittest.IsolatedAsyncioTestCase):
         app = FastAPI()
         app.include_router(openai.router)
         app.dependency_overrides[openai.authenticate_bearer] = lambda: 'test'
-        with patch.object(api,'stream_post_async',upstream), patch.object(api,'prepare_thought_boundary',lambda m,r:(r,None)), \
-             patch.object(openai,'is_anti_truncation_model',return_value=anti), \
-             patch.object(openai,'get_anti_truncation_max_attempts',AsyncMock(return_value=2)):
+        with patch.object(api,'stream_post_async',upstream), patch.object(openai,'is_anti_truncation_model',return_value=anti), patch.object(openai,'get_anti_truncation_max_attempts',AsyncMock(return_value=2)):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
                 return await client.post('/v1/chat/completions',json={
                     'model':'gemini-4-argon-medium','stream':True,
@@ -85,8 +83,7 @@ class FollowupRepairTests(unittest.IsolatedAsyncioTestCase):
         app.include_router(openai.router)
         app.dependency_overrides[openai.authenticate_bearer] = lambda: 'test'
         payload = json.loads(chunk('NONSTREAM ANSWER', usage={'promptTokenCount':'bad'})[5:])
-        with patch.object(api,'post_async',AsyncMock(return_value=httpx.Response(200,json=payload))), \
-             patch.object(api,'prepare_thought_boundary',lambda m,r:(r,None)):
+        with patch.object(api,'post_async',AsyncMock(return_value=httpx.Response(200,json=payload))):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
                 response = await client.post('/v1/chat/completions',json={
                     'model':'gemini-4-argon-medium','stream':False,

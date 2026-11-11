@@ -9,8 +9,8 @@ from fastapi import FastAPI
 from src.api import antigravity as api
 from src.router.antigravity import gemini, openai, anthropic
 import test_custom_audit
-from test_thought_boundary import event
-from test_boundary_part_metadata import MARKER
+from stream_fixtures import event
+MARKER = "<<<AGY_FINAL_literal>>>"
 
 
 class ProtocolMatrixAuditTests(unittest.IsolatedAsyncioTestCase):
@@ -52,7 +52,6 @@ class ProtocolMatrixAuditTests(unittest.IsolatedAsyncioTestCase):
                                 self.saved.reset_mock()
                                 with ExitStack() as stack:
                                     stack.enter_context(patch.object(api, 'stream_post_async', upstream))
-                                    stack.enter_context(patch.object(api, 'prepare_thought_boundary', lambda m,r:(r,MARKER)))
                                     stack.enter_context(patch.object(api, 'record_api_call_error', AsyncMock()))
                                     stack.enter_context(patch('config.get_return_thoughts_to_frontend', AsyncMock(return_value=include)))
                                     for module in (gemini, openai, anthropic):
@@ -84,8 +83,8 @@ class ProtocolMatrixAuditTests(unittest.IsolatedAsyncioTestCase):
                                         delta = item['delta']
                                         reasoning += delta.get('thinking', '')
                                         content += delta.get('text', '')
-                                self.assertEqual(content, answer)
-                                self.assertEqual(reasoning, 'native reasoning' + planning if include else '')
+                                self.assertEqual(content, whole)
+                                self.assertEqual(reasoning, 'native reasoning')
                                 self.assertEqual(bool(errors), finish != 'STOP')
                                 if errors:
                                     self.assertEqual(errors[-1]['blockReason'], 'PROHIBITED_CONTENT')

@@ -9,13 +9,10 @@ from fastapi import FastAPI, Response
 import test_custom_audit
 from src.api import antigravity as api
 from src.stream_events import inspect_line
-from src.thought_boundary import ERROR_CODE
+ERROR_CODE = "UPSTREAM_OUTPUT_BOUNDARY_MISSING"
 from src.router.stream_passthrough import build_streaming_response_or_error
 from src.converter.openai2gemini import convert_gemini_to_openai_stream
 from src.converter.anthropic2gemini import gemini_stream_to_anthropic_stream
-
-
-MARKER = 'BOUNDARY'
 
 
 def event(parts=None, finish=None, **extra):
@@ -51,15 +48,8 @@ class EventRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 yield item
         self.record_error = AsyncMock()
         self.record_success = AsyncMock()
-        with patch.object(api, 'stream_post_async', upstream), \
-             patch.object(api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)), \
-             patch.object(api, 'get_retry_config', AsyncMock(return_value={
-                 'retry_enabled': enabled, 'max_retries': maximum, 'retry_interval': 0})), \
-             patch.object(api, 'record_api_call_error', self.record_error), \
-             patch.object(api, 'record_api_call_success', self.record_success), \
-             patch.object(api, '_switch_credential_for_retry', AsyncMock(return_value=(True, None))), \
-             patch.object(api, 'handle_error_with_retry', AsyncMock(return_value=enabled)), \
-             patch.object(api, 'parse_and_log_cooldown', AsyncMock(return_value=None)):
+        with patch.object(api, 'stream_post_async', upstream), patch.object(api, 'get_retry_config', AsyncMock(return_value={
+                 'retry_enabled': enabled, 'max_retries': maximum, 'retry_interval': 0})), patch.object(api, 'record_api_call_error', self.record_error), patch.object(api, 'record_api_call_success', self.record_success), patch.object(api, '_switch_credential_for_retry', AsyncMock(return_value=(True, None))), patch.object(api, 'handle_error_with_retry', AsyncMock(return_value=enabled)), patch.object(api, 'parse_and_log_cooldown', AsyncMock(return_value=None)):
             chunks = [x async for x in api.stream_request({'model': 'gemini-4-argon-medium',
                 'request': {'contents': [], 'generationConfig': {'thinkingConfig': {'includeThoughts': include}}}},
                 log_ctx={'request_id': 'synthetic-same-request'})]
@@ -69,7 +59,7 @@ class EventRecoveryTests(unittest.IsolatedAsyncioTestCase):
         thought = {'text': '原生思考', 'thought': True, 'thoughtSignature': 'synthetic-signature'}
         chunks, rows = await self.run_attempts([
             ['', ': keepalive', 'data: {"candidates":[],"usageMetadata":{"totalTokenCount":3}}', 'data: [DONE]'],
-            [event([thought]), event([{'text': MARKER + '正文'}], 'STOP',
+            [event([thought]), event([{'text': '正文'}], 'STOP',
                 usageMetadata={'promptTokenCount': 10, 'candidatesTokenCount': 2, 'totalTokenCount': 12})]])
         self.assertEqual(self.calls, 2)
         self.assertEqual([r['status_code'] for r in rows], [502, 200])
@@ -107,7 +97,7 @@ class EventRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_sse_error_can_recover_before_content(self):
         chunks, rows = await self.run_attempts([
             ['data: {"error":{"code":503,"status":"UNAVAILABLE"}}'],
-            [event([{'text': MARKER + '恢复'}], 'STOP')]])
+            [event([{'text': '恢复'}], 'STOP')]])
         self.assertEqual(self.calls, 2)
         self.assertEqual([r['status_code'] for r in rows], [503, 200])
         self.assertEqual(parts_of(chunks), [{'text': '恢复'}])
@@ -128,11 +118,6 @@ class EventRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(chunks[-1].body)['error']['status'], 'UPSTREAM_INVALID_EVENT')
         self.assertEqual(parts_of(chunks), [])
 
-    async def test_confirmed_thinking_without_boundary_remains_thought_without_error(self):
-        chunks, rows = await self.run_attempts([[event([{'text': 'Thinking Process:\n不确定是思考还是正文'}], 'STOP')]])
-        self.assertEqual(self.calls, 1)
-        self.assertTrue(all(p.get('thought') is True for p in parts_of(chunks)))
-        self.assertTrue(rows[0]['success'])
 
     async def test_native_thought_followed_by_unmarked_body_succeeds(self):
         chunks, rows = await self.run_attempts([[event([{'text': '思考', 'thought': True}]),
@@ -142,7 +127,7 @@ class EventRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rows[0]['success'])
 
     async def test_no_retry_after_thought_or_body_on_transport_or_upstream_error(self):
-        for part in [{'text': '思考', 'thought': True}, {'text': MARKER + '正文'}]:
+        for part in [{'text': '思考', 'thought': True}, {'text': '正文'}]:
             for failure in [RuntimeError('synthetic disconnect'),
                             'data: {"error":{"code":503,"status":"UNAVAILABLE"}}',
                             Response(status_code=503, content='synthetic HTTP error')]:
@@ -155,45 +140,22 @@ class EventRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_transport_error_before_content_retries(self):
         chunks, rows = await self.run_attempts([[RuntimeError('synthetic disconnect')],
-                                               [event([{'text': MARKER + 'OK'}], 'STOP')]])
+                                               [event([{'text': 'OK'}], 'STOP')]])
         self.assertEqual(self.calls, 2)
         self.assertEqual([r['status_code'] for r in rows], [500, 200])
         self.assertEqual(parts_of(chunks), [{'text': 'OK'}])
 
-    async def test_optout_still_suppresses_native_and_reclassified_thought(self):
-        chunks, rows = await self.run_attempts([[event([{'text': 'native', 'thought': True},
-            {'text': 'reclassified' + MARKER + 'answer'}], 'STOP')]], include=False)
-        self.assertEqual(parts_of(chunks), [{'text': 'answer'}])
-        self.assertTrue(rows[0]['success'])
-
-    async def test_both_converters_keep_recovered_thought_out_of_body(self):
-        chunks, _ = await self.run_attempts([[''], [event([
-            {'text': '思考', 'thought': True, 'thoughtSignature': 'synthetic'},
-            {'text': MARKER + '答案'}], 'STOP')]])
-        converted = convert_gemini_to_openai_stream(chunks[0], 'gemini-4-argon-medium', 'synthetic')
-        delta = json.loads(converted[6:])['choices'][0]['delta']
-        self.assertEqual(delta['reasoning_content'], '思考')
-        self.assertEqual(delta['content'], '答案')
-        async def source():
-            for c in chunks:
-                yield c.encode()
-        output = [x async for x in gemini_stream_to_anthropic_stream(source(), 'gemini-4-argon-medium')]
-        deltas = [json.loads(line[6:]).get('delta') for x in output for line in x.decode().splitlines()
-                  if line.startswith('data: ')]
-        self.assertIn({'type': 'thinking_delta', 'thinking': '思考'}, deltas)
-        self.assertIn({'type': 'text_delta', 'text': '答案'}, deltas)
 
     async def test_real_httpx_line_iteration_and_response_prefetch(self):
         # Exercise the actual HTTP decoder and first-event prefetch, offline.
         from src import httpx_client
-        payload = '\n' + event([{'text': MARKER + 'OK'}], 'STOP').replace('data: ', 'data:')
+        payload = '\n' + event([{'text': 'OK'}], 'STOP').replace('data: ', 'data:')
         @asynccontextmanager
         async def client(**kwargs):
             async with httpx.AsyncClient(transport=httpx.MockTransport(
                     lambda request: httpx.Response(200, text=payload))) as session:
                 yield session
-        with patch.object(httpx_client, 'get_streaming_client', client), \
-             patch.object(api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)):
+        with patch.object(httpx_client, 'get_streaming_client', client):
             response = await build_streaming_response_or_error(api.stream_request(
                 {'model': 'gemini-4-argon-medium', 'request': {'contents': []}}))
             chunks = []
@@ -232,18 +194,14 @@ class EventRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     yield ''
                     return
                 yield event([{'text': 'synthetic-thought', 'thought': True, 'thoughtSignature': 'synthetic'},
-                             {'text': MARKER + 'synthetic-answer'}], 'STOP')
+                             {'text': 'synthetic-answer'}], 'STOP')
             self.saved.reset_mock()
-            with patch.object(api, 'stream_post_async', upstream), \
-                 patch.object(api, 'prepare_thought_boundary', lambda m, r: (r, MARKER)), \
-                 patch.object(api, 'get_retry_config', AsyncMock(return_value={
-                     'retry_enabled': True, 'max_retries': 2, 'retry_interval': 0})), \
-                 patch.object(api, '_switch_credential_for_retry', AsyncMock(return_value=(True, None))):
+            with patch.object(api, 'stream_post_async', upstream), patch.object(api, 'get_retry_config', AsyncMock(return_value={
+                     'retry_enabled': True, 'max_retries': 2, 'retry_interval': 0})), patch.object(api, '_switch_credential_for_retry', AsyncMock(return_value=(True, None))):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
                     response = await client.post(url, json=body)
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(calls, 2)
-            self.assertNotIn(MARKER, response.text)
             self.assertNotIn(ERROR_CODE, response.text)
             events = [json.loads(line[5:]) for line in response.text.splitlines()
                       if line.startswith('data:') and line[5:].strip() != '[DONE]']

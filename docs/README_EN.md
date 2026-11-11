@@ -298,7 +298,7 @@ agy2api supports two storage backends: **Local SQLite (Default)** and **PostgreS
 Credentials are stored as structured database columns (no JSON blobs), keyed uniquely by **email**:
 `email`, `access_token`, `refresh_token`, `client_id`, `client_secret`, `project_id`, `expiry`, `tier`
 
-Import/export uses a standardized JSON format: `{"refresh_token": "...", "email": "...", "tier": "...", "project_id": "..."}` (only `refresh_token` is required; the rest are fetched automatically).
+Import/export uses a standardized JSON format: `{"refresh_token": "...", "access_token": "...", "expiry": "...", "email": "...", "tier": "...", "project_id": "..."}` (only `refresh_token` is required; an unexpired `access_token` is reused directly; the rest are fetched automatically).
 
 ### Environment Variable Configuration
 
@@ -328,6 +328,7 @@ Import/export uses a standardized JSON format: `{"refresh_token": "...", "email"
 - `PROXY`: Proxy address (supports `http://`, `https://`, `socks5://`, `socks5h://`, optionally with credentials `user:pass@host:port`)
 - `OAUTH_PROXY_URL`: OAuth authentication proxy endpoint
 - `GOOGLEAPIS_PROXY_URL`: Google APIs proxy endpoint
+- `PATH_PREFIX`: When the reverse proxy preserves the path prefix (e.g. `/AGY2API`), set this so the backend strips it before routing; default: empty (no stripping)
 
 **Automation Configuration**
 - `AUTO_BAN`: Enable automatic credential banning (default: false)

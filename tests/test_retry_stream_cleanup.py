@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import Response
 import test_custom_audit
-from test_thought_boundary import event
+from stream_fixtures import event
 from src.api import antigravity as api
 from src.stream_delivery import StreamDelivery, current_delivery
 
@@ -41,7 +41,6 @@ class RetryStreamCleanupTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     with ExitStack() as stack:
                         stack.enter_context(patch.object(api, 'stream_post_async', upstream))
-                        stack.enter_context(patch.object(api, 'prepare_thought_boundary', lambda m, r: (r, None)))
                         stack.enter_context(patch.object(api, 'get_retry_config', AsyncMock(return_value={
                             'retry_enabled': True, 'max_retries': 1, 'retry_interval': 0})))
                         stack.enter_context(patch.object(api, 'record_api_call_error', AsyncMock()))

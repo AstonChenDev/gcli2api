@@ -9,10 +9,12 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from config import get_usage_log_enabled
 from log import log
-from src.request_body_log import delete_request_body_logs, read_request_body_log
+from src.request_body_log import delete_orphan_request_body_logs, delete_request_body_logs, read_request_body_log
+from src.usage_log import flush_usage_logs
 from src.storage.database import get_database
 from src.utils import verify_panel_token
 
@@ -35,6 +37,8 @@ async def get_overall_usage_stats(
 ):
     filters = overall_filters(start_timestamp, end_timestamp, model_name)
     database = await get_database()
+    # Match /list: include completed calls still waiting in this worker's queue.
+    await flush_usage_logs()
     result = await database.overall_usage_stats(**filters)
     result["logging_enabled"] = await get_usage_log_enabled()
     return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
@@ -49,6 +53,7 @@ async def get_overall_usage_errors(
 ):
     filters = overall_filters(start_timestamp, end_timestamp, model_name)
     database = await get_database()
+    await flush_usage_logs()
     result = await database.overall_usage_errors(scope=scope, offset=offset, limit=limit,
         status_code=status_code, **filters)
     return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
@@ -67,6 +72,7 @@ async def lookup_request(
     if id_type == "log_id" and not (identifier.isascii() and identifier.isdecimal() and len(identifier) <= 19 and 0 < int(identifier) <= 9223372036854775807):
         raise HTTPException(400, "日志 ID 必须是有效的正整数")
     database = await get_database()
+    await flush_usage_logs()
     items, total = await database.query_usage_logs(identifier=identifier, id_type=id_type, offset=offset, limit=limit)
     return JSONResponse(content={"items": items, "total": total, "offset": offset, "limit": limit}, headers={"Cache-Control": "no-store"})
 
@@ -81,6 +87,7 @@ async def get_credential_usage_stats(
     if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
         raise HTTPException(400, "开始时间不能晚于结束时间")
     database = await get_database()
+    await flush_usage_logs()
     result = await database.credential_usage_stats(offset=offset, limit=limit,
         start_timestamp=start_timestamp, end_timestamp=end_timestamp,
         model_name=model_name.strip(), credential_email=credential_email.strip() if credential_email is not None else None)
@@ -99,6 +106,7 @@ async def get_credential_usage_errors(
     if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
         raise HTTPException(400, "开始时间不能晚于结束时间")
     database = await get_database()
+    await flush_usage_logs()
     return JSONResponse(content=await database.credential_usage_errors(offset=offset, limit=limit,
         status_code=status_code, start_timestamp=start_timestamp, end_timestamp=end_timestamp,
         model_name=model_name.strip(), credential_email=credential_email.strip()), headers={"Cache-Control": "no-store"})
@@ -126,6 +134,8 @@ async def get_usage_logs(
             raise HTTPException(status_code=400, detail="offset 不能为负数")
 
         database = await get_database()
+        # 批量写队列中的待落库日志先刷盘，保证面板看到最新数据
+        await flush_usage_logs()
         items, total = await database.query_usage_logs(
             offset=offset,
             limit=limit,
@@ -158,6 +168,8 @@ async def get_usage_stats(
     """聚合统计：请求数 / 成功失败 / token 汇总 / 平均耗时 / 每模型分布"""
     try:
         database = await get_database()
+        # 批量写队列中的待落库日志先刷盘，保证统计完整
+        await flush_usage_logs()
         stats = await database.usage_log_stats(
             start_timestamp=start_timestamp,
             end_timestamp=end_timestamp,
@@ -181,9 +193,11 @@ async def clear_logs(
         if days < 0:
             raise HTTPException(status_code=400, detail="天数不能为负数")
         cutoff = time.time() - days * 86400
+        await flush_usage_logs()
         database = await get_database()
         deleted, paths = await database.delete_usage_logs_with_files(cutoff)
         files_deleted = await asyncio.to_thread(delete_request_body_logs, paths)
+        files_deleted += await delete_orphan_request_body_logs(database, cutoff)
         return JSONResponse(content={
             "message": "已清理已有日志" if days == 0 else f"已清理 {days} 天前的日志",
             "deleted": deleted,
@@ -201,9 +215,11 @@ async def truncate_logs(token: str = Depends(verify_panel_token)):
     """清空操作开始前的日志，保留并发完成的新请求记录。"""
     try:
         cutoff = time.time()
+        await flush_usage_logs()
         database = await get_database()
         deleted, paths = await database.delete_usage_logs_with_files(cutoff)
         files_deleted = await asyncio.to_thread(delete_request_body_logs, paths)
+        files_deleted += await delete_orphan_request_body_logs(database, cutoff)
 
         return JSONResponse(content={
             "message": "已清空已有日志，保留清空期间新增的记录",

@@ -29,7 +29,7 @@ class ContinuationAccountingTests(unittest.IsolatedAsyncioTestCase):
                     nonlocal calls
                     calls += 1
                     if calls == 1:
-                        yield event('BOUNDARYfirst segment','MAX_TOKENS')
+                        yield event('first segment','MAX_TOKENS')
                     else:
                         yield Response(status_code=400,content=json.dumps({'error':{'code':400,'status':'INVALID_ARGUMENT','message':'continuation rejected'}}))
                 with ExitStack() as stack:
@@ -37,7 +37,6 @@ class ContinuationAccountingTests(unittest.IsolatedAsyncioTestCase):
                         stack.enter_context(patch.object(module,'is_anti_truncation_model',return_value=True))
                         stack.enter_context(patch.object(module,'get_anti_truncation_max_attempts',AsyncMock(return_value=2)))
                     stack.enter_context(patch.object(api,'stream_post_async',upstream))
-                    stack.enter_context(patch.object(api,'prepare_thought_boundary',lambda m,r:(r,'BOUNDARY')))
                     stack.enter_context(patch.object(api,'record_api_call_error',AsyncMock()))
                     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
                         response=await client.post(url,json=body)
@@ -58,7 +57,7 @@ class ContinuationAccountingTests(unittest.IsolatedAsyncioTestCase):
                     async def upstream(**kwargs):
                         nonlocal calls
                         calls += 1
-                        yield event('BOUNDARY' + ('first' if calls == 1 else 'second'), 'STOP')
+                        yield event(('first' if calls == 1 else 'second'), 'STOP')
 
                     async def segments():
                         for _ in range(2):
@@ -77,9 +76,7 @@ class ContinuationAccountingTests(unittest.IsolatedAsyncioTestCase):
                     async def receive():
                         await asyncio.Event().wait()
 
-                    with patch.object(api, 'stream_post_async', upstream), patch.object(
-                        api, 'prepare_thought_boundary', lambda m, r: (r, 'BOUNDARY'),
-                    ):
+                    with patch.object(api, 'stream_post_async', upstream):
                         response = await build_streaming_response_or_error(segments())
                         run = response({'type': 'http', 'asgi': {'spec_version': version}}, receive, send)
                         if fail_second_send:

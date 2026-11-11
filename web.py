@@ -12,6 +12,11 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from log import log
+import config
+from src import session_cache
+from src.storage.database import get_database, close_database
+from src.usage_log import close_usage_logs
+from src.httpx_client import close_shared_clients
 
 # Import managers and utilities
 # credential_manager 已重构为无状态函数模块（无需初始化/关闭）
@@ -31,7 +36,6 @@ async def lifespan(app: FastAPI):
 
     # 初始化配置缓存（优先执行）
     try:
-        import config
         await config.init_config()
         log.info("配置缓存初始化成功")
     except Exception as e:
@@ -39,7 +43,6 @@ async def lifespan(app: FastAPI):
 
     # 预热数据库连接（提前暴露配置问题）
     try:
-        from src.storage.database import get_database
         await get_database()
         log.info("数据库连接就绪")
     except Exception as e:
@@ -47,10 +50,8 @@ async def lifespan(app: FastAPI):
 
     # 初始化会话凭证缓存（Redis 可选，未配置时使用内存后端）
     try:
-        import os as os_module
-        from src import session_cache
 
-        redis_url = os_module.getenv("REDIS_URL", "")
+        redis_url = os.getenv("REDIS_URL", "")
         if redis_url:
             await session_cache.init_redis(redis_url)
         else:
@@ -67,15 +68,26 @@ async def lifespan(app: FastAPI):
 
     # 关闭凭证管理器与数据库
     try:
-        from src.storage.database import close_database
+        await close_usage_logs()
+        log.info("请求日志队列已落库")
+    except Exception as e:
+        log.error(f"落库请求日志时出错: {e}")
+
+    try:
         await close_database()
         log.info("数据库已关闭")
     except Exception as e:
         log.error(f"关闭数据库时出错: {e}")
 
+    # 关闭共享 httpx 客户端（释放连接池）
+    try:
+        await close_shared_clients()
+        log.info("HTTP 客户端已关闭")
+    except Exception as e:
+        log.error(f"关闭 HTTP 客户端时出错: {e}")
+
     # 关闭会话凭证缓存
     try:
-        from src import session_cache
         await session_cache.close()
     except Exception as e:
         log.debug(f"关闭会话缓存时出错: {e}")
@@ -99,7 +111,6 @@ class IPWhitelistMiddleware:
             await self.app(scope, receive, send)
             return
 
-        import config
 
         try:
             enabled, rules = await config.get_ip_whitelist_rules()
@@ -129,6 +140,32 @@ class IPWhitelistMiddleware:
         await self.app(scope, receive, send)
 
 
+class PathPrefixMiddleware:
+    """
+    路径前缀剥离中间件（纯 ASGI）
+
+    反代保留路径前缀时（如 location /AGY2API/ 搭配不带 URI 的 proxy_pass），
+    请求路径形如 /AGY2API/xxx。配置 PATH_PREFIX 后，中间件在路由匹配前
+    剥掉该前缀；未配置时请求原样下发。
+    """
+
+    def __init__(self, app, prefix: str):
+        self.app = app
+        self.prefix = prefix
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path == self.prefix or path.startswith(self.prefix + "/"):
+                scope["path"] = path[len(self.prefix):] or "/"
+                raw_path = scope.get("raw_path")
+                if isinstance(raw_path, bytes) and raw_path.startswith(
+                    self.prefix.encode("ascii")
+                ):
+                    scope["raw_path"] = raw_path[len(self.prefix):] or b"/"
+        await self.app(scope, receive, send)
+
+
 # 创建FastAPI应用
 app = FastAPI(
     title="AGY2API",
@@ -146,8 +183,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# IP 白名单中间件（需在最外层，先于 CORS 与所有路由执行）
+# IP 白名单中间件（先于 CORS 与所有路由执行）
 app.add_middleware(IPWhitelistMiddleware)
+
+# 路径前缀剥离中间件（配置 PATH_PREFIX 时启用，先于白名单与所有路由执行，
+# 使反代保留前缀的请求按剥掉前缀后的路径匹配路由）
+path_prefix = os.environ.get("PATH_PREFIX", "").rstrip("/")
+if path_prefix:
+    app.add_middleware(PathPrefixMiddleware, prefix=path_prefix)
+    log.info(f"已启用路径前缀剥离: {path_prefix}")
 
 # 挂载路由器
 # Antigravity路由 - 处理OpenAI格式请求并转换为Antigravity API

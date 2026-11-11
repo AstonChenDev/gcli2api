@@ -294,7 +294,7 @@ agy2apiは2つのストレージバックエンドに対応: **ローカルSQLit
 クレデンシャルは**メールアドレス（email）を一意キー**として構造化データベースカラムで保存されます（JSON blobは不使用）:
 `email`、`access_token`、`refresh_token`、`client_id`、`client_secret`、`project_id`、`expiry`、`tier`
 
-インポート/エクスポートは標準化JSON形式: `{"refresh_token": "...", "email": "...", "tier": "...", "project_id": "..."}`（`refresh_token` のみ必須、残りは自動取得）。
+インポート/エクスポートは標準化JSON形式: `{"refresh_token": "...", "access_token": "...", "expiry": "...", "email": "...", "tier": "...", "project_id": "..."}`（`refresh_token` のみ必須、有効期限内の `access_token` はそのまま再利用、残りは自動取得）。
 
 ### 環境変数設定
 
@@ -324,6 +324,7 @@ agy2apiは2つのストレージバックエンドに対応: **ローカルSQLit
 - `PROXY`: プロキシアドレス（`http://`、`https://`、`socks5://`、`socks5h://` 対応、`user:pass@host:port` 形式の認証情報付きも可）
 - `OAUTH_PROXY_URL`: OAuth認証プロキシエンドポイント
 - `GOOGLEAPIS_PROXY_URL`: Google APIsプロキシエンドポイント
+- `PATH_PREFIX`: リバースプロキシがパスプレフィックスを保持する場合（例: `/AGY2API`）、バックエンドがルーティング前にプレフィックスを剥がすよう設定。デフォルト: 空（剥がさない）
 
 **自動化設定**
 - `AUTO_BAN`: クレデンシャル自動BANの有効化（デフォルト: false）

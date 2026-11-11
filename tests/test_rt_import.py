@@ -41,6 +41,29 @@ class RTImportTests(unittest.IsolatedAsyncioTestCase):
     async def post(self, payload):
         return await self.client.post("/creds/import-antigravity-refresh-tokens", json=payload)
 
+    async def test_invalid_unicode_token_does_not_abort_valid_items(self):
+        payload = {"refresh_tokens": [chr(0xD800), "synthetic-good"]}
+        prepare = AsyncMock(return_value=("valid@example.invalid", credential()))
+        with patch.object(rt, "prepare_credential", prepare):
+            response = await self.client.post("/creds/import-antigravity-refresh-tokens",
+                content=json.dumps(payload), headers={"Content-Type": "application/json"})
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual((result["imported_count"], result["failed_count"]), (1, 1))
+        self.assertEqual(result["results"][0]["error_code"], "invalid_refresh_token")
+        prepare.assert_awaited_once_with("synthetic-good")
+        self.assertNotIn("synthetic-good", response.text)
+
+    async def test_excessive_json_depth_is_input_error(self):
+        depth = 10000
+        body = '{"refresh_tokens":' + '[' * depth + '"synthetic"' + ']' * depth + '}'
+        with patch.object(rt, "prepare_credential", AsyncMock()) as prepare:
+            response = await self.client.post("/creds/import-antigravity-refresh-tokens",
+                content=body, headers={"Content-Type": "application/json"})
+        self.assertEqual(response.status_code, 400)
+        prepare.assert_not_awaited()
+        self.assertNotIn("synthetic", response.text)
+
     async def test_supported_shapes(self):
         for payload in [
             {"refresh_tokens": ["a\nb"]}, ["a", "b"],

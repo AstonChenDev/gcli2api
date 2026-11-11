@@ -95,13 +95,11 @@ class CustomAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.saved.call_args.args[0]['status_code'],500)
         self.assertIn('STREAM_INTERRUPTED_UNKNOWN', self.saved.call_args.args[0]['error_message'])
 
-    async def test_schema_snake_case_bypasses_text_boundary_and_conflicts_reject(self):
-        from src.thought_boundary import prepare_thought_boundary
+    async def test_schema_snake_case_normalizes_and_conflicts_reject(self):
         from src.converter.request_fields import normalize_gemini_request_fields
         from fastapi import HTTPException
         request = {'generation_config':{'response_mime_type':'application/json','response_json_schema':{'type':'object','properties':{'top_k':{'type':'number'}}}}}
-        prepared, marker = prepare_thought_boundary('gemini-4-argon-medium', request)
-        self.assertIsNone(marker)
+        prepared = normalize_gemini_request_fields(request)
         self.assertNotIn('systemInstruction',prepared)
         self.assertIn('top_k',prepared['generationConfig']['responseJsonSchema']['properties'])
         with self.assertRaises(HTTPException):

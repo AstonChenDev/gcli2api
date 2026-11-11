@@ -1,9 +1,9 @@
-import api from "../api";
+import api from "../api.js";
 
 // Stream results as each credential finishes; no two-minute Axios request timeout.
 export async function uploadCredentialFiles(formData, { signal, onEvent }) {
   const token = localStorage.getItem("agy2apiPreviewPanelToken");
-  const response = await fetch(`${api.defaults.baseURL || ""}/creds/upload-stream`, {
+  const response = await fetch(api.getUri({ url: "/creds/upload-stream" }), {
     method: "POST", body: formData, signal,
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });

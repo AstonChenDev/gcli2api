@@ -52,7 +52,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
         async def waiting():
             await asyncio.Event().wait()
-        with patch.object(api, 'stream_post_async', upstream), patch.object(api, 'prepare_thought_boundary', lambda m,r:(r,'BOUNDARY')):
+        with patch.object(api, 'stream_post_async', upstream):
             response = await build_streaming_response_or_error(api.stream_request(
                 {'model':'gemini-4-argon-medium','request':{'contents':[]}}))
             await asyncio.wait_for(response({'type':'http','asgi':{'spec_version':version}}, receive or waiting, send), 2)
@@ -65,7 +65,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 if message['type']=='http.response.body':
                     raise BrokenPipeError('synthetic failed send')
             with self.assertRaises(Exception):
-                await self.respond([event('BOUNDARYanswer','STOP')],send,version=version)
+                await self.respond([event('answer','STOP')],send,version=version)
             self.assertEqual(self.saved.await_count,1)
             self.assertEqual(self.saved.call_args.args[0]['status_code'],499)
 
@@ -74,7 +74,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         async def send(message):
             self.assertEqual(self.saved.await_count,0)
             if message['type']=='http.response.start':headers.extend(message['headers'])
-        await self.respond([event('BOUNDARYanswer','STOP')],send)
+        await self.respond([event('answer','STOP')],send)
         self.assertEqual(self.saved.await_count,1)
         row=self.saved.call_args.args[0]
         self.assertTrue(row['success'])
@@ -86,7 +86,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             if message['type']=='http.response.body' and message.get('body'):disconnected.set()
         async def receive():
             await disconnected.wait();return {'type':'http.disconnect'}
-        await self.respond([event('BOUNDARYanswer','STOP')],send,receive,version='2.3')
+        await self.respond([event('answer','STOP')],send,receive,version='2.3')
         self.assertEqual(self.saved.call_args.args[0]['status_code'],200)
 
     async def test_internal_task_cancel_is_not_claimed_as_client_disconnect(self):
@@ -188,9 +188,9 @@ class ExplicitErrorCodes(unittest.IsolatedAsyncioTestCase):
                     with self.subTest(code=code,partial=partial,url=url):
                         self.saved.reset_mock()
                         async def upstream(**kw):
-                            if partial:yield event('BOUNDARYpartial answer')
+                            if partial:yield event('partial answer')
                             yield 'data: '+json.dumps({'error':{'code':code,'status':'SYNTHETIC_UPSTREAM_ERROR','message':'original error'}})
-                        with patch.object(api,'stream_post_async',upstream),patch.object(api,'record_api_call_error',AsyncMock()),patch.object(api,'prepare_thought_boundary',lambda m,r:(r,'BOUNDARY')):
+                        with patch.object(api,'stream_post_async',upstream), patch.object(api,'record_api_call_error',AsyncMock()):
                             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as c:
                                 response=await c.post(url,json=body)
                         self.assertEqual(response.status_code,200 if partial else code)
@@ -214,9 +214,9 @@ class CompletedTransportTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(finish=finish):
                 self.saved.reset_mock()
                 async def upstream(**kwargs):
-                    yield event('BOUNDARYanswer',finish)
+                    yield event('answer',finish)
                     raise httpx.RemoteProtocolError('synthetic transport close')
-                with patch.object(api,'stream_post_async',upstream),patch.object(api,'prepare_thought_boundary',lambda m,r:(r,'BOUNDARY')):
+                with patch.object(api,'stream_post_async',upstream):
                     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
                         response=await client.post('/v1beta/models/gemini-4-argon-medium:streamGenerateContent',json={'contents':[{'role':'user','parts':[{'text':'test'}]}]})
                 self.assertEqual(self.saved.await_count,1)

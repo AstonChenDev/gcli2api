@@ -1,7 +1,9 @@
 import axios from "axios";
+import { getBasePath } from "./basePath.js";
 
 const api = axios.create({
-  baseURL: window.location.pathname.startsWith("/preview/") ? "/preview" : "",
+  // 基径取面板页面所在路径（末尾补斜杠），反代到子路径下时请求仍落在同一子路径内
+  baseURL: getBasePath(),
   timeout: 120000,
 });
 
@@ -21,7 +23,7 @@ api.interceptors.response.use(
     const credentialTestFailure = error.config?.url?.startsWith("/creds/test/") && error.response?.data?.email;
     if (error.response?.status === 401 && !credentialTestFailure) {
       localStorage.removeItem("agy2apiPreviewPanelToken");
-      window.location.href = window.location.pathname.startsWith("/preview/") ? "/preview/" : "/";
+      window.location.href = getBasePath();
     }
     return Promise.reject(error);
   }

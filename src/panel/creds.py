@@ -1,7 +1,7 @@
 """
 凭证管理路由模块 - 处理 /creds/* 相关的HTTP请求（仅 Antigravity 模式）
 凭证以 email 为唯一键；导入/导出使用规范 JSON 格式：
-  { "refresh_token": "...", "email": "...", "tier": "...", "project_id": "..." }
+  { "refresh_token": "...", "access_token": "...", "expiry": "...", "email": "...", "tier": "...", "project_id": "..." }
 """
 
 import asyncio
@@ -26,6 +26,7 @@ from src.credential_manager import (
     remove_credential,
     set_cred_disabled,
 )
+from src.stream_events import inspect_line, stream_error
 from src.models import (
     CredFileActionRequest,
     CredFileBatchActionRequest,
@@ -46,7 +47,7 @@ from src.utils import (
 )
 from src.api.antigravity import fetch_quota_info, build_antigravity_headers
 from src.credential_cooldown import acquire_test_dispatch, CooldownStore, PoolCooling
-from anyio import CancelScope
+from src import httpx_client
 from src.google_oauth_api import (
     Credentials,
     fetch_project_id_and_tier,
@@ -110,7 +111,8 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     导入单个凭证（规范格式）。
     必须字段: refresh_token
-    可选字段: email / tier / project_id（缺失时自动获取）
+    可选字段: email / tier / project_id / access_token / expiry
+    （access_token 未过期时直接复用；否则用 refresh_token 刷新获取，其余缺失字段自动获取）
 
     Returns:
         {"status": "success"|"error", "email": ..., "message": ...}
@@ -123,29 +125,45 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
         email = (data.get("email") or "").strip().lower() or None
         tier = (data.get("tier") or "").strip().lower() or None
         project_id = (data.get("project_id") or "").strip() or None
+        access_token = (str(data.get("access_token") or "")).strip()
+        expiry = (str(data.get("expiry") or "")).strip()
 
-        # 用 refresh_token 换 access_token，同时验证凭证有效性
-        creds = Credentials(
-            access_token="",
-            refresh_token=refresh_token,
-            client_id=ANTIGRAVITY_CLIENT_ID,
-            client_secret=ANTIGRAVITY_CLIENT_SECRET,
-        )
-        for attempt in range(2):
-            try:
-                await asyncio.wait_for(creds.refresh(), timeout=IMPORT_REFRESH_TIMEOUT)
-                break
-            except Exception as exc:
-                # Credentials.refresh wraps transport errors in TokenError; keep the cause.
-                network_error = isinstance(exc, (TimeoutError, httpx.RequestError)) or isinstance(exc.__context__, httpx.RequestError)
-                status = getattr(exc, "status_code", None)
-                retryable = network_error or status in (429, 500, 502, 503, 504)
-                if retryable and attempt == 0:
-                    await asyncio.sleep(0.5)
-                    continue
-                if network_error:
-                    return {"status": "error", "code": "network_error", "message": "连接 Google 验证服务超时或网络异常（已重试），请检查代理后重试；不代表凭证无效"}
-                return {"status": "error", "code": "oauth_rejected", "message": f"Google 令牌验证失败（HTTP {status}）" if status else "令牌验证失败，请检查凭证格式后重试"}
+        # 提供了未过期的 access_token 时直接复用（跳过刷新，避免批量导入触发 OAuth 限流）
+        creds = None
+        if access_token:
+            candidate = Credentials.from_dict({
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "client_id": ANTIGRAVITY_CLIENT_ID,
+                "client_secret": ANTIGRAVITY_CLIENT_SECRET,
+                "expiry": expiry,
+            })
+            if not candidate.is_expired():
+                creds = candidate
+
+        if creds is None:
+            # 用 refresh_token 换 access_token，同时验证凭证有效性
+            creds = Credentials(
+                access_token="",
+                refresh_token=refresh_token,
+                client_id=ANTIGRAVITY_CLIENT_ID,
+                client_secret=ANTIGRAVITY_CLIENT_SECRET,
+            )
+            for attempt in range(2):
+                try:
+                    await asyncio.wait_for(creds.refresh(), timeout=IMPORT_REFRESH_TIMEOUT)
+                    break
+                except Exception as exc:
+                    # Credentials.refresh wraps transport errors in TokenError; keep the cause.
+                    network_error = isinstance(exc, (TimeoutError, httpx.RequestError)) or isinstance(exc.__context__, httpx.RequestError)
+                    status = getattr(exc, "status_code", None)
+                    retryable = network_error or status in (429, 500, 502, 503, 504)
+                    if retryable and attempt == 0:
+                        await asyncio.sleep(0.5)
+                        continue
+                    if network_error:
+                        return {"status": "error", "code": "network_error", "message": "连接 Google 验证服务超时或网络异常（已重试），请检查代理后重试；不代表凭证无效"}
+                    return {"status": "error", "code": "oauth_rejected", "message": f"Google 令牌验证失败（HTTP {status}）" if status else "令牌验证失败，请检查凭证格式后重试"}
 
         if not creds.access_token:
             return {"status": "error", "message": "refresh_token 无效: 未获取到 access_token"}
@@ -455,18 +473,19 @@ async def download_all_creds_common() -> Response:
         for email in emails:
             try:
                 state = await database.get_credential_state(email)
+                # 从凭证数据中取 refresh_token / access_token / expiry
+                cred = await database.get_credential(email)
+                if not cred:
+                    continue
+
                 export_data = {
-                    "refresh_token": "",
+                    "refresh_token": cred.get("refresh_token", ""),
+                    "access_token": cred.get("access_token", ""),
+                    "expiry": cred.get("expiry", ""),
                     "email": email,
                     "tier": state.get("tier", "pro"),
                     "project_id": state.get("project_id", ""),
                 }
-                # 从凭证数据中取 refresh_token
-                cred = await database.get_credential(email)
-                if cred:
-                    export_data["refresh_token"] = cred.get("refresh_token", "")
-                else:
-                    continue
 
                 if cred.get("note"):
                     export_data["note"] = cred["note"]
@@ -581,6 +600,8 @@ async def import_antigravity_refresh_token_credentials(
                 raise HTTPException(status_code=413, detail="导入文件不能超过 1 MiB")
         try:
             payload = json.loads(bytes(body))
+        except RecursionError:
+            raise HTTPException(status_code=400, detail="JSON 嵌套层级过深，请检查导入内容")
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise HTTPException(status_code=400, detail="请求内容不是有效的 JSON")
 
@@ -755,6 +776,8 @@ async def export_credential(
 
         export_data = {
             "refresh_token": cred.get("refresh_token", ""),
+            "access_token": cred.get("access_token", ""),
+            "expiry": cred.get("expiry", ""),
             "email": email,
             "tier": state.get("tier", "pro"),
             "project_id": cred.get("project_id", ""),
@@ -805,6 +828,8 @@ async def download_selected_credentials(
             raise HTTPException(status_code=404, detail=f"凭证不存在，请刷新列表后重试：{email}")
         entries.append((email, {
             "email": email,
+            "access_token": cred.get("access_token", ""),
+            "expiry": cred.get("expiry", ""),
             "refresh_token": cred.get("refresh_token", ""),
             "project_id": cred.get("project_id", ""),
             "tier": cred.get("tier", "pro"),
@@ -945,8 +970,6 @@ async def test_credential(
         if not access_token:
             raise HTTPException(status_code=400, detail="凭证中没有访问令牌")
 
-        from src.httpx_client import post_async
-
         project_id = credential_data.get("project_id", "")
         if not project_id:
             raise HTTPException(status_code=400, detail="凭证中没有项目ID")
@@ -962,7 +985,7 @@ async def test_credential(
             lease = await acquire_test_dispatch(email, test_model)
         except PoolCooling as exc:
             raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": str(exc.retry_after)})
-        response = await post_async(
+        response = await httpx_client.post_async(
             url=f"{api_base_url}/v1internal:generateContent",
             json={
                 "model": test_model,
@@ -980,7 +1003,6 @@ async def test_credential(
         if status_code == 200:
             # The batch tester must apply the same response semantics as the
             # model API, rather than clearing errors on an HTTP-200 rejection.
-            from src.stream_events import inspect_line, stream_error
             kind, classified = inspect_line("data: " + response.text, allow_text_notice=True) if response.content else ("metadata", None)
             if kind != "content":
                 if kind not in ("blocked", "error", "invalid"):
