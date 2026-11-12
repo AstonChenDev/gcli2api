@@ -18,6 +18,7 @@ from sqlalchemy import select, text
 from log import log
 from src.storage.database import (
     AntigravityCredential, ConfigItem, Credential499State, get_cooldown_group,
+    CredentialEntitlement, catalog_supports_model,
     get_database,
 )
 
@@ -223,6 +224,9 @@ class CooldownStore:
         async with self.locked(email) as (session, state, cfg):
             # Recheck after cache/sticky/prefetch selection, immediately at dispatch.
             cred = await session.scalar(select(AntigravityCredential).where(AntigravityCredential.email == email))
+            snapshot = await session.scalar(select(CredentialEntitlement.snapshot).where(CredentialEntitlement.email == email))
+            if catalog_supports_model(snapshot, model) is False:
+                return None, 1
             quota_family = get_cooldown_group(model)
             family = resolve_family(model, cfg)
             if not cred or (not manual and (cred.disabled or json.loads(cred.model_cooldowns or "{}").get(quota_family, 0) > self.clock())):

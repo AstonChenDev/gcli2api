@@ -3,6 +3,7 @@ Main Web Integration - Integrates all routers and modules
 集合router并开启主服务
 """
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 
@@ -17,6 +18,7 @@ from src import session_cache
 from src.storage.database import get_database, close_database
 from src.usage_log import close_usage_logs
 from src.httpx_client import close_shared_clients
+from src.credential_entitlements import refresh_loop
 
 # Import managers and utilities
 # credential_manager 已重构为无状态函数模块（无需初始化/关闭）
@@ -61,7 +63,12 @@ async def lifespan(app: FastAPI):
 
     # OAuth回调服务器将在需要时按需启动
 
-    yield
+    entitlement_task = asyncio.create_task(refresh_loop())
+    try:
+        yield
+    finally:
+        entitlement_task.cancel()
+        await asyncio.gather(entitlement_task, return_exceptions=True)
 
     # 清理资源
     log.info("开始关闭 AGY2API 主服务")

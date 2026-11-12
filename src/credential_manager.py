@@ -16,6 +16,7 @@ from config import get_credential_select_mode
 from src import session_cache
 from src.google_oauth_api import Credentials
 from src.storage.database import get_database
+from src.credential_entitlements import queue_refresh
 
 # sticky 模式的当前粘性凭证（进程内唯一状态；重置函数供测试使用）
 _sticky_email: Optional[str] = None
@@ -199,6 +200,8 @@ async def record_api_call_result(
         if success:
             asyncio.create_task(database.record_success(email, model_name=model_name))
         elif error_code:
+            if error_code == 404:
+                await queue_refresh(email, database)
             error_messages = {}
             if error_message:
                 error_messages[str(error_code)] = error_message
@@ -274,7 +277,11 @@ async def refresh_token(
         if creds.expires_at:
             credential_data["expiry"] = creds.expires_at.isoformat() if hasattr(creds.expires_at, "isoformat") else str(creds.expires_at)
 
-        await database.store_credential(email, credential_data)
+        if not await database.update_access_token(
+            email, credential_data.get("refresh_token", ""),
+            credential_data.get("access_token", ""), credential_data.get("expiry", ""),
+        ):
+            return None
         log.info(f"Token刷新成功并已保存: {email}")
         return credential_data
 

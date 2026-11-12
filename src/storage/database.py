@@ -31,6 +31,7 @@ from sqlalchemy import (
     select,
     text,
     tuple_,
+    update,
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -100,6 +101,16 @@ class Credential499State(Base):
     state: Mapped[str] = mapped_column(Text, default="{}")
 
 
+class CredentialEntitlement(Base):
+    """Shared last-known model permissions and a bounded refresh lease."""
+    __tablename__ = "credential_entitlements"
+    email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    snapshot: Mapped[str] = mapped_column(Text, default="{}")
+    next_refresh: Mapped[float] = mapped_column(Float, default=0)
+    lease_until: Mapped[float] = mapped_column(Float, default=0)
+    lease_token: Mapped[str] = mapped_column(String(32), default="")
+
+
 class UsageLog(Base):
     """请求日志表：每次 API 调用记录一条（成功与失败均记录）"""
     __tablename__ = "usage_log"
@@ -158,6 +169,15 @@ def _load_json(raw: Optional[str], default: Any) -> Any:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return default
+
+
+def catalog_supports_model(snapshot, model):
+    """None means unknown; failed refreshes never become an empty catalog."""
+    data = _load_json(snapshot, {})
+    models = data.get("models")
+    if not model or not isinstance(models, list):
+        return None
+    return model in models
 
 
 def _row_to_credential_dict(row: AntigravityCredential) -> Dict[str, Any]:
@@ -385,8 +405,10 @@ class Database:
     ) -> bool:
         """存储或更新凭证（以 email 为唯一键，保留状态字段）"""
         async with self.session() as s:
+            if self.backend_type == "sqlite":
+                await s.execute(text("BEGIN IMMEDIATE"))
             row = await s.scalar(
-                select(AntigravityCredential).where(AntigravityCredential.email == email)
+                select(AntigravityCredential).where(AntigravityCredential.email == email).with_for_update()
             )
             access_token = credential_data.get("access_token") or credential_data.get("token") or ""
             refresh_token = credential_data.get("refresh_token") or ""
@@ -398,6 +420,9 @@ class Database:
             tier = credential_data.get("tier")
 
             if row:
+                if (row.refresh_token, row.client_id, row.project_id) != (refresh_token, client_id, project_id):
+                    # Fence in-flight results when an account is reimported/replaced.
+                    await s.execute(delete(CredentialEntitlement).where(CredentialEntitlement.email == email))
                 row.access_token = access_token
                 row.refresh_token = refresh_token
                 row.client_id = client_id
@@ -435,6 +460,15 @@ class Database:
             )
             return _row_to_credential_dict(row) if row else None
 
+    async def update_access_token(self, email, expected_refresh_token, access_token, expiry):
+        """Token renewal must not overwrite a concurrently refreshed tier/note."""
+        async with self.session() as s:
+            result = await s.execute(update(AntigravityCredential).where(
+                AntigravityCredential.email == email,
+                AntigravityCredential.refresh_token == expected_refresh_token,
+            ).values(access_token=access_token, expiry=expiry, updated_at=time.time()))
+            return result.rowcount == 1
+
     async def list_credentials(self) -> List[str]:
         """列出所有凭证 email（创建顺序）"""
         async with self.session() as s:
@@ -458,6 +492,7 @@ class Database:
             # Retain this empty lock row even with no leases. Removing it could
             # race a worker between its INSERT ON CONFLICT and SELECT FOR UPDATE.
             if row:
+                await s.execute(delete(CredentialEntitlement).where(CredentialEntitlement.email == email))
                 await s.delete(row)
                 return True
             return False
@@ -476,7 +511,9 @@ class Database:
                     select(
                         AntigravityCredential.email,
                         AntigravityCredential.model_cooldowns,
+                        CredentialEntitlement.snapshot,
                     )
+                    .outerjoin(CredentialEntitlement, CredentialEntitlement.email == AntigravityCredential.email)
                     .where(AntigravityCredential.disabled == False)  # noqa: E712
                     .where(AntigravityCredential.email.not_in(exclude_emails or []))
                     .order_by(AntigravityCredential.id)
@@ -485,15 +522,19 @@ class Database:
             if not rows:
                 return None
             # Python 侧随机负载均衡（过滤模型家族冷却）
-            candidates = rows
-            if cd_group:
-                candidates = []
-                for email, model_cooldowns in rows:
-                    cooldowns = _load_json(model_cooldowns, {})
-                    cd = cooldowns.get(cd_group)
-                    if cd is not None and current_time < cd:
-                        continue
-                    candidates.append((email, model_cooldowns))
+            candidates, confirmed = [], []
+            for email, model_cooldowns, snapshot in rows:
+                supported = catalog_supports_model(snapshot, model_name)
+                if supported is False:
+                    continue
+                cooldowns = _load_json(model_cooldowns, {})
+                cd = cooldowns.get(cd_group) if cd_group else None
+                if cd is not None and current_time < cd:
+                    continue
+                candidates.append((email, model_cooldowns))
+                if supported is True:
+                    confirmed.append((email, model_cooldowns))
+            candidates = confirmed or candidates
             if not candidates:
                 return None
             picked_email = random.choice(candidates)[0]
@@ -523,6 +564,9 @@ class Database:
                 select(AntigravityCredential).where(AntigravityCredential.email == email)
             )
             if not row or row.disabled:
+                return None
+            snapshot = await s.scalar(select(CredentialEntitlement.snapshot).where(CredentialEntitlement.email == email))
+            if catalog_supports_model(snapshot, model_name) is False:
                 return None
             if cd_group:
                 cooldowns = _load_json(row.model_cooldowns, {})
