@@ -205,8 +205,8 @@ const CONFIG_GROUPS = [
   {
     title: "思考等级模型匹配",
     fields: [
-      { key: "thinking_model_routing_enabled", label: "按思考等级匹配模型", type: "bool", note: "默认关闭。开启后，例如 gemini-4-argon + high 自动选择 gemini-4-argon-high。支持 high / medium / low；已带等级后缀优先，未传等级默认选择 medium。保存后立即生效。" },
-      { key: "thinking_model_routing_bases", label: "适用模型", type: "textarea", showIf: (cfg) => !!cfg.thinking_model_routing_enabled, note: "每行一个基础模型名，默认 gemini-4-argon。仅添加上游确实提供 -high / -medium / -low 变体的模型。OpenAI 使用 reasoning_effort，Gemini 使用 generationConfig.thinkingConfig.thinkingLevel。后续模型名复写规则仍可覆盖匹配结果。" },
+      { key: "thinking_model_routing_enabled", label: "按思考等级匹配模型", type: "bool", note: "默认关闭。开启后，例如 gemini-4-hydrogen + xhigh 自动选择 gemini-4-hydrogen-xhigh。Hydrogen 支持 low / medium / high / xhigh，其他模型支持 low / medium / high；已带等级后缀优先，未传等级默认选择 medium。保存后立即生效。" },
+      { key: "thinking_model_routing_bases", label: "适用模型", type: "textarea", showIf: (cfg) => !!cfg.thinking_model_routing_enabled, note: "每行一个基础模型名，默认包含 gemini-4-argon、gemini-4-carbon、gemini-4-hydrogen。已有名单保持不变，需要使用 Hydrogen 时请追加 gemini-4-hydrogen。仅添加上游确实提供对应等级变体的模型。OpenAI 使用 reasoning_effort，Gemini 使用 generationConfig.thinkingConfig.thinkingLevel。后续模型名复写规则仍可覆盖匹配结果。" },
     ],
   },
   {

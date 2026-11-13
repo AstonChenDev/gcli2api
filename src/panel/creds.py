@@ -39,6 +39,7 @@ from src.antigravity_import import (
     parse_import_request_payload,
 )
 from src.storage.database import get_database
+from src.credential_entitlements import get_model_view, queue_refresh, refresh_one
 from src.utils import (
     verify_panel_token,
     ANTIGRAVITY_USER_AGENT,
@@ -67,6 +68,32 @@ class CredentialNoteRequest(BaseModel):
 class ClearCooldownRequest(BaseModel):
     emails: List[str] = Field(min_length=1, max_length=1000)
     scope: Literal["all", "quota", "protection"] = "all"
+
+
+@router.get("/models/{email}")
+async def credential_models(email: str, token: str = Depends(verify_panel_token)):
+    result = await get_model_view(email, await get_database())
+    if result is None:
+        raise HTTPException(404, "凭证不存在")
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/models/{email}/refresh")
+async def refresh_credential_models(email: str, token: str = Depends(verify_panel_token)):
+    database = await get_database()
+    before = await get_model_view(email, database)
+    if before is None:
+        raise HTTPException(404, "凭证不存在")
+    # Reuse the cross-worker lease and 60-second minimum interval. Viewing the
+    # panel never triggers generation or clears cooldowns/enables credentials.
+    await queue_refresh(email, database)
+    await refresh_one(email, database)
+    result = await get_model_view(email, database)
+    if result is None:
+        raise HTTPException(404, "凭证已被删除")
+    result['refresh_deferred'] = (result['refresh_in_progress'] or
+                                  result['last_attempt_at'] == before['last_attempt_at'])
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/clear-cooldown")

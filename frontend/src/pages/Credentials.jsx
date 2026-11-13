@@ -20,12 +20,14 @@ import Select from "../components/Select";
 import api from "../api";
 import QuotaSummary, { quotaGroups } from "../components/QuotaSummary";
 import CredentialQuota from "../components/CredentialQuota";
+import CredentialModels from "../components/CredentialModels";
 
 const hasActiveCooldown = (item, now) =>
   Object.values(item.model_cooldowns || {}).some(until => until > now);
 
 export default function Credentials() {
   const [items, setItems] = useState([]);
+  const [modelsCredential, setModelsCredential] = useState(null);
   const [noteCredential, setNoteCredential] = useState(null);
   const [noteDraft, setNoteDraft] = useState("");
   const [noteSaving, setNoteSaving] = useState(false);
@@ -692,6 +694,9 @@ export default function Credentials() {
                 <CredentialQuota key={`${cred.email}:${Boolean(cooldownText)}`}
                   email={cred.email} cooling={Boolean(cooldownText)} disabled={cred.disabled}
                   data={quotaCache[cred.email]} loading={quotaLoading.has(cred.email)} onRequest={requestQuota} />
+                <button onClick={() => setModelsCredential(cred)} className="w-full text-xs px-3 py-2 rounded-lg border border-purple-200 text-purple-700 hover:bg-purple-50 text-left">
+                  查看可用模型 →
+                </button>
                 {testResults[cred.email] && <div className={`text-xs ${testResults[cred.email].status === 200 ? "text-emerald-700" : "text-red-700"}`}>最近测试：{testResults[cred.email].model} · HTTP {testResults[cred.email].status || "—"}</div>}
 
                 {/* 操作按钮（2×3 网格铺满卡片） */}
@@ -832,6 +837,8 @@ export default function Credentials() {
           <QuotaSummary data={quotaCache[quotaModal.email]} loading={quotaLoading.has(quotaModal.email)} />
         </Modal>
       )}
+      {modelsCredential && <CredentialModels key={modelsCredential.email} credential={modelsCredential}
+        onClose={() => setModelsCredential(null)} onUpdated={fetchCreds} />}
 
       {/* 错误详情弹窗 */}
       {errorModal && (

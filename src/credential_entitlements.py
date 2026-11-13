@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -16,7 +17,8 @@ from src.credential_tier import normalize_credential_tier
 from src.google_oauth_api import Credentials
 from src.httpx_client import post_async
 from src.storage.database import (
-    AntigravityCredential, CredentialEntitlement, get_database, _row_to_credential_dict,
+    AntigravityCredential, CredentialEntitlement, get_database, get_cooldown_group,
+    _row_to_credential_dict,
 )
 from src.utils import ANTIGRAVITY_USER_AGENT
 
@@ -52,6 +54,62 @@ def parse_catalog(data):
         raise ValueError("Missing or malformed model catalog")
     return sorted(name for name, spec in models.items()
                   if not spec.get("disabled") and "disabled" not in name.lower())
+
+
+def _timestamp(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0 else 0
+
+
+async def get_model_view(email, database=None):
+    """Read only public panel fields; never return credentials or raw snapshots."""
+    db = database or await get_database()
+    async with db.session() as session:
+        row = (await session.execute(select(
+            AntigravityCredential.email, AntigravityCredential.note,
+            AntigravityCredential.tier, AntigravityCredential.disabled,
+            AntigravityCredential.model_cooldowns, CredentialEntitlement.snapshot,
+            CredentialEntitlement.next_refresh, CredentialEntitlement.lease_until,
+        ).outerjoin(CredentialEntitlement, CredentialEntitlement.email == AntigravityCredential.email)
+            .where(AntigravityCredential.email == email))).mappings().one_or_none()
+    if row is None:
+        return None
+    try:
+        snapshot = json.loads(row['snapshot'] or '{}')
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+    except (TypeError, ValueError):
+        snapshot = {}
+    try:
+        cooldowns = json.loads(row['model_cooldowns'] or '{}')
+        if not isinstance(cooldowns, dict):
+            cooldowns = {}
+    except (TypeError, ValueError):
+        cooldowns = {}
+    now = time.time()
+    raw_models = snapshot.get('models')
+    known = isinstance(raw_models, list) and all(isinstance(m, str) for m in raw_models)
+    models = sorted(set(m for m in raw_models if m and 'disabled' not in m.lower())) if known else []
+    checked_at = _timestamp(snapshot.get('models_checked_at'))
+    attempted_at = _timestamp(snapshot.get('attempted_at'))
+    # Expose categories, not arbitrary exception messages or snapshot contents.
+    errors = snapshot.get('errors', [])
+    if not isinstance(errors, list):
+        errors = []
+    failed = sorted({e.split(':', 1)[0] for e in errors
+                     if isinstance(e, str) and e.split(':', 1)[0] in ('auth', 'tier', 'models')})
+    return {
+        'email': row['email'], 'note': row['note'] or '', 'tier': row['tier'],
+        'disabled': bool(row['disabled']), 'models_known': known,
+        'models': [{'name': m, 'quota_cooldown_until': until if until > now else None}
+                   for m in models
+                   for until in [_timestamp(cooldowns.get(get_cooldown_group(m)))]],
+        'checked_at': checked_at or None, 'last_attempt_at': attempted_at or None,
+        'stale': not known or not checked_at or now - checked_at >= REFRESH_SECONDS,
+        'refresh_in_progress': _timestamp(row['lease_until']) > now,
+        'retry_after_seconds': max(0, math.ceil(max(attempted_at + RETRY_SECONDS,
+                                                   _timestamp(row['lease_until'])) - now)),
+        'failed_checks': failed,
+    }
 
 
 @asynccontextmanager

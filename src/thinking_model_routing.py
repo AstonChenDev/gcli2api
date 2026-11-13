@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from config import get_thinking_model_routing_bases, get_thinking_model_routing_enabled
 
 LEVELS = ("high", "medium", "low")
+MODEL_LEVELS = {"gemini-4-hydrogen": (*LEVELS, "xhigh")}
 
 
 def _read_path(payload: dict, *keys):
@@ -33,13 +34,14 @@ async def route_thinking_model(model: str, payload: dict, protocol: str) -> str:
             for level in ("thinkingLevel", "thinking_level")
         ],
     }
+    supported_levels = MODEL_LEVELS.get(model, LEVELS)
     levels = []
     for path in paths[protocol]:
         value = _read_path(payload, *path)
         if value is None:
             continue
-        if not isinstance(value, str) or value.strip().lower() not in LEVELS:
-            raise HTTPException(status_code=400, detail="思考等级仅支持 high、medium、low")
+        if not isinstance(value, str) or value.strip().lower() not in supported_levels:
+            raise HTTPException(status_code=400, detail="思考等级仅支持 " + "、".join(supported_levels))
         levels.append(value.strip().lower())
     if len(set(levels)) > 1:
         raise HTTPException(status_code=400, detail="请求中存在冲突的思考等级")
@@ -52,6 +54,6 @@ async def add_thinking_model_aliases(model_ids: list[str]) -> list[str]:
     if await get_thinking_model_routing_enabled():
         available = set(model_ids)
         for base in await get_thinking_model_routing_bases():
-            if base not in result and all(f"{base}-{level}" in available for level in LEVELS):
+            if base not in result and all(f"{base}-{level}" in available for level in MODEL_LEVELS.get(base, LEVELS)):
                 result.append(base)
     return result

@@ -217,10 +217,9 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                 raise HTTPException(status_code=400, detail="思考等级模型匹配开关必须是布尔值")
         if "thinking_model_routing_bases" in new_config:
             bases = new_config["thinking_model_routing_bases"]
-            import re
             if not isinstance(bases, list) or any(
                 not isinstance(base, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", base.strip())
-                or base.strip().endswith(("-high", "-medium", "-low")) for base in bases
+                or base.strip().lower().endswith(("-high", "-medium", "-low", "-xhigh")) for base in bases
             ):
                 raise HTTPException(status_code=400, detail="适用模型必须为基础模型名数组，不含等级后缀、空格或路径")
             new_config["thinking_model_routing_bases"] = list(dict.fromkeys(base.strip() for base in bases))

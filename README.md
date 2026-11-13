@@ -22,6 +22,8 @@
 
 权限快照及刷新租约保存在独立的 `credential_entitlements` 表，多个 worker 共用。每个 worker 每轮最多刷新 2 个凭证，每 5 秒检查待刷新任务，不为每次生成请求重复查询上游。404 会提示后台提前刷新，同一账号的两次刷新至少间隔 60 秒；404 本身不会被当作账号封禁依据，也不会自动重放已开始的生成。
 
+凭证卡片的“查看可用模型”展示该邮箱的模型权限目录、备注、会员等级、最近成功查询时间与查询异常，支持搜索及复制完整模型名。打开弹窗只读取已有快照；“刷新权限”复用上述后台刷新规则和跨 worker 限流，更新会员信息时仍遵循明确 Free 自动禁用、升级不自动启用的规则。禁用凭证也能查看，查询失败保留历史目录；“尚未查询成功”与“已确认没有可用模型”分别显示。目录只列出上游真实型号，不把未配置的基础名或别名当作该凭证的权限；有模型权限不代表额度足够或请求必定成功，配额冷却单独标注，剩余额度使用原“额度”入口查询。面板鉴权接口为 `GET /creds/models/{email}` 和 `POST /creds/models/{email}/refresh`。
+
 随机、会话缓存、粘性选择及最终派发均会跳过已确认不支持目标型号的凭证。筛选使用完成别名和思考等级转换后的实际上游型号。未知权限允许沿用原调度，随机选择优先使用已确认支持的账号；启动预热期间或权限变化尚未刷新时仍可能遇到一次上游拒绝。查询超时、401、429、异常结构等不会清空最后一次有效权限或误降级为 Free，后台稍后重试。此机制不替代额度冷却，也不保证消除所有 404/429。
 
 ## 安装指南
@@ -395,7 +397,7 @@ Gemini 请求的 `system_instruction` 与 `systemInstruction` 会先统一为一
 
 ### 按思考等级匹配模型
 
-在后台「配置 → 思考等级模型匹配」开启开关并保存，立即对新请求生效。默认关闭；适用模型默认 `gemini-4-argon`。可按行添加其他基础模型名，但应先确认上游提供对应的 `-high`、`-medium`、`-low` 变体。
+在后台「配置 → 思考等级模型匹配」开启开关并保存，立即对新请求生效。默认关闭；未配置过适用模型时，默认包含 `gemini-4-argon`、`gemini-4-carbon`、`gemini-4-hydrogen`。已有的后台名单和环境变量保持不变，升级后需要使用 Hydrogen 时，须在实际生效的名单中追加 `gemini-4-hydrogen`。可按行添加其他基础模型名，但应先确认上游提供对应的等级变体。
 
 OpenAI `/v1/chat/completions` 请求示例：
 
@@ -410,19 +412,21 @@ OpenAI `/v1/chat/completions` 请求示例：
 
 此请求选择 `gemini-4-argon-high`。将等级改为 `medium` 或 `low` 即选择对应变体。流式、非流式及 `抗截断-` 前缀均支持。
 
+Hydrogen 额外支持 `xhigh`：`"model": "gemini-4-hydrogen"` 配合 `"reasoning_effort": "xhigh"` 会选择 `gemini-4-hydrogen-xhigh`；配合 `medium` 则选择 `gemini-4-hydrogen-medium`。Argon、Carbon 和其他模型仍只接受原有三档。
+
 - OpenAI：`reasoning_effort`，也接受 `reasoning.effort`（仅聊天接口，不新增 Responses 接口）。
 - Gemini：路径模型名使用基础名称，请求体传 `generationConfig.thinkingConfig.thinkingLevel`，也接受对应 snake_case 字段。
 - Claude 格式 `/v1/messages`：基础模型名配合 `output_config.effort`。
-- 等级接受 high / medium / low，不区分大小写；仅对已配置的基础名称生效。未传等级（或等级为 null）时默认选择 medium，例如 gemini-4-argon 自动匹配 gemini-4-argon-medium。非法或相互冲突的等级返回 HTTP 400。
+- Hydrogen 接受 low / medium / high / xhigh，其他模型接受 high / medium / low，不区分大小写；仅对已配置的基础名称生效。未传等级（或等级为 null）时统一默认选择 medium，例如 gemini-4-hydrogen 自动匹配 gemini-4-hydrogen-medium。非法或相互冲突的等级返回 HTTP 400。
 - 已经带后缀的模型名优先，例如 `gemini-4-argon-low` 配 `high` 仍使用 low。其他模型保持原行为。
 - 匹配发生在模型名复写规则之前；已有复写规则仍可覆盖匹配结果。请求日志保留客户端原始模型名，上游请求使用匹配后的模型名。
-- 开关开启且模型列表包含三个等级变体时，模型列表额外显示基础名称，保留原有变体。
+- 开关开启且模型列表包含该基础模型全部受支持的等级变体时（Hydrogen 四档，其他模型三档），模型列表额外显示基础名称，保留原有变体。
 
 环境变量（优先于后台设置，按现有配置机制锁定对应后台项）：
 
 ```dotenv
 THINKING_MODEL_ROUTING_ENABLED=true
-THINKING_MODEL_ROUTING_BASES=gemini-4-argon
+THINKING_MODEL_ROUTING_BASES=gemini-4-argon,gemini-4-carbon,gemini-4-hydrogen
 ```
 
 多个基础模型用英文逗号分隔；空列表表示不匹配任何模型。此功能负责选择上游模型，不保证所有凭证都具有该模型权限。
