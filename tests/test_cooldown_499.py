@@ -584,6 +584,148 @@ class CooldownTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(leases[0].heartbeat.done())
             self.assertEqual((await self.state())["leases"], {})
 
+    async def test_passive_modes_keep_transport_alive_and_retry_renewal(self):
+        for mode in ("off", "observe"):
+            for raises in (False, True):
+                with self.subTest(mode=mode, raises=raises):
+                    await self.settings(mode=mode)
+                    key, _ = await self.admit(f"passive-{mode}-{raises}")
+                    release, recovered = asyncio.Event(), asyncio.Event()
+                    leases = []
+                    original = self.store.renew
+                    calls = 0
+                    async def renew(email, lease_key):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 1:
+                            if raises:
+                                raise RuntimeError("synthetic storage outage")
+                            return False
+                        result = await original(email, lease_key)
+                        recovered.set()
+                        return result
+                    async def transport():
+                        lease = cooldown.Lease(self.store, self.email, key)
+                        leases.append(lease)
+                        try:
+                            await release.wait()
+                            return "complete answer"
+                        finally:
+                            await lease.result(success=release.is_set())
+                            await lease.close()
+                    with patch.object(self.store, "renew", renew), patch.object(cooldown, "RENEW_SECONDS", .005):
+                        task = asyncio.create_task(transport())
+                        try:
+                            await asyncio.wait_for(recovered.wait(), .5)
+                            self.assertFalse(task.done())
+                            self.assertFalse(leases[0].lost)
+                            release.set()
+                            self.assertEqual(await asyncio.wait_for(task, .5), "complete answer")
+                        finally:
+                            task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                    self.assertTrue(leases[0].heartbeat.done())
+                    self.assertEqual((await self.state())["leases"], {})
+
+    async def test_renewal_failure_uses_latest_successfully_read_mode(self):
+        for initial, updated in (("enforce", "off"), ("enforce", "observe"), ("off", "enforce")):
+            with self.subTest(initial=initial, updated=updated):
+                await self.settings(mode=initial)
+                key, _ = await self.admit(f"switch-{initial}-{updated}")
+                started, renew_now, attempted, release = (asyncio.Event() for _ in range(4))
+                leases = []
+                original = self.store.renew
+                async def renew(email, lease_key):
+                    await renew_now.wait()
+                    await original(email, lease_key)
+                    attempted.set()
+                    raise RuntimeError("synthetic failure after policy read")
+                async def transport():
+                    lease = cooldown.Lease(self.store, self.email, key)
+                    leases.append(lease)
+                    started.set()
+                    try:
+                        await release.wait()
+                        return "complete answer"
+                    finally:
+                        await lease.result(success=release.is_set())
+                        await lease.close()
+                with patch.object(self.store, "renew", renew), patch.object(cooldown, "RENEW_SECONDS", .005):
+                    task = asyncio.create_task(transport())
+                    try:
+                        await asyncio.wait_for(started.wait(), .5)
+                        await self.settings(mode=updated)
+                        renew_now.set()
+                        await asyncio.wait_for(attempted.wait(), .5)
+                        if updated == "enforce":
+                            with self.assertRaises(asyncio.CancelledError):
+                                await asyncio.wait_for(task, .5)
+                            self.assertTrue(leases[0].lost)
+                        else:
+                            await asyncio.sleep(.01)
+                            self.assertFalse(task.done())
+                            release.set()
+                            self.assertEqual(await asyncio.wait_for(task, .5), "complete answer")
+                    finally:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                self.assertTrue(leases[0].heartbeat.done())
+
+    async def test_passive_finalization_failure_does_not_replace_completed_answer(self):
+        for mode in ("off", "observe", "enforce"):
+            with self.subTest(mode=mode):
+                await self.settings(mode=mode)
+                key, _ = await self.admit(f"finish-{mode}")
+                lease = cooldown.Lease(self.store, self.email, key)
+                await lease.result(success=True)
+                with patch.object(self.store, "finish", AsyncMock(side_effect=RuntimeError("synthetic storage outage"))):
+                    if mode == "enforce":
+                        with self.assertRaises(RuntimeError):
+                            await lease.close()
+                    else:
+                        await lease.close()
+                self.assertTrue(lease.heartbeat.done())
+                # Missing persistence is not a successful probe or fresh cooldown.
+                await self.store.finish(self.email, key)
+
+    async def test_expired_observation_lease_is_not_recreated_and_enforce_still_cancels(self):
+        await self.settings(mode="observe")
+        key, _ = await self.admit("expired-observation")
+        checked, renew_now = asyncio.Event(), asyncio.Event()
+        leases = []
+        original = self.store.renew
+        async def renew(email, lease_key):
+            await renew_now.wait()
+            result = await original(email, lease_key)
+            checked.set()
+            return result
+        async def transport():
+            lease = cooldown.Lease(self.store, self.email, key)
+            leases.append(lease)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await lease.result()
+                await lease.close()
+        with patch.object(self.store, "renew", renew), patch.object(cooldown, "RENEW_SECONDS", .005):
+            task = asyncio.create_task(transport())
+            try:
+                self.now += cooldown.LEASE_SECONDS + 1
+                renew_now.set()
+                await asyncio.wait_for(checked.wait(), .5)
+                await asyncio.sleep(.01)
+                self.assertFalse(task.done())
+                self.assertFalse(leases[0].lost)
+                self.assertEqual((await self.state())["leases"], {})
+                await self.settings(mode="enforce")
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, .5)
+                self.assertTrue(leases[0].lost)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(leases[0].heartbeat.done())
+
     async def custom_groups(self, rules, **options):
         await self.settings(scope="family", custom_families_enabled=True,
                             family_rules=rules, threshold=1, **options)

@@ -166,11 +166,15 @@ class CooldownStore:
     def __init__(self, database, clock=time.time):
         self.database = database
         self.clock = clock
+        # Retain the last policy read even when a subsequent SQL write fails.
+        # A database outage must not turn observation into enforcement.
+        self.last_known_mode = None
 
     @asynccontextmanager
     async def locked(self, email):
         async with self.database.locked_cooldown_state(email) as (session, row):
             cfg = await read_settings(session)
+            self.last_known_mode = cfg["mode"]
             state = json.loads(row.state)
             state.setdefault("leases", {})
             policy = [cfg["mode"], cfg["scope"], cfg.get("revision", "0")]
@@ -340,24 +344,29 @@ class Lease:
         self.heartbeat = asyncio.create_task(self._renew())
 
     async def _renew(self):
-        try:
-            while True:
-                await asyncio.sleep(RENEW_SECONDS)
-                if self.closed and self.owner and self.owner.done() and self.outcome is None:
-                    return  # Missing finalizer: let ownership expire, never renew forever.
-                if not await self.store.renew(self.email, self.key):
-                    # Never continue an upstream call after losing ownership.
-                    self.lost = True
-                    if self.owner and not self.owner.done():
-                        self.owner.cancel()
-                    return
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.error(f"499 protection lease renewal failed ({type(exc).__name__}); cancelling upstream owner")
+        while True:
+            await asyncio.sleep(RENEW_SECONDS)
+            if self.closed and self.owner and self.owner.done() and self.outcome is None:
+                return  # Missing finalizer: let ownership expire, never renew forever.
+            try:
+                owned = await self.store.renew(self.email, self.key)
+                if owned:
+                    continue
+                reason = "ownership lost"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                reason = type(exc).__name__
+            if self.store.last_known_mode in ("off", "observe"):
+                log.warning(f"499 protection tracking unavailable ({reason}); continuing in {self.store.last_known_mode} mode")
+                # Retry tracking, including policy reads, on the next heartbeat.
+                # Do not recreate an expired lease or replay a missing outcome.
+                continue
+            log.error(f"499 protection lease renewal failed ({reason}); cancelling upstream owner")
             self.lost = True
             if self.owner and not self.owner.done():
                 self.owner.cancel()
+            return
 
     async def iterate(self, stream):
         while True:
@@ -387,6 +396,12 @@ class Lease:
             self.finished = True
             try:
                 await self.store.finish(self.email, self.key, **self.outcome)
+            except Exception as exc:
+                if self.store.last_known_mode not in ("off", "observe"):
+                    raise
+                # An observation write failure cannot replace the API result.
+                # Leave failed persistence to lease expiry; never claim recovery.
+                log.warning(f"499 protection result not persisted ({type(exc).__name__}); continuing in {self.store.last_known_mode} mode")
             finally:
                 self.heartbeat.cancel()
                 await asyncio.gather(self.heartbeat, return_exceptions=True)

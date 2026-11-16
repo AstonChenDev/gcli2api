@@ -2,100 +2,14 @@
 import asyncio
 import copy
 import json
-import os
 import unittest
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
-from src import httpx_client, usage_log
+from src import usage_log
 from src.api import antigravity
 from src.panel import creds, usage_logs
-
-
-class SharedClientTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.stack = ExitStack()
-        self.addCleanup(self.stack.close)
-        self.addAsyncCleanup(httpx_client.close_shared_clients)
-        self.stack.enter_context(patch.dict(os.environ, {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}))
-        self.proxy = self.stack.enter_context(patch.object(httpx_client, "get_proxy_config", AsyncMock(return_value="")))
-        self.stack.enter_context(patch.object(httpx_client, "get_stream_handshake_timeout_enabled", AsyncMock(return_value=True)))
-        self.deadline = self.stack.enter_context(patch.object(httpx_client, "get_stream_handshake_timeout_seconds", AsyncMock(return_value=40)))
-
-    async def test_reuses_real_tcp_connection_and_closes_at_shutdown(self):
-        connections, tasks = [], set()
-        async def serve(reader, writer):
-            tasks.add(asyncio.current_task())
-            connections.append(writer)
-            try:
-                for _ in range(2):
-                    await reader.readuntil(b"\r\n\r\n")
-                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
-                    await writer.drain()
-                await reader.read()
-            except asyncio.IncompleteReadError:
-                pass
-            finally:
-                writer.close()
-                await writer.wait_closed()
-        server = await asyncio.start_server(serve, "127.0.0.1", 0)
-        try:
-            url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/"
-            for _ in range(2):
-                async with httpx_client.get_client() as client:
-                    self.assertEqual((await client.get(url)).text, "OK")
-            self.assertEqual(len(connections), 1)
-            self.assertFalse(client.is_closed)
-            self.proxy.return_value = "not-a-valid-proxy"
-            with self.assertRaises(ValueError):
-                async with httpx_client.get_client():
-                    pass
-            self.proxy.return_value = ""
-            async with httpx_client.get_client() as recovered:
-                self.assertIs(recovered, client)
-            await httpx_client.close_shared_clients()
-            self.assertTrue(client.is_closed)
-            await asyncio.wait_for(asyncio.gather(*tasks), 2)
-        finally:
-            server.close()
-            await server.wait_closed()
-            for writer in connections:
-                writer.close()
-
-    async def test_proxy_rotation_waits_for_all_active_leases(self):
-        async with httpx_client.get_streaming_client() as old:
-            async with httpx_client.get_streaming_client() as same:
-                self.assertIs(old, same)
-                self.proxy.return_value = "http://127.0.0.1:1"
-                async with httpx_client.get_streaming_client() as new:
-                    self.assertIsNot(old, new)
-                    self.assertFalse(old.is_closed)
-                self.assertFalse(old.is_closed)
-            self.assertFalse(old.is_closed)
-        self.assertTrue(old.is_closed)
-
-    async def test_invalid_proxy_keeps_active_stream_managed_until_release(self):
-        async with httpx_client.get_streaming_client() as old:
-            self.proxy.return_value = "not-a-valid-proxy"
-            with self.assertRaises(ValueError):
-                async with httpx_client.get_streaming_client():
-                    pass
-            await httpx_client.close_shared_clients()
-            self.assertFalse(old.is_closed)
-        self.assertTrue(old.is_closed)
-
-    async def test_handshake_hot_reload_and_shutdown_preserve_active_client(self):
-        async with httpx_client.get_streaming_client() as old:
-            self.deadline.return_value = 15
-            async with httpx_client.get_streaming_client() as new:
-                self.assertEqual((old.handshake_timeout, new.handshake_timeout), (40, 15))
-                self.assertIsNone(new.timeout.read)
-                await httpx_client.close_shared_clients()
-                self.assertFalse(new.is_closed)
-                self.assertFalse(old.is_closed)
-            self.assertTrue(new.is_closed)
-        self.assertTrue(old.is_closed)
 
 
 class UsageQueueTests(unittest.IsolatedAsyncioTestCase):

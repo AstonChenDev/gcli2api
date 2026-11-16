@@ -1,12 +1,12 @@
 import asyncio
 import json
 import unittest
-from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi import FastAPI, Response
 import test_custom_audit
+from src import httpx_client
 from src.api import antigravity as api
 from src.stream_events import inspect_line
 ERROR_CODE = "UPSTREAM_OUTPUT_BOUNDARY_MISSING"
@@ -148,23 +148,19 @@ class EventRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_httpx_line_iteration_and_response_prefetch(self):
         # Exercise the actual HTTP decoder and first-event prefetch, offline.
-        from src import httpx_client
         payload = '\n' + event([{'text': 'OK'}], 'STOP').replace('data: ', 'data:')
-        @asynccontextmanager
-        async def client(**kwargs):
-            async with httpx.AsyncClient(transport=httpx.MockTransport(
-                    lambda request: httpx.Response(200, text=payload))) as session:
-                yield session
-        with patch.object(httpx_client, 'get_streaming_client', client):
-            response = await build_streaming_response_or_error(api.stream_request(
-                {'model': 'gemini-4-argon-medium', 'request': {'contents': []}}))
-            chunks = []
-            async def send(message):
-                if message['type']=='http.response.body' and message.get('body'):
-                    chunks.append(message['body'].decode())
-            async def receive():
-                await asyncio.Event().wait()
-            await response({'type':'http','asgi':{'spec_version':'2.4'}}, receive, send)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, text=payload))) as session:
+            with patch.object(httpx_client, '_get_shared_client', AsyncMock(return_value=session)):
+                response = await build_streaming_response_or_error(api.stream_request(
+                    {'model': 'gemini-4-argon-medium', 'request': {'contents': []}}))
+                chunks = []
+                async def send(message):
+                    if message['type']=='http.response.body' and message.get('body'):
+                        chunks.append(message['body'].decode())
+                async def receive():
+                    await asyncio.Event().wait()
+                await response({'type':'http','asgi':{'spec_version':'2.4'}}, receive, send)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(parts_of(chunks), [{'text': 'OK'}])
         self.assertEqual(self.saved.call_args.args[0]['response_id'], 'synthetic-recovery')

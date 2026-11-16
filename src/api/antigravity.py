@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Callable, Tuple
 
 from fastapi import Response
-from httpx import ConnectTimeout, TransportError
+from httpx import TransportError
 from config import (
     get_antigravity_api_url,
     get_auto_ban_error_codes,
@@ -894,8 +894,8 @@ async def stream_request(
                     return
                 outcome = "transport_error"
                 completion.error = True
-                error_status = 504 if isinstance(e, ConnectTimeout) else 500
-                error_message = f"{'UPSTREAM_CONNECT_TIMEOUT' if error_status == 504 else '异常'}: {type(e).__name__}: {e}"
+                error_status = 500
+                error_message = f"异常: {type(e).__name__}: {e}"
                 log.error(f"[ANTIGRAVITY STREAM] 流式请求异常: {type(e).__name__}: {e}, 凭证: {current_file}")
                 if not content_delivered and retry_config["retry_enabled"] and attempt < max_retries:
                     log.info(f"[ANTIGRAVITY STREAM] 异常后重试 (attempt {attempt + 2}/{max_retries + 1})...")
@@ -907,10 +907,10 @@ async def stream_request(
                     # 所有重试都失败，返回最后一次的错误（如果有）
                     log.error(f"[ANTIGRAVITY STREAM] 所有重试均失败，最后异常: {e}")
                     await _log_stream_result(error_status, False, error_message)
-                    if last_error_response and error_status != 504:
+                    if last_error_response:
                         yield last_error_response
                     else:
-                        # 建连超时返回 504，其他未分类异常返回 500。
+                        # 与上游一致：没有先前错误响应时，传输异常返回 500。
                         yield Response(
                             content=json.dumps({"error": error_message}),
                             status_code=error_status,

@@ -33,8 +33,6 @@ async def get_config(token: str = Depends(verify_panel_token)):
         # 基础配置
         current_config["credentials_dir"] = await config.get_credentials_dir()
         current_config["proxy"] = await config.get_proxy_config() or ""
-        current_config["stream_handshake_timeout_enabled"] = await config.get_stream_handshake_timeout_enabled()
-        current_config["stream_handshake_timeout_seconds"] = await config.get_stream_handshake_timeout_seconds()
 
         # 代理端点配置
         current_config["oauth_proxy_url"] = await config.get_oauth_proxy_url()
@@ -123,14 +121,6 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
             validate_settings(new_config)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        if "stream_handshake_timeout_enabled" in new_config:
-            if not isinstance(new_config["stream_handshake_timeout_enabled"], bool):
-                raise HTTPException(status_code=400, detail="握手超时开关必须是布尔值")
-        if "stream_handshake_timeout_seconds" in new_config:
-            seconds = new_config["stream_handshake_timeout_seconds"]
-            if type(seconds) is not int or not 1 <= seconds <= 3600:
-                raise HTTPException(status_code=400, detail="握手超时必须是 1–3600 秒之间的整数；关闭限制请使用开关")
-
         if "retry_429_max_retries" in new_config:
             if (
                 not isinstance(new_config["retry_429_max_retries"], int)

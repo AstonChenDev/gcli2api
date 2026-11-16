@@ -48,10 +48,11 @@ export default function ModelTokenStats({ filters }) {
     catch { setStorageError('浏览器未允许保存，权重仅在本次页面打开期间有效。'); }
   };
   const summary = data?.summary;
-  return <section className="rounded-xl border border-purple-200 bg-white p-4 sm:p-5 space-y-4" aria-label="模型 Token 与额度统计">
+  return <details className="rounded-xl border border-purple-200 bg-white p-4 sm:p-5" aria-label="模型 Token 与额度统计">
+    <summary className="cursor-pointer font-semibold text-lg text-slate-900">模型 Token 与额度占比</summary>
+    <div className="mt-4 space-y-4">
     <div className="flex flex-wrap justify-between items-center gap-3">
-      <div><h3 className="font-semibold text-lg text-slate-900">模型 Token 与额度占比</h3>
-        <p className="text-xs text-slate-500 mt-1">跟随上方时间、邮箱和实际模型筛选 · 占比以筛选后的全部匹配记录为分母</p></div>
+      <p className="text-xs text-slate-500">跟随上方时间、邮箱和实际模型筛选 · 占比以筛选后的全部匹配记录为分母</p>
       <select aria-label="模型用量排序" value={sort} onChange={e => setSort(e.target.value)} className="rounded-lg border border-slate-300 p-2 text-sm">
         <option value="total_tokens">按总 Token</option><option value="prompt_tokens">按输入 Token</option><option value="completion_tokens">按输出 Token</option><option value="attempts">按调用次数</option>
       </select>
@@ -117,5 +118,6 @@ export default function ModelTokenStats({ filters }) {
         </details>}
       </>}
     </>}
-  </section>;
+    </div>
+  </details>;
 }

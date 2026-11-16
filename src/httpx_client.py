@@ -3,178 +3,131 @@
 为所有需要使用httpx的模块提供统一的客户端配置和方法
 保持通用性，不与特定业务逻辑耦合
 
-按事件循环、代理和超时配置复用连接；配置变化后旧连接待在途请求结束再关闭。
+- 共享 AsyncClient（按代理配置指纹缓存），复用 TCP/TLS 连接，
+  避免每请求新建客户端造成的握手开销
+- 代理配置变化（面板热更新）时指纹变化，旧客户端惰性关闭重建
+- 超时等请求级参数在每次请求时传入，不受客户端实例缓存影响
 """
 
 import asyncio
-import json
-from weakref import WeakKeyDictionary
-from dataclasses import dataclass
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import httpx
+import json
 from fastapi import Response
-from anyio import CancelScope, fail_after
 
-from config import get_proxy_config, get_stream_handshake_timeout_enabled, get_stream_handshake_timeout_seconds
+from config import get_proxy_config
 from log import log
 
+# ====================== 共享客户端 ======================
 
-class _StreamingClient(httpx.AsyncClient):
-    def __init__(self, *, handshake_timeout, **kwargs):
-        super().__init__(**kwargs)
-        self.handshake_timeout = handshake_timeout
-
-    async def send(self, request, **kwargs):
-        # connect= alone does not bound an HTTP proxy's CONNECT response read.
-        # Keep one deadline through TCP, proxy negotiation and TLS, then lift it
-        # before sending the origin request. Model generation has no deadline.
-        original_trace = request.extensions.get("trace")
-        pending_stream = None
-        with fail_after(self.handshake_timeout) as handshake:
-            async def trace(event, info):
-                nonlocal pending_stream
-                if event.endswith((".connect_tcp.complete", ".connect_unix_socket.complete", ".start_tls.complete")):
-                    pending_stream = info.get("return_value")
-                if event in ("http11.send_request_headers.started", "http2.send_request_headers.started"):
-                    if info["request"].method != b"CONNECT":
-                        handshake.deadline = float("inf")
-                        pending_stream = None  # The HTTP connection now owns it.
-                if original_trace:
-                    await original_trace(event, info)
-
-            request.extensions["trace"] = trace
-            try:
-                return await super().send(request, **kwargs)
-            except BaseException:
-                # httpcore may not yet own a socket if SOCKS negotiation is
-                # cancelled. Closing the client pool alone misses that socket.
-                if pending_stream is not None:
-                    with CancelScope(shield=True):
-                        try:
-                            await pending_stream.aclose()
-                        except Exception as exc:
-                            log.warning(f"Handshake socket cleanup failed: {type(exc).__name__}")
-                if handshake.cancel_called:
-                    raise httpx.ConnectTimeout(
-                        f"Upstream connection/proxy/TLS handshake exceeded {self.handshake_timeout:g}s",
-                        request=request,
-                    ) from None
-                raise
-            finally:
-                if original_trace is None:
-                    request.extensions.pop("trace", None)
-                else:
-                    request.extensions["trace"] = original_trace
+# (代理指纹, AsyncClient) 列表；正常情况下最多两个条目（无代理/有代理）
+_shared_clients: List[Tuple[str, httpx.AsyncClient]] = []
+_shared_clients_lock = asyncio.Lock()
 
 
-@dataclass
-class _ClientLease:
-    client: httpx.AsyncClient
-    users: int = 0
-    retired: bool = False
+def _client_fingerprint(proxy_url: Optional[str]) -> str:
+    """客户端指纹：代理 URL 不同则不能复用同一客户端"""
+    return proxy_url or ""
 
 
-# Each application loop owns its clients; never share transports across loops.
-_client_pools = WeakKeyDictionary()
+async def _build_client(proxy_url: Optional[str]) -> httpx.AsyncClient:
+    """按当前代理配置构建客户端"""
+    client_kwargs: Dict[str, Any] = {"timeout": None}
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+    return httpx.AsyncClient(**client_kwargs)
 
 
-async def _safe_aclose(client):
-    with CancelScope(shield=True):
-        try:
-            await client.aclose()
-        except Exception as exc:
-            log.warning(f"HTTP client cleanup failed: {type(exc).__name__}")
-
-
-async def get_client_kwargs(timeout=30.0, **kwargs):
-    options = {"timeout": timeout, **kwargs}
-    proxy = await get_proxy_config()
-    if proxy and "proxy" not in options:
-        options["proxy"] = proxy
-    return options
-
-
-@asynccontextmanager
-async def _lease_client(*, timeout, streaming=False, handshake_timeout=None, **kwargs):
-    options = await get_client_kwargs(timeout=timeout, **kwargs)
-    factory = _StreamingClient if streaming else httpx.AsyncClient
-    if streaming:
-        options["handshake_timeout"] = handshake_timeout
-    # Explicit transports, hooks, certificates etc. belong only to this caller.
-    if kwargs:
-        client = factory(**options)
-        try:
-            yield client
-        finally:
-            await _safe_aclose(client)
-        return
-
-    pool = _client_pools.setdefault(asyncio.get_running_loop(), {})
-    proxy = options.get("proxy", "")
-    timeout_key = tuple(httpx.Timeout(timeout).as_dict().items())
-    key = (proxy, streaming, handshake_timeout, timeout_key)
-    # Construction may reject an invalid proxy. Keep the old pool managed until
-    # its replacement exists, so failure cannot orphan idle sockets.
-    entry = pool.get(key)
-    if entry is None or entry.client.is_closed:
-        entry = pool[key] = _ClientLease(factory(**options))
-    # No awaits between lookup, retirement and lease acquisition. A proxy or
-    # handshake setting change must not close another request's active stream.
-    stale = []
-    for old_key, old in list(pool.items()):
-        if old_key[0] != proxy or (streaming and old_key[1] and old_key[2] != handshake_timeout):
-            del pool[old_key]
-            old.retired = True
-            if not old.users:
-                stale.append(old.client)
-    entry.users += 1
+async def _safe_aclose(client: httpx.AsyncClient) -> None:
+    """安全关闭客户端，异常仅告警"""
     try:
-        for client in stale:
-            await _safe_aclose(client)
-        yield entry.client
-    finally:
-        entry.users -= 1
-        if entry.retired and not entry.users:
-            await _safe_aclose(entry.client)
+        await client.aclose()
+    except Exception as e:
+        log.warning(f"关闭旧 httpx 客户端失败: {e}")
 
 
-async def close_shared_clients():
-    """Retire this loop's pool; active streams close upon their final release."""
-    pool = _client_pools.pop(asyncio.get_running_loop(), {})
-    for entry in pool.values():
-        entry.retired = True
-        if not entry.users:
-            await _safe_aclose(entry.client)
+async def _get_shared_client(**kwargs) -> httpx.AsyncClient:
+    """
+    获取共享的 AsyncClient（按代理指纹缓存复用）。
+
+    调用方不得关闭该客户端（由模块统一管理生命周期，
+    web.py 应用关闭时调用 close_shared_clients）。
+    """
+    proxy_url = await get_proxy_config()
+    fingerprint = _client_fingerprint(proxy_url)
+
+    # 快路径：指纹匹配直接复用（无锁读）
+    for fp, client in _shared_clients:
+        if fp == fingerprint:
+            return client
+
+    # 慢路径：创建或重建客户端
+    async with _shared_clients_lock:
+        # 双重检查（并发下可能已被其他请求创建）
+        for fp, client in _shared_clients:
+            if fp == fingerprint:
+                return client
+
+        # 代理热更新：指纹不匹配的旧客户端移出并异步关闭
+        stale: List[httpx.AsyncClient] = []
+        kept: List[Tuple[str, httpx.AsyncClient]] = []
+        for fp, client in _shared_clients:
+            if fp == fingerprint:
+                kept.append((fp, client))
+            else:
+                stale.append(client)
+        _shared_clients[:] = kept
+
+        new_client = await _build_client(proxy_url)
+        _shared_clients.append((fingerprint, new_client))
+
+        # 惰性关闭旧客户端，不阻塞当前请求
+        for old in stale:
+            try:
+                asyncio.create_task(_safe_aclose(old))
+            except Exception as e:
+                log.warning(f"调度旧客户端关闭失败: {e}")
+
+        return new_client
+
+
+async def close_shared_clients() -> None:
+    """关闭所有共享客户端（应用关闭时调用）"""
+    async with _shared_clients_lock:
+        clients = [c for _, c in _shared_clients]
+        _shared_clients.clear()
+    for client in clients:
+        await _safe_aclose(client)
+
+
+# ====================== 客户端获取（兼容旧接口） ======================
+
+@asynccontextmanager
+async def get_client(
+    timeout: float = 30.0, **kwargs
+) -> AsyncGenerator[httpx.AsyncClient, None]:
+    """获取配置好的异步HTTP客户端（共享复用）"""
+    yield await _get_shared_client()
 
 
 @asynccontextmanager
-async def get_client(timeout=30.0, **kwargs):
-    async with _lease_client(timeout=timeout, **kwargs) as client:
-        yield client
+async def get_streaming_client(
+    timeout: float = None, **kwargs
+) -> AsyncGenerator[httpx.AsyncClient, None]:
+    """获取用于流式请求的HTTP客户端（共享复用）"""
+    yield await _get_shared_client()
 
 
-@asynccontextmanager
-async def get_streaming_client(timeout=None, **kwargs):
-    handshake_timeout = (
-        await get_stream_handshake_timeout_seconds()
-        if await get_stream_handshake_timeout_enabled() else None
-    )
-    if timeout is None:
-        timeout = httpx.Timeout(None, connect=handshake_timeout)
-    async with _lease_client(timeout=timeout, streaming=True,
-                             handshake_timeout=handshake_timeout, **kwargs) as client:
-        yield client
+# ====================== 异步请求方法 ======================
 
-
-# 通用的异步方法
 async def get_async(
     url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 30.0, **kwargs
 ) -> httpx.Response:
     """通用异步GET请求"""
-    async with get_client(timeout=timeout) as client:
-        return await client.get(url, headers=headers, **kwargs)
+    client = await _get_shared_client()
+    return await client.get(url, headers=headers, timeout=timeout, **kwargs)
 
 
 async def post_async(
@@ -186,8 +139,10 @@ async def post_async(
     **kwargs,
 ) -> httpx.Response:
     """通用异步POST请求"""
-    async with get_client(timeout=timeout) as client:
-        return await client.post(url, data=data, json=json, headers=headers, **kwargs)
+    client = await _get_shared_client()
+    return await client.post(
+        url, data=data, json=json, headers=headers, timeout=timeout, **kwargs
+    )
 
 
 # 调试用：设为 True 时所有流式请求都返回 429
@@ -209,18 +164,20 @@ async def stream_post_async(
         )
         return
 
-    async with get_streaming_client(**kwargs) as client:
-        async with client.stream("POST", url, json=body, headers=headers) as r:
-            # 错误直接返回
-            if r.status_code != 200:
-                yield Response(await r.aread(), r.status_code, dict(r.headers))
-                return
+    client = await _get_shared_client()
+    async with client.stream(
+        "POST", url, json=body, headers=headers, **kwargs
+    ) as r:
+        # 错误直接返回
+        if r.status_code != 200:
+            yield Response(await r.aread(), r.status_code, dict(r.headers))
+            return
 
-            # 如果native=True，直接返回bytes流
-            if native:
-                async for chunk in r.aiter_bytes():
-                    yield chunk
-            else:
-                # 通过aiter_lines转化成str流返回
-                async for line in r.aiter_lines():
-                    yield line
+        # 如果native=True，直接返回bytes流
+        if native:
+            async for chunk in r.aiter_bytes():
+                yield chunk
+        else:
+            # 通过aiter_lines转化成str流返回
+            async for line in r.aiter_lines():
+                yield line

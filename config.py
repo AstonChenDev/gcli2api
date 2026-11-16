@@ -29,8 +29,6 @@ AUTO_BAN_ERROR_CODES = [403]
 ENV_MAPPINGS = {
     "CREDENTIALS_DIR": "credentials_dir",
     "PROXY": "proxy",
-    "STREAM_HANDSHAKE_TIMEOUT_ENABLED": "stream_handshake_timeout_enabled",
-    "STREAM_HANDSHAKE_TIMEOUT_SECONDS": "stream_handshake_timeout_seconds",
     "OAUTH_PROXY_URL": "oauth_proxy_url",
     "GOOGLEAPIS_PROXY_URL": "googleapis_proxy_url",
     "ANTIGRAVITY_API_URL": "antigravity_api_url",
@@ -141,24 +139,6 @@ async def get_proxy_config():
         )
         return None
     return proxy_url
-
-
-async def get_stream_handshake_timeout_enabled() -> bool:
-    value = await get_config_value("stream_handshake_timeout_enabled", True, "STREAM_HANDSHAKE_TIMEOUT_ENABLED")
-    if isinstance(value, str):
-        return value.lower() in ("true", "1", "yes", "on")
-    return bool(value)
-
-
-async def get_stream_handshake_timeout_seconds() -> int:
-    value = await get_config_value("stream_handshake_timeout_seconds", 40, "STREAM_HANDSHAKE_TIMEOUT_SECONDS")
-    try:
-        seconds = int(value)
-        if not isinstance(value, bool) and str(seconds) == str(value).strip() and 1 <= seconds <= 3600:
-            return seconds
-    except (ValueError, TypeError, OverflowError):
-        pass
-    return 40
 
 
 async def get_auto_ban_enabled() -> bool:

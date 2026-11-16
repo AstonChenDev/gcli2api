@@ -135,8 +135,6 @@ const CONFIG_GROUPS = [
     fields: [
       { key: "credentials_dir", label: "凭证目录路径", type: "text", note: "存储认证文件的目录路径" },
       { key: "proxy", label: "代理设置", type: "text", note: "支持 http/https/socks5/socks5h，可带账号密码（user:pass@host:port），留空不使用。保存后对新连接生效", placeholder: "http://user:pass@proxy:port 或 socks5h://proxy:port" },
-      { key: "stream_handshake_timeout_enabled", label: "启用握手超时", type: "bool", note: "限制流式调用连接上游的等待时间，使用代理和不使用代理时均生效。默认开启；关闭后不限建连时间，客户端断开仍会取消请求。保存后对新请求生效" },
-      { key: "stream_handshake_timeout_seconds", label: "握手超时秒数", type: "number", min: 1, max: 3600, step: 1, showIf: (cfg) => !!cfg.stream_handshake_timeout_enabled, note: "默认 40 秒，可设 1–3600 秒。每次重试单独计时，不限制连接建立后的思考与生成时长" },
     ],
   },
   {
