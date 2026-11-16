@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import math
 import time
 from typing import Literal, Optional
 
@@ -24,9 +25,26 @@ router = APIRouter(prefix="/usage-logs", tags=["usage-logs"])
 
 
 def overall_filters(start_timestamp, end_timestamp, model_name):
+    if any(value is not None and not math.isfinite(value) for value in (start_timestamp, end_timestamp)):
+        raise HTTPException(400, "时间必须是有限数值")
     if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
         raise HTTPException(400, "开始时间不能晚于结束时间")
     return dict(start_timestamp=start_timestamp, end_timestamp=end_timestamp, model_name=model_name.strip())
+
+
+@router.get("/model-tokens")
+async def get_model_token_stats(
+    token: str = Depends(verify_panel_token),
+    start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None,
+    model_name: str = "", credential_email: Optional[str] = None,
+):
+    filters = overall_filters(start_timestamp, end_timestamp, model_name)
+    filters["credential_email"] = credential_email.strip() if credential_email is not None else None
+    database = await get_database()
+    await flush_usage_logs()
+    result = await database.model_token_stats(**filters)
+    result["logging_enabled"] = await get_usage_log_enabled()
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/overall-stats")

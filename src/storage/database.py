@@ -1108,6 +1108,48 @@ class Database:
                 await session.execute(text("BEGIN"))
             yield session
 
+    async def model_token_stats(self, **filters):
+        """Sum recorded consumption across all attempts, including failed retries.
+
+        Do not deduplicate request IDs: each upstream attempt can consume tokens.
+        Cache is a subset of input and thinking is already included in output.
+        No historical per-call quota charges are stored, so never infer them here.
+        """
+        _, model, conditions = self._credential_usage_filters(**filters)
+        prompt = func.coalesce(UsageLog.prompt_tokens, 0)
+        completion = func.coalesce(UsageLog.completion_tokens, 0)
+        components = prompt + completion
+        total = case((UsageLog.total_tokens > 0, UsageLog.total_tokens), else_=components)
+        query = select(
+            model.label("model_name"), func.count().label("attempts"),
+            func.sum(case((UsageLog.success.is_(True), 1), else_=0)).label("success_count"),
+            func.sum(prompt).label("prompt_tokens"),
+            func.sum(completion).label("completion_tokens"),
+            func.sum(func.coalesce(UsageLog.cached_tokens, 0)).label("cached_tokens"),
+            func.sum(total).label("total_tokens"),
+            func.sum(total - components).label("total_difference_tokens"),
+            func.sum(case((UsageLog.success.is_not(True), total), else_=0)).label("failed_tokens"),
+            func.sum(case((total > 0, 1), else_=0)).label("positive_usage_attempts"),
+            func.min(UsageLog.created_at).label("first_request"),
+            func.max(UsageLog.created_at).label("last_request"),
+        ).where(*conditions).group_by(model).order_by(func.sum(total).desc(), model)
+        async with self._usage_snapshot() as s:
+            rows = [dict(r) for r in (await s.execute(query)).mappings()]
+        fields = ("attempts", "success_count", "prompt_tokens", "completion_tokens",
+                  "cached_tokens", "total_tokens", "total_difference_tokens", "failed_tokens", "positive_usage_attempts")
+        summary = {key: sum(row[key] for row in rows) for key in fields}
+        summary["first_request"] = min((r["first_request"] for r in rows), default=None)
+        summary["last_request"] = max((r["last_request"] for r in rows), default=None)
+        for row in rows:
+            for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                row[field + "_percentage"] = (
+                    row[field] / summary[field] * 100 if summary[field] else None)
+            row["quota_percentage"] = None
+        return {"summary": summary, "items": rows,
+                "quota": {"available": False, "reason": "no_per_call_quota_charges"},
+                "token_basis": "reported_total_with_input_plus_output_fallback",
+                "scope": "all_recorded_attempts"}
+
     async def credential_usage_stats(self, offset=0, limit=50, **filters):
         """Aggregate retained request logs by credential and actual upstream model."""
         email, model, conditions = self._credential_usage_filters(**filters)

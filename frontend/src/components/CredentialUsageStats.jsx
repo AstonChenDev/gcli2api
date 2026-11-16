@@ -4,21 +4,23 @@ import api from "../api";
 import Modal from "./Modal";
 import OverallUsageStats, { successRate } from "./OverallUsageStats";
 import { formatMillions } from "../utils/tokens";
+import ModelTokenStats from "./ModelTokenStats";
+import { statsRange } from "../utils/modelUsage";
 
 const time = value => value ? new Date(value * 1000).toLocaleString("zh-CN") : "—";
-function rangeParams(range) {
-  const end = Date.now() / 1000;
-  const start = range === "today" ? new Date().setHours(0, 0, 0, 0) / 1000 : range === "all" ? null : end - Number(range) * 3600;
-  return { ...(start === null ? {} : { start_timestamp: start }), end_timestamp: end };
-}
 const inputClass = "rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 min-w-0";
 const tierStyles = { ultra: "bg-purple-100 text-purple-800", ultra_lite: "bg-purple-100 text-purple-800", pro: "bg-blue-100 text-blue-800", free: "bg-slate-100 text-slate-700" };
 
 export default function CredentialUsageStats() {
-  const [range, setRange] = useState("today");
+  const [range, setRange] = useState("all");
+  const [customStart, setCustomStart] = useState("");
+  const [customEnd, setCustomEnd] = useState("");
+  const [rangeError, setRangeError] = useState("");
+  const [autoRefresh, setAutoRefresh] = useState(false);
   const [email, setEmail] = useState("");
   const [model, setModel] = useState("");
-  const [filters, setFilters] = useState(() => rangeParams("today"));
+  const [filters, setFilters] = useState(() => statsRange("all"));
+  const [appliedRange, setAppliedRange] = useState("all");
   const [page, setPage] = useState(1);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -54,8 +56,21 @@ export default function CredentialUsageStats() {
 
   const apply = event => {
     event.preventDefault(); setPage(1);
-    setFilters({ ...rangeParams(range), ...(email.trim() ? { credential_email: email.trim() } : {}), ...(model.trim() ? { model_name: model.trim() } : {}) });
+    try {
+      const window = statsRange(range, customStart, customEnd);
+      setFilters({ ...window, ...(email.trim() ? { credential_email: email.trim() } : {}), ...(model.trim() ? { model_name: model.trim() } : {}) });
+      setAppliedRange(range); setRangeError("");
+    } catch (err) { setRangeError(err.message); }
   };
+  useEffect(() => {
+    if (!autoRefresh || appliedRange === "custom") return;
+    const timer = setInterval(() => {
+      if (document.visibilityState !== "hidden") {
+        setFilters(previous => ({ ...previous, ...statsRange(appliedRange) }));
+      }
+    }, 60000);
+    return () => clearInterval(timer);
+  }, [autoRefresh, appliedRange]);
   const summary = data?.summary;
   const pages = Math.max(1, Math.ceil((data?.total || 0) / 50));
   return <div className="space-y-4">
@@ -64,19 +79,26 @@ export default function CredentialUsageStats() {
       <p>每个凭证、每个实际调用模型单独计数。上游重试分别计数，成功和失败按请求日志记录汇总。</p>
       <p className="text-xs text-slate-600">凭证级别显示当前保存的 Ultra / Pro / Free；已删除或缺少级别信息的凭证显示“未知”。</p>
       <p className="text-xs text-slate-600">1 M = 1,000,000 Tokens。输入包含缓存命中，输出包含思考 Tokens；上游未返回的用量无法计入。</p>
-      <p className="text-xs text-slate-600">统计仅包含保留的请求日志；清理日志会同步减少统计，关闭日志后不会新增统计。后台凭证测试不计入这里。</p>
+      <p className="text-xs text-slate-600">统计仅包含保留的请求日志；清理日志会同步减少统计，关闭日志后不会新增统计。凭证健康检查不计入；已记录的额度校准调用计入统计。</p>
     </div>
     <form onSubmit={apply} className="flex flex-wrap gap-2">
       <select aria-label="统计时间范围" value={range} onChange={e => setRange(e.target.value)} className={inputClass}>
-        <option value="0.08333333333333333">最近 5 分钟</option><option value="0.25">最近 15 分钟</option><option value="1">最近 1 小时</option><option value="today">今天</option><option value="24">最近 24 小时</option><option value="168">最近 7 天</option><option value="720">最近 30 天</option><option value="all">全部保留日志</option>
+        <option value="0.08333333333333333">最近 5 分钟</option><option value="0.25">最近 15 分钟</option><option value="1">最近 1 小时</option><option value="today">今天（浏览器时区）</option><option value="24">最近 24 小时</option><option value="168">最近 7 天</option><option value="720">最近 30 天</option><option value="all">全部保留日志</option><option value="custom">自定义时间</option>
       </select>
+      {range === "custom" && <div className="flex flex-wrap gap-2 w-full text-xs text-slate-600">
+        <label>开始时间（浏览器时区）<input type="datetime-local" step="1" aria-label="统计开始时间" value={customStart} onChange={e => setCustomStart(e.target.value)} className={`${inputClass} block`} /></label>
+        <label>结束时间（浏览器时区）<input type="datetime-local" step="1" aria-label="统计结束时间" value={customEnd} onChange={e => setCustomEnd(e.target.value)} className={`${inputClass} block`} /></label>
+      </div>}
       <input aria-label="统计凭证邮箱" value={email} onChange={e => setEmail(e.target.value)} placeholder="凭证邮箱（留空查全部）" className={`${inputClass} flex-1`} />
       <input aria-label="统计模型名称" value={model} onChange={e => setModel(e.target.value)} placeholder="完整模型名称（留空查全部）" className={`${inputClass} flex-1`} />
       <button disabled={loading} className="btn btn-primary flex items-center gap-1.5 text-sm disabled:opacity-50"><RefreshCw size={14} /> 查询 / 刷新</button>
     </form>
+    {rangeError && <p role="alert" className="text-sm text-red-700">{rangeError}</p>}
+    <label className="flex items-center gap-2 text-xs text-slate-500"><input type="checkbox" checked={autoRefresh} disabled={appliedRange === "custom"} onChange={e => setAutoRefresh(e.target.checked)} />每分钟自动刷新（自定义时间固定不滚动）</label>
     <p className="text-xs text-slate-500">查询范围：{filters.start_timestamp ? time(filters.start_timestamp) : "全部保留记录"} 至 {time(filters.end_timestamp)}</p>
     {data?.logging_enabled === false && <p role="alert" className="text-sm text-amber-800 bg-amber-50 rounded-lg p-3">请求日志当前已关闭，以下仅为历史保留数据。</p>}
     {error && <p role="alert" className="text-sm text-red-700">{error}</p>}
+    <ModelTokenStats filters={filters} />
     <OverallUsageStats filters={filters} />
     <h3 className="font-semibold text-slate-900">凭证 × 模型调用统计（含重试）</h3>
     {summary && <>
