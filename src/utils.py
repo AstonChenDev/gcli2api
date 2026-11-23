@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Optional
 
 from config import get_api_password, get_panel_password
 from fastapi import Depends, HTTPException, Header, Query, Request, status
@@ -10,28 +10,24 @@ security = HTTPBearer()
 
 # ====================== OAuth Configuration ======================
 
-def get_geminicli_user_agent(model: str = "") -> str:
-    """生成动态 User-Agent: GeminiCLI/{version}/{model} ({platform}; {arch}; {surface})"""
-    if model:
-        return f"Mozilla/5.0 (compatible; Google-Gemini-CLI/1.0; +https://github.com/google-gemini/gemini-cli) {model}"
-    return f"Mozilla/5.0 (compatible; Google-Gemini-CLI/1.0; +https://github.com/google-gemini/gemini-cli)"
+# Antigravity 官方语言服务枢纽 (Antigravity Hub) 指纹常量
+# 出站 User-Agent 对齐官方 Hub 签名（版本号与 CL 为 Google Piper 内部构建点，
+# 必须成对出现、全球正版客户端统一，切勿随机变动）：
+#   antigravity/hub/{OFFICIAL_HUB_VERSION} (aidev_client; os_type=windows; arch=amd64; cl={OFFICIAL_HUB_CL})
+OFFICIAL_HUB_VERSION = "2.28.0"
+OFFICIAL_HUB_CL = "1008300195"
+_HUB_FINGERPRINT_OS = "windows"
+_HUB_FINGERPRINT_ARCH = "amd64"
 
-# 静态常量
-GEMINICLI_USER_AGENT = get_geminicli_user_agent()
-
-# Antigravity CLI 客户端仿真常量
-ANTIGRAVITY_VERSION = "2.23.0"
-ANTIGRAVITY_PLATFORM = "darwin/arm64"
-ANTIGRAVITY_USER_AGENT = f"antigravity/hub/{ANTIGRAVITY_VERSION} {ANTIGRAVITY_PLATFORM}"
-
-# OAuth Configuration - 标准模式
-CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
-CLIENT_SECRET = "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"
-SCOPES = [
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-]
+ANTIGRAVITY_USER_AGENT = (
+    f"antigravity/hub/{OFFICIAL_HUB_VERSION} "
+    f"(aidev_client; os_type={_HUB_FINGERPRINT_OS}; "
+    f"arch={_HUB_FINGERPRINT_ARCH}; cl={OFFICIAL_HUB_CL})"
+)
+# 兼容旧引用
+ANTIGRAVITY_CLI_VERSION = OFFICIAL_HUB_VERSION
+ANTIGRAVITY_CLI_PLATFORM = f"{_HUB_FINGERPRINT_OS}/{_HUB_FINGERPRINT_ARCH}"
+log.info(f"当前 Antigravity Hub 出站指纹: {ANTIGRAVITY_USER_AGENT}")
 
 # Antigravity OAuth Configuration
 ANTIGRAVITY_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
@@ -50,97 +46,22 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 # 回调服务器配置
 CALLBACK_HOST = "localhost"
 
-# Model name lists for different features
-BASE_MODELS = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-3-flash-preview",
-    "gemini-3.1-pro-preview",
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.8-flash",
-]
-
-
 # ====================== Model Helper Functions ======================
 
-def is_fake_streaming_model(model_name: str) -> bool:
-    """Check if model name indicates fake streaming should be used."""
-    return model_name.startswith("假流式/")
+# 抗截断模型前缀
+_ANTI_TRUNCATION_PREFIX = "抗截断-"
 
 
 def is_anti_truncation_model(model_name: str) -> bool:
     """Check if model name indicates anti-truncation should be used."""
-    return model_name.startswith("抗截断/")
+    return model_name.startswith(_ANTI_TRUNCATION_PREFIX)
 
 
 def get_base_model_from_feature_model(model_name: str) -> str:
     """Get base model name from feature model name."""
-    # Remove feature prefixes
-    for prefix in ["假流式/", "抗截断/", "流式抗截断/"]:
-        if model_name.startswith(prefix):
-            return model_name[len(prefix) :]
+    if model_name.startswith(_ANTI_TRUNCATION_PREFIX):
+        return model_name[len(_ANTI_TRUNCATION_PREFIX) :]
     return model_name
-
-
-def get_available_models(router_type: str = "openai") -> List[str]:
-    """
-    Get available models with feature prefixes.
-
-    Args:
-        router_type: "openai" or "gemini"
-
-    Returns:
-        List of model names with feature prefixes
-    """
-    models = []
-
-    for base_model in BASE_MODELS:
-        # 基础模型
-        models.append(base_model)
-
-        # 假流式模型 (前缀格式)
-        models.append(f"假流式/{base_model}")
-
-        # 抗截断模型 (前缀格式)
-        models.append(f"抗截断/{base_model}")
-
-        # 定义思考后缀（根据模型系列不同）
-        thinking_suffixes = []
-
-        # Gemini 2.5 系列: 使用思考预算后缀
-        if "gemini-2.5" in base_model:
-            thinking_suffixes = ["-max", "-high", "-medium", "-low", "-minimal"]
-        # Gemini 3 系列: 使用思考等级后缀
-        elif "gemini-3" in base_model:
-            if "flash" in base_model:
-                # 3-flash-preview: 支持 high/medium/low/minimal
-                thinking_suffixes = ["-high", "-medium", "-low", "-minimal"]
-            elif "pro" in base_model:
-                # 3-pro-preview: 支持 high/low
-                thinking_suffixes = ["-high", "-low"]
-
-        search_suffix = "-search"
-
-        # 1. 单独的 thinking 后缀
-        for thinking_suffix in thinking_suffixes:
-            models.append(f"{base_model}{thinking_suffix}")
-            models.append(f"假流式/{base_model}{thinking_suffix}")
-            models.append(f"抗截断/{base_model}{thinking_suffix}")
-
-        # 2. 单独的 search 后缀
-        models.append(f"{base_model}{search_suffix}")
-        models.append(f"假流式/{base_model}{search_suffix}")
-        models.append(f"抗截断/{base_model}{search_suffix}")
-
-        # 3. thinking + search 组合后缀
-        for thinking_suffix in thinking_suffixes:
-            combined_suffix = f"{thinking_suffix}{search_suffix}"
-            models.append(f"{base_model}{combined_suffix}")
-            models.append(f"假流式/{base_model}{combined_suffix}")
-            models.append(f"抗截断/{base_model}{combined_suffix}")
-
-    return models
 
 
 # ====================== Authentication Functions ======================

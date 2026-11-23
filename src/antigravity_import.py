@@ -1,36 +1,24 @@
-"""Import Antigravity credentials from refresh tokens or Manager backups.
-
-This module deliberately keeps OAuth secrets and tokens out of API results and
-application logs.  A credential is persisted only after Google accepts the
-refresh token and the Antigravity project can be resolved.
-"""
-
-from __future__ import annotations
-
+"""RT/Manager import adapted from my-custom: validate first, skip duplicates, never echo tokens."""
 import asyncio
 import hashlib
-import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from config import get_antigravity_api_url
+from config import get_antigravity_api_url, get_googleapis_proxy_url, get_oauth_proxy_url
 from log import log
-from src.google_oauth_api import Credentials, fetch_project_id_and_tier, get_user_email
-from src.storage_adapter import StorageAdapter, get_storage_adapter
-from src.utils import (
-    ANTIGRAVITY_CLIENT_ID,
-    ANTIGRAVITY_CLIENT_SECRET,
-    ANTIGRAVITY_SCOPES,
-    ANTIGRAVITY_USER_AGENT,
-    TOKEN_URL,
-)
+from src.google_oauth_api import TokenError, read_oauth_tokens
+from src.httpx_client import get_async, post_async
+from src.credential_tier import parse_project_id, parse_tier
+from src.storage.database import get_database
+from src.utils import ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET, ANTIGRAVITY_USER_AGENT
 
 MAX_IMPORT_ITEMS = 100
 MAX_REFRESH_TOKEN_LENGTH = 4096
+MAX_IMPORT_BODY_BYTES = 1024 * 1024
 IMPORT_CONCURRENCY = 3
 IMPORT_ITEM_TIMEOUT_SECONDS = 90
 IMPORT_BATCH_TIMEOUT_SECONDS = 300
-MAX_IMPORT_BODY_BYTES = 1024 * 1024
 
 
 class AntigravityImportInputError(ValueError):
@@ -43,16 +31,6 @@ class RefreshTokenCandidate:
     refresh_token: Optional[str]
     error_code: Optional[str] = None
     error: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class PreparedCredential:
-    candidate: RefreshTokenCandidate
-    credential_data: Dict[str, Any]
-    project_id: str
-    email: str
-    tier: Optional[str]
-    credit_amount: Optional[int]
 
 
 def _normalize_email(value: Any) -> Optional[str]:
@@ -75,6 +53,10 @@ def _validate_refresh_token(value: Any) -> Tuple[Optional[str], Optional[str], O
         return None, "invalid_refresh_token", "Refresh Token 长度无效"
     if any(character.isspace() or ord(character) < 32 for character in token):
         return None, "invalid_refresh_token", "Refresh Token 不能包含空白或控制字符"
+    try:
+        token.encode("utf-8")
+    except UnicodeEncodeError:
+        return None, "invalid_refresh_token", "Refresh Token 包含无效的 Unicode 字符"
     return token, None, None
 
 
@@ -174,391 +156,140 @@ def _token_digest(refresh_token: str) -> str:
     return hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
 
 
-def _safe_import_error(error: Exception) -> Tuple[str, str]:
-    """Map OAuth/network exceptions to stable messages without echoing secrets."""
-
-    if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
-        return "import_timeout", "凭证验证超时，请稍后重试"
-    oauth_error_code = getattr(error, "oauth_error_code", None)
-    status_code = getattr(error, "status_code", None)
-    lowered = str(error).lower()
-    if oauth_error_code == "invalid_grant" or "invalid_grant" in lowered:
-        return "invalid_grant", "Refresh Token 已失效、被撤销或 OAuth Client 不匹配"
-    if status_code == 429:
-        return "oauth_rate_limited", "Google OAuth 请求过于频繁，请稍后重试"
-    if isinstance(status_code, int) and status_code >= 500:
-        return "oauth_upstream_error", "Google OAuth 暂时不可用，请稍后重试"
-    if "timeout" in lowered or "timed out" in lowered:
-        return "oauth_timeout", "连接 Google OAuth 超时，请稍后重试"
-    if "connect" in lowered or "network" in lowered:
-        return "oauth_network_error", "无法连接 Google OAuth，请检查网络或上游代理"
-    return "oauth_exchange_failed", "Google OAuth 拒绝了该 Refresh Token"
+class ImportFailure(Exception):
+    def __init__(self, code, message):
+        self.code = code
+        self.message = message
+        super().__init__(message)
 
 
-def build_antigravity_credential_data(credentials: Credentials, project_id: str) -> Dict[str, Any]:
-    """Build the same self-contained credential shape as the OAuth flow."""
+async def prepare_credential(refresh_token, *, existing_emails):
+    """Use existing configured OAuth/Google proxies, without logging upstream bodies."""
+    oauth_url = await get_oauth_proxy_url()
+    response = await post_async(
+        f"{oauth_url.rstrip('/')}/token",
+        data={"refresh_token": refresh_token, "grant_type": "refresh_token",
+              "client_id": ANTIGRAVITY_CLIENT_ID, "client_secret": ANTIGRAVITY_CLIENT_SECRET},
+        headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=30.0,
+    )
+    if response.status_code != 200:
+        if response.status_code == 429:
+            raise ImportFailure("oauth_rate_limited", "Google OAuth 请求过于频繁，请稍后重试")
+        if response.status_code >= 500:
+            raise ImportFailure("oauth_unavailable", "Google OAuth 暂时不可用，请稍后重试")
+        raise ImportFailure("oauth_rejected", "RT 已失效、被撤销或 OAuth Client 不匹配")
+    data = response.json()
+    try:
+        access_token, refresh_token = read_oauth_tokens(data, refresh_token)
+    except TokenError:
+        raise ImportFailure("oauth_invalid_response", "Google 未返回有效的令牌数据") from None
+    headers = {"Authorization": f"Bearer {access_token}", "User-Agent": ANTIGRAVITY_USER_AGENT}
+    google_url = await get_googleapis_proxy_url()
+    response = await get_async(f"{google_url.rstrip('/')}/oauth2/v2/userinfo", headers=headers, timeout=30.0)
+    if response.status_code != 200:
+        raise ImportFailure("userinfo_failed", "RT 有效，但获取 Google 账号邮箱失败")
+    user = response.json()
+    email = _normalize_email(user.get("email"))
+    if not email or user.get("verified_email") is False:
+        raise ImportFailure("email_not_found", "无法确认 Google 账号邮箱，未保存凭证")
 
-    data: Dict[str, Any] = {
-        "client_id": ANTIGRAVITY_CLIENT_ID,
-        "client_secret": ANTIGRAVITY_CLIENT_SECRET,
-        "token": credentials.access_token,
-        "refresh_token": credentials.refresh_token,
-        "scopes": ANTIGRAVITY_SCOPES,
-        "token_uri": TOKEN_URL,
-        "project_id": project_id,
+    if email in existing_emails:
+        return email, None
+
+    api_url = await get_antigravity_api_url()
+    response = await post_async(
+        f"{api_url.rstrip('/')}/v1internal:loadCodeAssist", headers=headers,
+        json={"metadata": {"ideType": "ANTIGRAVITY"}}, timeout=30.0,
+    )
+    if response.status_code != 200:
+        raise ImportFailure("project_lookup_failed", f"获取 Antigravity 项目失败（HTTP {response.status_code}）")
+    account = response.json()
+    project = parse_project_id(account)
+    if not project:
+        raise ImportFailure("project_not_found", "RT 有效，但没有获取到 Antigravity Project ID；请先在官方应用激活账号")
+    try:
+        tier = parse_tier(account)
+    except ValueError:
+        tier = "unknown"
+    credential = {
+        "access_token": access_token, "refresh_token": refresh_token,
+        "client_id": ANTIGRAVITY_CLIENT_ID, "client_secret": ANTIGRAVITY_CLIENT_SECRET,
+        "project_id": project, "tier": tier,
+        "expiry": (datetime.now(timezone.utc) + timedelta(seconds=int(data.get("expires_in", 3600)))).isoformat(),
     }
-    if credentials.expires_at:
-        data["expiry"] = credentials.expires_at.isoformat()
-    return data
+    return email, credential
 
 
-async def _load_existing_identity_index(
-    storage_adapter: StorageAdapter,
-) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """Return refresh-token and verified-email indexes for existing AG creds."""
+def _failure(item, code, message):
+    return {"item": item, "status": "failed", "error_code": code, "error": message}
 
-    filenames = await storage_adapter.list_credentials(mode="antigravity")
-    states = await storage_adapter.get_all_credential_states(mode="antigravity")
-    token_index: Dict[str, str] = {}
-    email_index: Dict[str, str] = {}
 
-    for filename, state in states.items():
-        if not isinstance(state, dict):
+async def import_antigravity_refresh_tokens(candidates, *, database=None):
+    database = database or await get_database()
+    identities = await database.get_import_identities()
+    existing_tokens = {_token_digest(rt) for _, rt in identities if rt}
+    existing_emails = {email.casefold() for email, _ in identities}
+    results = {}
+    pending = []
+    seen = {}
+    for candidate in candidates:
+        if candidate.error_code:
+            results[candidate.item] = _failure(candidate.item, candidate.error_code, candidate.error)
             continue
-        email = _normalize_email(state.get("user_email"))
-        if email:
-            email_index[email] = filename
-
-    async def load_one(filename: str) -> Tuple[str, Optional[Dict[str, Any]]]:
-        return filename, await storage_adapter.get_credential(filename, mode="antigravity")
-
-    # Avoid hundreds of sequential DB round trips without flooding a remote DB.
-    for offset in range(0, len(filenames), 25):
-        rows = await asyncio.gather(
-            *(load_one(filename) for filename in filenames[offset : offset + 25])
-        )
-        for filename, credential_data in rows:
-            if not credential_data:
-                continue
-            if not isinstance(credential_data, dict):
-                # Legacy upload accepts any valid JSON. Ignore malformed pool
-                # entries instead of letting one bad row block all imports.
-                continue
-            refresh_token = credential_data.get("refresh_token")
-            if isinstance(refresh_token, str) and refresh_token:
-                token_index[_token_digest(refresh_token)] = filename
-
-    return token_index, email_index
-
-
-async def _prepare_candidate(
-    candidate: RefreshTokenCandidate,
-    semaphore: asyncio.Semaphore,
-    get_api_url: Callable[[], Awaitable[str]],
-    fetch_project: Callable[..., Awaitable[Tuple[Optional[str], Optional[str], Optional[int]]]],
-    fetch_email: Callable[[Credentials], Awaitable[Optional[str]]],
-) -> Tuple[Optional[PreparedCredential], Optional[Dict[str, Any]]]:
-    assert candidate.refresh_token is not None
-
-    async with semaphore:
-        credentials = Credentials(
-            access_token="",
-            refresh_token=candidate.refresh_token,
-            client_id=ANTIGRAVITY_CLIENT_ID,
-            client_secret=ANTIGRAVITY_CLIENT_SECRET,
-        )
-        try:
-            async with asyncio.timeout(IMPORT_ITEM_TIMEOUT_SECONDS):
-                # The general proxy keeps a long timeout for generation calls;
-                # credential import must fail promptly instead of holding a
-                # batch request for 15 minutes on an unreachable OAuth host.
-                await credentials.refresh(timeout=30.0)
-                api_base_url = await get_api_url()
-                project_id, tier, credit_amount = await fetch_project(
-                    access_token=credentials.access_token,
-                    user_agent=ANTIGRAVITY_USER_AGENT,
-                    api_base_url=api_base_url,
-                    include_credits=True,
-                )
-                if not project_id:
-                    return None, {
-                        "item": candidate.item,
-                        "status": "failed",
-                        "error_code": "project_not_found",
-                        "error": "Refresh Token 有效，但无法获取 Antigravity Project ID",
-                    }
-
-                # Only trust the Google userinfo response for persisted identity;
-                # Manager backup email fields are user-controlled input.
-                email = _normalize_email(await fetch_email(credentials))
-                if not email:
-                    return None, {
-                        "item": candidate.item,
-                        "status": "failed",
-                        "error_code": "email_not_found",
-                        "error": "Refresh Token 有效，但无法从 Google 获取账号邮箱",
-                    }
-                return (
-                    PreparedCredential(
-                        candidate=candidate,
-                        credential_data=build_antigravity_credential_data(credentials, project_id),
-                        project_id=project_id,
-                        email=email,
-                        tier=tier,
-                        credit_amount=credit_amount,
-                    ),
-                    None,
-                )
-        except Exception as error:
-            error_code, message = _safe_import_error(error)
-            # Do not include the exception text: OAuth libraries can attach the
-            # submitted form body to some errors.
-            log.warning(
-                "Antigravity Refresh Token import failed: "
-                f"item={candidate.item}, code={error_code}, "
-                f"exception={type(error).__name__}"
-            )
-            return None, {
-                "item": candidate.item,
-                "status": "failed",
-                "error_code": error_code,
-                "error": message,
-            }
-
-
-async def import_antigravity_refresh_tokens(
-    candidates: Sequence[RefreshTokenCandidate],
-    *,
-    storage_adapter: Optional[StorageAdapter] = None,
-    get_api_url: Callable[[], Awaitable[str]] = get_antigravity_api_url,
-    fetch_project: Callable[..., Awaitable[Any]] = fetch_project_id_and_tier,
-    fetch_email: Callable[[Credentials], Awaitable[Optional[str]]] = get_user_email,
-) -> Dict[str, Any]:
-    """Validate, enrich, de-duplicate, and persist AG refresh tokens."""
-
-    adapter = storage_adapter or await get_storage_adapter()
-    existing_tokens, existing_emails = await _load_existing_identity_index(adapter)
-    results: List[Optional[Dict[str, Any]]] = [None] * len(candidates)
-    seen_request_tokens: Dict[str, int] = {}
-    to_prepare: List[RefreshTokenCandidate] = []
-
-    for position, candidate in enumerate(candidates):
-        if candidate.error_code or not candidate.refresh_token:
-            results[position] = {
-                "item": candidate.item,
-                "status": "failed",
-                "error_code": candidate.error_code or "missing_refresh_token",
-                "error": candidate.error or "缺少 Refresh Token",
-            }
-            continue
-
         digest = _token_digest(candidate.refresh_token)
-        if digest in seen_request_tokens:
-            results[position] = {
-                "item": candidate.item,
-                "status": "skipped",
-                "error_code": "duplicate_in_request",
-                "error": f"与第 {seen_request_tokens[digest]} 项重复",
-            }
+        if digest in seen or digest in existing_tokens:
+            results[candidate.item] = {"item": candidate.item, "status": "skipped", "error_code": "duplicate_token",
+                "error": f"与第 {seen[digest]} 项重复" if digest in seen else "该 RT 已存在"}
             continue
-        seen_request_tokens[digest] = candidate.item
-
-        if digest in existing_tokens:
-            results[position] = {
-                "item": candidate.item,
-                "status": "skipped",
-                "error_code": "already_exists",
-                "error": "该 Refresh Token 已存在",
-                "filename": existing_tokens[digest],
-            }
-            continue
-        to_prepare.append(candidate)
+        seen[digest] = candidate.item
+        pending.append(candidate)
 
     semaphore = asyncio.Semaphore(IMPORT_CONCURRENCY)
+
+    async def prepare(candidate):
+        async with semaphore:
+            try:
+                async with asyncio.timeout(IMPORT_ITEM_TIMEOUT_SECONDS):
+                    return candidate, await prepare_credential(candidate.refresh_token, existing_emails=existing_emails), None
+            except ImportFailure as error:
+                return candidate, None, _failure(candidate.item, error.code, error.message)
+            except TimeoutError:
+                return candidate, None, _failure(candidate.item, "import_timeout", "验证超时，请稍后重试")
+            except Exception as error:
+                log.warning(f"RT import verification failed: item={candidate.item}, type={type(error).__name__}")
+                return candidate, None, _failure(candidate.item, "validation_failed", "验证失败，请检查网络或稍后重试")
+
     try:
         async with asyncio.timeout(IMPORT_BATCH_TIMEOUT_SECONDS):
-            prepared_rows = await asyncio.gather(
-                *(
-                    _prepare_candidate(
-                        candidate,
-                        semaphore,
-                        get_api_url,
-                        fetch_project,
-                        fetch_email,
-                    )
-                    for candidate in to_prepare
-                )
-            )
+            prepared = await asyncio.gather(*(prepare(c) for c in pending))
     except TimeoutError:
-        # Preparation does not write storage, so cancellation leaves no partial
-        # credentials. The caller can safely retry with a smaller batch.
-        prepared_rows = [
-            (
-                None,
-                {
-                    "item": candidate.item,
-                    "status": "failed",
-                    "error_code": "batch_timeout",
-                    "error": "本批验证超过 5 分钟，未完成的凭证均未保存，请缩小批次后重试",
-                },
-            )
-            for candidate in to_prepare
-        ]
+        prepared = [(c, None, _failure(c.item, "batch_timeout", "本批验证超过 5 分钟，本批新凭证均未保存；请缩小批次重试")) for c in pending]
 
-    prepared_by_item: Dict[int, PreparedCredential] = {}
-    errors_by_item: Dict[int, Dict[str, Any]] = {}
-    for prepared, error_result in prepared_rows:
-        if prepared:
-            prepared_by_item[prepared.candidate.item] = prepared
-        elif error_result:
-            errors_by_item[error_result["item"]] = error_result
-
-    seen_batch_emails: Dict[str, int] = {}
-    for position, candidate in enumerate(candidates):
-        if results[position] is not None:
+    for candidate, row, error in prepared:
+        if error:
+            results[candidate.item] = error
             continue
-        if candidate.item in errors_by_item:
-            results[position] = errors_by_item[candidate.item]
+        email, credential = row
+        if email in existing_emails:
+            results[candidate.item] = {"item": candidate.item, "email": email, "status": "skipped",
+                "error_code": "email_already_exists", "error": "该 Google 账号已存在，保留原凭证"}
             continue
-
-        prepared = prepared_by_item[candidate.item]
-        normalized_email = _normalize_email(prepared.email)
-        # _prepare_candidate requires a verified Google email. Keep this guard
-        # defensive in case a future caller constructs PreparedCredential itself.
-        if not normalized_email:
-            results[position] = {
-                "item": candidate.item,
-                "status": "failed",
-                "error_code": "email_not_found",
-                "error": "无法确定 Google 账号身份，未保存凭证",
-            }
+        try:
+            inserted = await database.insert_imported_credential(email, credential)
+        except Exception as error:
+            log.error(f"RT import storage failed: item={candidate.item}, type={type(error).__name__}")
+            results[candidate.item] = _failure(candidate.item, "storage_failed", "保存凭证失败，请稍后重试")
             continue
-        if normalized_email in seen_batch_emails:
-            results[position] = {
-                "item": candidate.item,
-                "email": normalized_email,
-                "status": "skipped",
-                "error_code": "duplicate_email_in_request",
-                "error": f"与第 {seen_batch_emails[normalized_email]} 项属于同一 Google 账号",
-            }
-            continue
-        if normalized_email in existing_emails:
-            results[position] = {
-                "item": candidate.item,
-                "email": normalized_email,
-                "status": "skipped",
-                "error_code": "email_already_exists",
-                "error": "该 Google 账号已存在",
-                "filename": existing_emails[normalized_email],
-            }
-            continue
+        existing_emails.add(email)
+        results[candidate.item] = {"item": candidate.item, "email": email,
+            "status": "success" if inserted else "skipped", "project_id": credential["project_id"], "tier": credential["tier"],
+            "error": None if inserted else "该 Google 账号已存在，保留原凭证"}
 
-        # Antigravity Manager also identifies/upserts accounts by verified email.
-        # Project IDs such as "aicode-consumers" are shared by many accounts and
-        # must never be used as an account identity or duplicate key.
-        identity_digest = hashlib.sha256(f"email:{normalized_email}".encode("utf-8")).hexdigest()
-        seen_batch_emails[normalized_email] = candidate.item
-        filename = f"ag_import_{identity_digest[:20]}.json"
+    ordered = [results[c.item] for c in candidates]
+    summary = {"total": len(ordered), "results": ordered}
+    for key, status in [("imported_count", "success"), ("skipped_count", "skipped"), ("failed_count", "failed")]:
+        summary[key] = sum(r["status"] == status for r in ordered)
+    log.info(f"RT import completed: total={summary['total']}, success={summary['imported_count']}, skipped={summary['skipped_count']}, failed={summary['failed_count']}")
+    return summary
 
-        # Deterministic filenames make concurrent imports across workers
-        # converge on one row instead of creating duplicates.
-        if await adapter.get_credential(filename, mode="antigravity"):
-            results[position] = {
-                "item": candidate.item,
-                "email": normalized_email,
-                "status": "skipped",
-                "error_code": "already_exists",
-                "error": "该 Google 账号已存在",
-                "filename": filename,
-            }
-            continue
 
-        stored = await adapter.store_credential(
-            filename, prepared.credential_data, mode="antigravity"
-        )
-        if not stored:
-            # Another worker may have inserted the same deterministic identity
-            # after our preflight check. Treat that unique-key race as an
-            # idempotent skip, not a storage outage.
-            if await adapter.get_credential(filename, mode="antigravity"):
-                results[position] = {
-                    "item": candidate.item,
-                    "email": normalized_email,
-                    "status": "skipped",
-                    "error_code": "already_exists",
-                    "error": "该 Google 账号已被另一并发请求导入",
-                    "filename": filename,
-                }
-                continue
-            results[position] = {
-                "item": candidate.item,
-                "email": normalized_email,
-                "status": "failed",
-                "error_code": "storage_failed",
-                "error": "凭证验证成功，但保存失败",
-            }
-            continue
-
-        state_updates = {
-            "disabled": False,
-            "error_codes": [],
-            "last_success": time.time(),
-            "user_email": normalized_email,
-            "tier": prepared.tier or "pro",
-        }
-        state_saved = False
-        for retry in range(3):
-            state_saved = await adapter.update_credential_state(
-                filename, state_updates, mode="antigravity"
-            )
-            if state_saved:
-                break
-            if retry < 2:
-                await asyncio.sleep(0.05 * (retry + 1))
-        if not state_saved:
-            # Do not delete here: with multiple production workers, another
-            # request may now own the same deterministic row. The credential is
-            # usable because all storage backends create safe default state;
-            # report the metadata problem explicitly for follow-up verification.
-            results[position] = {
-                "item": candidate.item,
-                "email": normalized_email,
-                "status": "partial",
-                "filename": filename,
-                "project_id": prepared.project_id,
-                "tier": prepared.tier,
-                "error_code": "state_metadata_failed",
-                "error": "凭证已保存，但邮箱或等级状态更新失败，请稍后执行凭证检验",
-            }
-            continue
-
-        existing_emails[normalized_email] = filename
-        existing_tokens[_token_digest(candidate.refresh_token or "")] = filename
-        results[position] = {
-            "item": candidate.item,
-            "email": normalized_email,
-            "status": "success",
-            "filename": filename,
-            "project_id": prepared.project_id,
-            "tier": prepared.tier,
-            "credit_amount": prepared.credit_amount,
-        }
-
-    final_results = [result for result in results if result is not None]
-    succeeded = sum(result["status"] == "success" for result in final_results)
-    skipped = sum(result["status"] == "skipped" for result in final_results)
-    failed = sum(result["status"] == "failed" for result in final_results)
-    partial = sum(result["status"] == "partial" for result in final_results)
-    log.info(
-        "Antigravity Refresh Token import completed: "
-        f"total={len(final_results)}, success={succeeded}, "
-        f"partial={partial}, skipped={skipped}, failed={failed}"
-    )
-    return {
-        "total": len(final_results),
-        "imported_count": succeeded,
-        "partial_count": partial,
-        "skipped_count": skipped,
-        "failed_count": failed,
-        "results": final_results,
-    }

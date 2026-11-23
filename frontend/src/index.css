@@ -1,0 +1,82 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-slate-50 text-slate-900;
+  background-color: #f5f7fb;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-white;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-slate-200 rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-slate-300;
+}
+
+/* 输入框聚焦样式 */
+input:focus,
+textarea:focus,
+select:focus {
+  @apply outline-none ring-2 ring-purple-500/50;
+}
+
+/* 按钮基础样式 */
+.btn {
+  @apply px-4 py-2 rounded-lg font-medium transition-all duration-200;
+}
+
+.btn-primary {
+  @apply bg-purple-600 hover:bg-purple-700 text-white;
+}
+
+.btn-secondary {
+  @apply bg-slate-100 hover:bg-slate-200 text-slate-800;
+}
+
+.btn-danger {
+  @apply bg-red-600 hover:bg-red-700 text-white;
+}
+
+/* 卡片样式 */
+.card {
+  @apply bg-white border border-slate-200 rounded-xl p-6 shadow-sm;
+}
+
+/* 表格样式 */
+.table-container {
+  @apply overflow-x-auto rounded-lg border border-slate-200;
+}
+
+table {
+  @apply w-full;
+}
+
+th {
+  @apply bg-slate-50 px-4 py-3 text-left text-sm font-medium text-slate-600;
+}
+
+td {
+  @apply px-4 py-3 text-sm border-t border-slate-200;
+}
+
+tr:hover td {
+  @apply bg-slate-50/50;
+}

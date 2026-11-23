@@ -3,7 +3,10 @@ OpenAI Transfer Module - Handles conversion between OpenAI and Gemini API format
 被openai-router调用，负责OpenAI格式与Gemini格式的双向转换
 """
 
+import base64
+import copy
 import json
+import re
 import time
 import uuid
 from collections import OrderedDict
@@ -18,33 +21,32 @@ from src.converter.thoughtSignature_fix import (
     SKIP_THOUGHT_SIGNATURE_VALIDATOR,
 )
 from src.converter.utils import merge_system_messages
+from src.stream_metadata import BLOCK_REASONS, token_counters
 
 from log import log
 
-#: 流式响应里每个 response_id 已分配到的工具调用序号。
-#: Gemini 的并行 functionCall 是「一个 chunk 一个 part」，若用 chunk 内 parts
-#: 下标当 OpenAI 的 tool_calls[].index，每个调用都会拿到 0；而按 OpenAI 流式规范
-#: 归并分片的客户端会把它们并进同一个 slot，arguments 拼成 `{"a":1}{"b":2}` 这种
-#: 非法 JSON。这里改按流内递增序号分配。
-_STREAM_TOOL_INDEX: "OrderedDict[str, int]" = OrderedDict()
-
-#: 上限：流被中途放弃（客户端断开、没有带 finishReason 的收尾块）时不会回收，
-#: 用 LRU 淘汰兜底，避免长期运行的实例无界增长。
+# Compatibility cache for callers converting individual chunks without owning a
+# stream state. HTTP routes pass their own dict, so active requests cannot be
+# evicted by another request and cancelled streams leave no global state.
+_STREAM_TOOL_INDEX: "OrderedDict[str, Dict[int, int]]" = OrderedDict()
 _STREAM_TOOL_INDEX_MAX_ENTRIES = 512
 
 
-def _next_stream_tool_call_indices(response_id: str, count: int) -> List[int]:
-    """为本 chunk 内的 count 个工具调用分配连续的流内序号。"""
-    base = _STREAM_TOOL_INDEX.get(response_id, 0)
-    _STREAM_TOOL_INDEX[response_id] = base + count
-    _STREAM_TOOL_INDEX.move_to_end(response_id)
-    while len(_STREAM_TOOL_INDEX) > _STREAM_TOOL_INDEX_MAX_ENTRIES:
-        _STREAM_TOOL_INDEX.popitem(last=False)
+def _next_stream_tool_call_indices(state: Dict[int, int], candidate_index: int, count: int) -> List[int]:
+    base = state.get(candidate_index, 0)
+    state[candidate_index] = base + count
     return list(range(base, base + count))
+
 
 def _convert_usage_metadata(usage_metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     将Gemini的usageMetadata转换为OpenAI格式的usage字段
+
+    语义对齐（Gemini -> OpenAI）:
+    - Gemini promptTokenCount 已包含缓存 token -> OpenAI prompt_tokens 同样包含缓存 token
+    - Gemini candidatesTokenCount 不包含推理 token -> OpenAI completion_tokens 包含推理 token
+      （completion_tokens = candidatesTokenCount + thoughtsTokenCount）
+    - 明细字段: prompt_tokens_details.cached_tokens / completion_tokens_details.reasoning_tokens
 
     Args:
         usage_metadata: Gemini API的usageMetadata字段
@@ -52,31 +54,25 @@ def _convert_usage_metadata(usage_metadata: Dict[str, Any]) -> Optional[Dict[str
     Returns:
         OpenAI格式的usage字典，如果没有usage数据则返回None
     """
-    if not usage_metadata:
+    if not isinstance(usage_metadata, dict) or not usage_metadata:
         return None
 
-    prompt_tokens_total = int(usage_metadata.get("promptTokenCount", 0) or 0)
-    cached_tokens = int(usage_metadata.get("cachedContentTokenCount", 0) or 0)
-    prompt_tokens = max(prompt_tokens_total - cached_tokens, 0)
-    completion_tokens = int(usage_metadata.get("candidatesTokenCount", 0) or 0)
-    raw_total_tokens = int(
-        usage_metadata.get(
-            "totalTokenCount",
-            prompt_tokens_total + completion_tokens + int(usage_metadata.get("thoughtsTokenCount", 0) or 0),
-        )
-        or 0
-    )
+    counts = token_counters(usage_metadata)
+    prompt_tokens = counts.get("promptTokenCount", 0)
+    cached_tokens = counts.get("cachedContentTokenCount", 0)
+    reasoning_tokens = counts.get("thoughtsTokenCount", 0)
+    completion_tokens = counts.get("candidatesTokenCount", 0) + reasoning_tokens
+    total_tokens = counts.get("totalTokenCount", prompt_tokens + completion_tokens)
 
     usage = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
-        "total_tokens": max(raw_total_tokens - cached_tokens, prompt_tokens + completion_tokens),
+        "total_tokens": total_tokens,
     }
 
     if cached_tokens > 0:
         usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
 
-    reasoning_tokens = int(usage_metadata.get("thoughtsTokenCount", 0) or 0)
     if reasoning_tokens > 0:
         usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
 
@@ -108,7 +104,7 @@ def _map_finish_reason(gemini_reason: str) -> str:
         return "stop"
     elif gemini_reason == "MAX_TOKENS":
         return "length"
-    elif gemini_reason in ["SAFETY", "RECITATION"]:
+    elif isinstance(gemini_reason, str) and gemini_reason in BLOCK_REASONS:
         return "content_filter"
     else:
         # 对于 None 或未知的 finishReason，返回 "stop" 作为默认值
@@ -140,8 +136,6 @@ def _normalize_function_name(name: str) -> str:
     Returns:
         规范化后的函数名
     """
-    import re
-
     if not name:
         return "_unnamed_function"
 
@@ -259,7 +253,6 @@ def _clean_schema_for_claude(schema: Any, root_schema: Optional[Dict[str, Any]] 
     if "$ref" in schema:
         resolved = _resolve_ref(schema["$ref"], root_schema)
         if resolved:
-            import copy
             result = copy.deepcopy(resolved)
             for key, value in schema.items():
                 if key != "$ref":
@@ -633,7 +626,6 @@ def _clean_schema_for_parameters_json_schema(
     if ref_key:
         resolved = _resolve_ref(schema[ref_key], root_schema)
         if resolved:
-            import copy
             result = copy.deepcopy(resolved)
             for key in ("description", "default"):
                 if key in schema:
@@ -747,20 +739,20 @@ def _clean_schema_for_parameters_json_schema(
         if key in unsupported_keys or key.startswith("x-"):
             del result[key]
 
-    nullable_props = set()
     if "properties" in result and isinstance(result["properties"], dict):
-        cleaned_props = {}
-        for prop_name, prop_schema in result["properties"].items():
-            if isinstance(prop_schema, dict):
-                prop_type = prop_schema.get("type")
-                if isinstance(prop_type, list) and any(str(t).lower() == "null" for t in prop_type):
-                    nullable_props.add(prop_name)
-            cleaned_props[prop_name] = _clean_schema_for_parameters_json_schema(prop_schema, root_schema, visited)
+        cleaned_props = {
+            prop_name: _clean_schema_for_parameters_json_schema(prop_schema, root_schema, visited)
+            for prop_name, prop_schema in result["properties"].items()
+        }
         result["properties"] = cleaned_props
 
     if "properties" in result and "type" not in result:
         result["type"] = "object"
 
+    # required 仅约束字段必须出现，null 也是合法取值；nullable 不等于可选。
+    # 若把 nullable 属性（如 Pydantic v2 的 type: ["string", "null"]）从 required
+    # 中剔除，上游 Gemini 会认为所有参数都非必填，频繁生成空参数 {} 的工具调用，
+    # 因此保留原始接口契约中的 required 约束。
     if "required" in result and isinstance(result["required"], list):
         prop_names = set(result.get("properties", {}).keys()) if isinstance(result.get("properties"), dict) else None
         required = []
@@ -768,8 +760,6 @@ def _clean_schema_for_parameters_json_schema(
             if not isinstance(item, str):
                 continue
             if prop_names is not None and item not in prop_names:
-                continue
-            if item in nullable_props:
                 continue
             if item not in required:
                 required.append(item)
@@ -939,7 +929,10 @@ def convert_openai_tools_to_gemini(openai_tools: List, model: str = "") -> List[
     return [{"functionDeclarations": function_declarations}]
 
 
-def convert_tool_choice_to_tool_config(tool_choice: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+def convert_tool_choice_to_tool_config(
+    tool_choice: Union[str, Dict[str, Any]],
+    tool_names: Optional[set] = None,
+) -> Dict[str, Any]:
     """
     将 OpenAI tool_choice 转换为 Gemini toolConfig
 
@@ -955,74 +948,27 @@ def convert_tool_choice_to_tool_config(tool_choice: Union[str, Dict[str, Any]]) 
         elif tool_choice == "none":
             return {"functionCallingConfig": {"mode": "NONE"}}
         elif tool_choice == "required":
+            if tool_names is not None and not tool_names:
+                raise ValueError("tool_choice 'required' needs at least one function tool")
             return {"functionCallingConfig": {"mode": "ANY"}}
     elif isinstance(tool_choice, dict):
         # {"type": "function", "function": {"name": "my_function"}}
-        if tool_choice.get("type") == "function":
-            function_name = tool_choice.get("function", {}).get("name")
-            if function_name:
+        function = tool_choice.get("function")
+        if tool_choice.get("type") == "function" and isinstance(function, dict):
+            function_name = function.get("name")
+            if isinstance(function_name, str) and function_name:
+                if tool_names is not None and function_name not in tool_names:
+                    raise ValueError(
+                        f"tool_choice refers to an undeclared function: {function_name}"
+                    )
                 return {
                     "functionCallingConfig": {
                         "mode": "ANY",
-                        "allowedFunctionNames": [function_name],
+                        "allowedFunctionNames": [_normalize_function_name(function_name)],
                     }
                 }
 
-    # 默认返回 AUTO 模式
-    return {"functionCallingConfig": {"mode": "AUTO"}}
-
-
-def convert_tool_message_to_function_response(message, all_messages: List = None) -> Dict[str, Any]:
-    """
-    将 OpenAI 的 tool role 消息转换为 Gemini functionResponse
-
-    Args:
-        message: OpenAI 格式的工具消息
-        all_messages: 所有消息的列表，用于查找 tool_call_id 对应的函数名
-
-    Returns:
-        Gemini 格式的 functionResponse part
-    """
-    # 获取 name 字段
-    name = getattr(message, "name", None)
-    encoded_tool_call_id = getattr(message, "tool_call_id", None) or ""
-
-    # 解码获取原始ID（functionResponse不需要签名）
-    original_tool_call_id, _ = decode_tool_id_and_signature(encoded_tool_call_id)
-
-    # 如果没有 name，尝试从 all_messages 中查找对应的 tool_call_id
-    # 注意：使用编码ID查找，因为存储的是编码ID
-    if not name and encoded_tool_call_id and all_messages:
-        for msg in all_messages:
-            if getattr(msg, "role", None) == "assistant" and hasattr(msg, "tool_calls") and msg.tool_calls:
-                for tool_call in msg.tool_calls:
-                    if getattr(tool_call, "id", None) == encoded_tool_call_id:
-                        func = getattr(tool_call, "function", None)
-                        if func:
-                            name = getattr(func, "name", None)
-                            break
-                if name:
-                    break
-
-    # 最终兜底：如果仍然没有 name，使用默认值
-    if not name:
-        name = "unknown_function"
-        log.warning(f"Tool message missing function name, using default: {name}")
-
-    try:
-        # 尝试将 content 解析为 JSON
-        response_data = (
-            json.loads(message.content) if isinstance(message.content, str) else message.content
-        )
-    except (json.JSONDecodeError, TypeError):
-        # 如果不是有效的 JSON，包装为对象
-        response_data = {"result": str(message.content)}
-
-    # 确保 response_data 是字典类型（Gemini API 要求 response 必须是对象）
-    if not isinstance(response_data, dict):
-        response_data = {"result": response_data}
-
-    return {"functionResponse": {"id": original_tool_call_id, "name": name, "response": response_data}}
+    raise ValueError("Unsupported tool_choice for Antigravity")
 
 
 def _reverse_transform_value(value: Any) -> Any:
@@ -1109,8 +1055,15 @@ def extract_tool_calls_from_parts(
             function_call = part["functionCall"]
             # 获取原始ID或生成新ID
             original_id = function_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"
-            # 获取参数并转换类型
+            # 获取参数并转换类型（容错：部分代理上游会返回 JSON 字符串格式的 args）
             args = function_call.get("args", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
             # 将字符串类型的值转回原始类型
             args = _reverse_transform_args(args)
 
@@ -1132,7 +1085,7 @@ def extract_tool_calls_from_parts(
             text = part["text"]
             if (
                 is_skip_thought_signature_placeholder(part)
-                or is_internal_placeholder_text(text)
+                or (not is_streaming and is_internal_placeholder_text(text))
             ):
                 continue
             text_content += text
@@ -1163,7 +1116,6 @@ def extract_images_from_content(content: Any) -> Dict[str, Any]:
                     image_url = item.get("image_url", {}).get("url", "")
                     # 解析 data:image/png;base64,xxx 格式
                     if image_url.startswith("data:image/"):
-                        import re
                         match = re.match(r"^data:image/(\w+);base64,(.+)$", image_url)
                         if match:
                             mime_type = match.group(1)
@@ -1208,6 +1160,48 @@ def _sanitize_openai_roundtrip_signatures(contents: List[Dict[str, Any]]) -> Non
             parts[index] = sanitized_part
 
 
+def _convert_openai_message_content(role: str, content: Any) -> List[Dict[str, Any]]:
+    """Convert supported Chat Completions content without silently losing parts."""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"text": content}] if content else []
+    if not isinstance(content, list):
+        raise ValueError(f"{role} message content must be text or content parts")
+
+    parts = []
+    for part in content:
+        if not isinstance(part, dict):
+            raise ValueError(f"{role} message contains an invalid content part")
+        part_type = part.get("type")
+        if part_type == "text" or (role == "assistant" and part_type == "refusal"):
+            value = part.get(part_type)
+            if not isinstance(value, str):
+                raise ValueError(f"{role} {part_type} content part must contain a string")
+            if value:
+                parts.append({"text": value})
+        elif role == "user" and part_type == "image_url":
+            image_url = part.get("image_url")
+            url = image_url.get("url") if isinstance(image_url, dict) else None
+            if not isinstance(url, str) or not url.startswith("data:image/"):
+                raise ValueError(
+                    "Antigravity requires image_url content as a base64 image data URL"
+                )
+            header, separator, encoded = url.partition(",")
+            if not separator or not header.endswith(";base64"):
+                raise ValueError("Invalid base64 image data URL")
+            try:
+                base64.b64decode(encoded, validate=True)
+            except ValueError as exc:
+                raise ValueError("Invalid base64 image data URL") from exc
+            parts.append({"inlineData": {"mimeType": header[5:-7], "data": encoded}})
+        else:
+            raise ValueError(
+                f"{role} content part type {part_type!r} is unsupported by Antigravity"
+            )
+    return parts
+
+
 async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Dict[str, Any]:
     """
     将 OpenAI 格式请求体转换为 Gemini 格式请求体
@@ -1229,35 +1223,38 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
             - systemInstruction: 系统指令 (如果有)
             - tools, toolConfig (如果有)
     """
-    # 处理连续的system消息（兼容性模式）
+    # Keep instruction roles out of Gemini contents.
     openai_request = await merge_system_messages(openai_request)
 
     contents = []
 
     # 提取消息列表
     messages = openai_request.get("messages", [])
-    
-    # 构建 tool_call_id -> (name, original_id, signature) 的映射
+
+    # 与上游一致，按 ID 查找工具名，不因不完整或重复的历史提前拒绝请求。
     tool_call_mapping = {}
-    for msg in messages:
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                encoded_id = tc.get("id", "")
-                func_name = tc.get("function", {}).get("name") or ""
+    for message in messages:
+        if message.get("role") == "assistant":
+            for tool_call in message.get("tool_calls") or []:
+                encoded_id = tool_call.get("id", "")
                 if encoded_id:
-                    # 解码获取原始ID和签名
                     original_id, _ = decode_tool_id_and_signature(encoded_id)
-                    tool_call_mapping[encoded_id] = (func_name, original_id, None)
-    
-    # 构建工具名称到参数 schema 的映射（用于类型修正）
+                    func_name = tool_call.get("function", {}).get("name") or ""
+                    tool_call_mapping[encoded_id] = (func_name, original_id)
+
+    # 一次收集工具声明，校验名称并保留参数 schema 供历史调用修正类型。
     tool_schemas = {}
-    if "tools" in openai_request and openai_request["tools"]:
-        for tool in openai_request["tools"]:
-            if tool.get("type") == "function":
-                function = tool.get("function", {})
-                func_name = function.get("name")
-                if func_name:
-                    tool_schemas[func_name] = function.get("parameters", {})
+    normalized_names = set()
+    for tool in openai_request.get("tools") or []:
+        if tool.get("type") == "function":
+            function = tool["function"]
+            func_name = function["name"]
+            normalized_name = _normalize_function_name(func_name)
+            if normalized_name in normalized_names:
+                raise ValueError("Function tool names collide after Antigravity normalization")
+            normalized_names.add(normalized_name)
+            tool_schemas[func_name] = function.get("parameters", {})
+    tool_names = set(tool_schemas)
 
     # 用于累积连续的 tool message 的 functionResponse parts
     pending_tool_parts = []
@@ -1279,36 +1276,33 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
         # 处理工具消息（tool role）- 累积到 pending_tool_parts
         if role == "tool":
             tool_call_id = message.get("tool_call_id", "")
-            func_name = message.get("name")
-
-            # 使用映射表查找
-            if tool_call_id in tool_call_mapping:
-                func_name, original_id, _ = tool_call_mapping[tool_call_id]
-            else:
-                # 如果没有name,尝试从消息列表中查找
-                if not func_name and tool_call_id:
-                    for msg in messages:
-                        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                            for tc in msg["tool_calls"]:
-                                if tc.get("id") == tool_call_id:
-                                    func_name = tc.get("function", {}).get("name")
-                                    break
-                            if func_name:
-                                break
-
-                # 解码 tool_call_id 获取原始 ID
-                original_id, _ = decode_tool_id_and_signature(tool_call_id)
-
-            # 最终兜底：确保 func_name 不为空
+            original_id, _ = decode_tool_id_and_signature(tool_call_id)
+            func_name, original_id = tool_call_mapping.get(
+                tool_call_id, (message.get("name"), original_id)
+            )
             if not func_name:
                 func_name = "unknown_function"
                 log.warning(f"Tool message missing function name for tool_call_id={tool_call_id}, using default: {func_name}")
+            func_name = _normalize_function_name(func_name)
+
+            # OpenAI also permits an array of text content parts for tool results.
+            if isinstance(content, list):
+                if not all(
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                    for part in content
+                ):
+                    raise ValueError("Tool message content may only contain text parts")
+                content = "".join(part.get("text", "") for part in content)
+            elif not isinstance(content, str):
+                raise ValueError("Tool message content must be text or text parts")
 
             # 解析响应数据
             try:
-                response_data = json.loads(content) if isinstance(content, str) else content
-            except (json.JSONDecodeError, TypeError):
-                response_data = {"result": str(content)}
+                response_data = json.loads(content)
+            except json.JSONDecodeError:
+                response_data = {"result": content}
 
             # 确保 response_data 是字典类型（Gemini API 要求 response 必须是对象）
             if not isinstance(response_data, dict):
@@ -1327,150 +1321,78 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
         # 遇到非 tool 消息时，先 flush 累积的 tool parts
         flush_pending_tool_parts()
 
-        # system 消息已经由 merge_system_messages 处理，这里跳过
-        if role == "system":
-            continue
+        if role not in ("user", "assistant"):
+            raise ValueError(f"Unsupported message role: {role}")
+
+        parts = _convert_openai_message_content(role, content)
+        if role == "assistant" and not parts and message.get("refusal"):
+            parts = [{"text": message["refusal"]}]
 
         # 将OpenAI角色映射到Gemini角色
-        if role == "assistant":
-            role = "model"
+        gemini_role = "model" if role == "assistant" else "user"
 
         # 检查是否有tool_calls
         tool_calls = message.get("tool_calls")
         if tool_calls:
-            parts = []
+            if role != "assistant":
+                raise ValueError("Only assistant messages may contain tool_calls")
 
-            # 如果有文本内容,先添加文本
-            # 注意: content 可能是 str、list（OpenAI content block 格式 [{"type":"text","text":"..."}]）、dict 或 None
-            # 必须解包为纯字符串，否则 text 字段会变成 list，触发 gemini_fix 的 str(dict) 产生嵌套字符串
-            if content:
-                if isinstance(content, list):
-                    for _part in content:
-                        if isinstance(_part, dict):
-                            if _part.get("type") == "text" or "text" in _part:
-                                _t = _part.get("text", "")
-                                if _t:
-                                    parts.append({"text": _t})
-                        elif isinstance(_part, str) and _part:
-                            parts.append({"text": _part})
-                elif isinstance(content, str):
-                    parts.append({"text": content})
-                elif isinstance(content, dict):
-                    _t = content.get("text", "")
-                    if _t:
-                        parts.append({"text": _t})
-                else:
-                    parts.append({"text": str(content)})
-
-            # 添加每个工具调用
             for tool_call in tool_calls:
+                encoded_id = tool_call.get("id", "")
                 try:
+                    function = tool_call["function"]
                     args = (
-                        json.loads(tool_call["function"]["arguments"])
-                        if isinstance(tool_call["function"]["arguments"], str)
-                        else tool_call["function"]["arguments"]
+                        json.loads(function["arguments"])
+                        if isinstance(function["arguments"], str)
+                        else function["arguments"]
                     )
-                    
-                    # 根据工具的 schema 修正参数类型
-                    func_name = tool_call["function"]["name"]
-                    if func_name in tool_schemas:
-                        args = fix_tool_call_args_types(args, tool_schemas[func_name])
-
-                    # 解码工具ID和thoughtSignature
-                    encoded_id = tool_call.get("id", "")
-                    original_id, signature = decode_tool_id_and_signature(encoded_id)
-
-                    # 构建functionCall part
-                    function_call_part = {
-                        "functionCall": {
-                            "id": original_id,
-                            "name": func_name,
-                            "args": args
-                        }
-                    }
-
-                    # OpenAI/RooCode 中转可能会改写或截断 tool_call_id，真实签名回传后容易触发
-                    # Corrupted thought signature。工具调用使用官方跳过校验占位符更稳。
-                    function_call_part["thoughtSignature"] = SKIP_THOUGHT_SIGNATURE_VALIDATOR
-
-                    parts.append(function_call_part)
-                except (json.JSONDecodeError, KeyError) as e:
-                    # 不能直接丢掉这个 functionCall：历史里它后面必然跟着一条
-                    # functionResponse，父调用一消失它就成了孤儿，Gemini 会返回
-                    # 空 candidate（0 completion token、finishReason=STOP）。
-                    # 降级保留：能救出第一个 JSON 对象就用它，否则用空参数。
-                    degraded_name = ""
-                    try:
-                        degraded_name = tool_call["function"]["name"]
-                    except (KeyError, TypeError):
-                        degraded_name = ""
-                    if not degraded_name:
-                        log.error(f"Failed to parse tool call (dropped, no name): {e}")
+                    if not isinstance(args, dict):
+                        # Gemini functionCall.args 必须是对象；非对象走降级恢复
+                        raise ValueError("tool call arguments must be a JSON object")
+                    func_name = function["name"]
+                except (ValueError, KeyError) as exc:
+                    # 上游容错：保留调用，恢复首个 JSON 对象，无法恢复则使用空参数。
+                    function = tool_call.get("function") or {}
+                    func_name = function.get("name")
+                    if not func_name:
+                        log.error(f"Failed to parse tool call (dropped, no name): {exc}")
                         continue
-
-                    try:
-                        raw_args = tool_call["function"]["arguments"]
-                    except (KeyError, TypeError):
-                        raw_args = ""
-                    degraded_args = {}
+                    args = {}
+                    raw_args = function.get("arguments", "")
                     if isinstance(raw_args, str) and raw_args:
                         try:
                             recovered, _ = json.JSONDecoder().raw_decode(raw_args.lstrip())
                         except ValueError:
                             recovered = None
                         if isinstance(recovered, dict):
-                            degraded_args = recovered
-                    if degraded_args and degraded_name in tool_schemas:
-                        degraded_args = fix_tool_call_args_types(
-                            degraded_args, tool_schemas[degraded_name]
-                        )
-
-                    original_id, _signature = decode_tool_id_and_signature(
-                        tool_call.get("id", "")
-                    )
+                            args = recovered
                     log.warning(
-                        f"Failed to parse tool call: {e} - keeping degraded functionCall "
-                        f"name={degraded_name} "
-                        f"args={'partial' if degraded_args else 'empty'}"
+                        f"Failed to parse tool call: {exc} - keeping degraded functionCall "
+                        f"name={func_name} args={'partial' if args else 'empty'}"
                     )
-                    parts.append({
+
+                if func_name in tool_schemas:
+                    args = fix_tool_call_args_types(args, tool_schemas[func_name])
+
+                original_id, _ = decode_tool_id_and_signature(encoded_id)
+                normalized_name = _normalize_function_name(func_name)
+                parts.append(
+                    {
                         "functionCall": {
                             "id": original_id,
-                            "name": degraded_name,
-                            "args": degraded_args,
+                            "name": normalized_name,
+                            "args": args,
                         },
+                        # 中转可能改写 tool_call_id，使用跳过校验占位符避免签名损坏。
                         "thoughtSignature": SKIP_THOUGHT_SIGNATURE_VALIDATOR,
-                    })
+                    }
+                )
+            if not parts:
+                continue
 
-            if parts:
-                contents.append({"role": role, "parts": parts})
-            continue
-
-        # 处理普通内容
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if part.get("type") == "text":
-                    parts.append({"text": part.get("text", "")})
-                elif part.get("type") == "image_url":
-                    image_url = part.get("image_url", {}).get("url")
-                    if image_url:
-                        try:
-                            mime_type, base64_data = image_url.split(";")
-                            _, mime_type = mime_type.split(":")
-                            _, base64_data = base64_data.split(",")
-                            parts.append({
-                                "inlineData": {
-                                    "mimeType": mime_type,
-                                    "data": base64_data,
-                                }
-                            })
-                        except ValueError:
-                            continue
-            if parts:
-                contents.append({"role": role, "parts": parts})
-        elif content:
-            contents.append({"role": role, "parts": [{"text": content}]})
+        if not parts:
+            raise ValueError(f"{role} message has no content representable by Antigravity")
+        contents.append({"role": gemini_role, "parts": parts})
 
     # 循环结束后，flush 剩余的 tool parts（如果消息列表以 tool 消息结尾）
     flush_pending_tool_parts()
@@ -1490,7 +1412,7 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
     # 构建生成配置
     generation_config = {}
     model = openai_request.get("model", "")
-    
+
     # 基础参数映射
     if "temperature" in openai_request:
         generation_config["temperature"] = openai_request["temperature"]
@@ -1498,9 +1420,10 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
         generation_config["topP"] = openai_request["top_p"]
     if "top_k" in openai_request:
         generation_config["topK"] = openai_request["top_k"]
-    if "max_tokens" in openai_request or "max_completion_tokens" in openai_request:
-        # max_completion_tokens 优先于 max_tokens
-        max_tokens = openai_request.get("max_completion_tokens") or openai_request.get("max_tokens")
+    max_tokens = openai_request.get("max_completion_tokens")
+    if max_tokens is None:
+        max_tokens = openai_request.get("max_tokens")
+    if max_tokens is not None:
         generation_config["maxOutputTokens"] = max_tokens
     if "stop" in openai_request:
         stop = openai_request["stop"]
@@ -1513,26 +1436,24 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
         generation_config["candidateCount"] = openai_request["n"]
     if "seed" in openai_request:
         generation_config["seed"] = openai_request["seed"]
-    
+
     # 处理 response_format
-    if "response_format" in openai_request and openai_request["response_format"]:
-        response_format = openai_request["response_format"]
+    response_format = openai_request.get("response_format")
+    if response_format is not None:
+        if not isinstance(response_format, dict):
+            raise ValueError("response_format 必须是对象")
         format_type = response_format.get("type")
-        
         if format_type == "json_schema":
-            # JSON Schema 模式
-            if "json_schema" in response_format and "schema" in response_format["json_schema"]:
-                schema = response_format["json_schema"]["schema"]
-                # 清理 schema
-                generation_config["responseSchema"] = _clean_schema_for_gemini(schema)
-                generation_config["responseMimeType"] = "application/json"
-        elif format_type == "json_object":
-            # JSON Object 模式
+            definition = response_format.get("json_schema")
+            if not isinstance(definition, dict) or not isinstance(definition.get("schema"), dict):
+                raise ValueError("response_format.json_schema.schema 必须是 JSON Schema 对象")
+            generation_config["responseJsonSchema"] = definition["schema"]
             generation_config["responseMimeType"] = "application/json"
-        elif format_type == "text":
-            # Text 模式
-            generation_config["responseMimeType"] = "text/plain"
-            
+        elif format_type == "json_object":
+            generation_config["responseMimeType"] = "application/json"
+        elif format_type != "text":
+            raise ValueError("response_format.type 必须是 text、json_object 或 json_schema")
+
     # 如果contents为空,添加默认用户消息
     if not contents:
         contents.append({"role": "user", "parts": [{"text": "请根据系统指令回答。"}]})
@@ -1548,13 +1469,14 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
         gemini_request["systemInstruction"] = openai_request["systemInstruction"]
 
     # 处理工具 - 传递 model 参数以便根据模型类型选择清理策略
-    model = openai_request.get("model", "")
     if "tools" in openai_request and openai_request["tools"]:
         gemini_request["tools"] = convert_openai_tools_to_gemini(openai_request["tools"], model)
 
     # 处理tool_choice
     if "tool_choice" in openai_request and openai_request["tool_choice"]:
-        gemini_request["toolConfig"] = convert_tool_choice_to_tool_config(openai_request["tool_choice"])
+        choice = openai_request["tool_choice"]
+        if tool_names or choice not in ("auto", "none"):
+            gemini_request["toolConfig"] = convert_tool_choice_to_tool_config(choice, tool_names)
 
     # 透传图片生成的 size 参数（如 "1024x1536"）
     if "size" in openai_request and openai_request["size"]:
@@ -1616,22 +1538,23 @@ def convert_gemini_to_openai_response(
         except Exception:
             return {"error": "Invalid response format"}
 
-    # 处理 GeminiCLI 的 response 包装格式
+    # 处理 Antigravity 的 response 包装格式
     if "response" in gemini_response:
         gemini_response = gemini_response["response"]
 
     # 转换为 OpenAI 格式
     choices = []
 
-    for candidate in gemini_response.get("candidates", []):
-        role = candidate.get("content", {}).get("role", "assistant")
+    for position, candidate in enumerate(gemini_response.get("candidates") or []):
+        content = candidate.get("content") or {}
+        role = content.get("role", "assistant")
 
         # 将Gemini角色映射回OpenAI角色
         if role == "model":
             role = "assistant"
 
         # 提取并分离thinking tokens和常规内容
-        parts = candidate.get("content", {}).get("parts", [])
+        parts = content.get("parts", [])
 
         # 提取工具调用和文本内容
         tool_calls, text_content = extract_tool_calls_from_parts(parts)
@@ -1677,9 +1600,8 @@ def convert_gemini_to_openai_response(
                 inline_data = part["inlineData"]
                 mime_type = inline_data.get("mimeType", "image/png")
                 base64_data = inline_data.get("data", "")
-                from src.converter.utils import get_image_url
-                image_url = get_image_url(base64_data, mime_type)
-                content_parts.append(f"![gemini-generated-content]({image_url})")
+                # 使用 Markdown 格式
+                content_parts.append(f"![gemini-generated-content](data:{mime_type};base64,{base64_data})")
         
         # 合并所有内容部分
         if content_parts:
@@ -1718,7 +1640,7 @@ def convert_gemini_to_openai_response(
             message["reasoning_content"] = reasoning_content
 
         choices.append({
-            "index": candidate.get("index", 0),
+            "index": candidate.get("index", position),
             "message": message,
             "finish_reason": finish_reason,
         })
@@ -1744,7 +1666,8 @@ def convert_gemini_to_openai_stream(
     gemini_stream_chunk: str,
     model: str,
     response_id: str,
-    status_code: int = 200
+    status_code: int = 200,
+    tool_call_state: Optional[Dict[int, int]] = None,
 ) -> Optional[str]:
     """
     将 Gemini 格式流式响应块转换为 OpenAI SSE 格式流式响应
@@ -1756,6 +1679,7 @@ def convert_gemini_to_openai_stream(
         model: 模型名称
         response_id: 此流式响应的一致ID
         status_code: HTTP 状态码 (默认 200)
+        tool_call_state: 请求独有的候选工具计数；省略时使用有界兼容缓存
 
     Returns:
         OpenAI SSE 格式的响应字符串 (如 "data: {json}\n\n"),
@@ -1790,7 +1714,7 @@ def convert_gemini_to_openai_stream(
         # 解析失败,跳过此块
         return None
 
-    # 处理 GeminiCLI 的 response 包装格式
+    # 处理 Antigravity 的 response 包装格式
     if "response" in gemini_chunk:
         gemini_response = gemini_chunk["response"]
     else:
@@ -1798,16 +1722,19 @@ def convert_gemini_to_openai_stream(
 
     # 转换为 OpenAI 流式格式
     choices = []
+    state = tool_call_state if tool_call_state is not None else _STREAM_TOOL_INDEX.get(response_id, {})
 
-    for candidate in gemini_response.get("candidates", []):
-        role = candidate.get("content", {}).get("role", "assistant")
+    for position, candidate in enumerate(gemini_response.get("candidates") or []):
+        candidate_index = candidate.get("index", position)
+        content = candidate.get("content") or {}
+        role = content.get("role", "assistant")
 
         # 将Gemini角色映射回OpenAI角色
         if role == "model":
             role = "assistant"
 
         # 提取并分离thinking tokens和常规内容
-        parts = candidate.get("content", {}).get("parts", [])
+        parts = content.get("parts", [])
 
         # 提取工具调用和文本内容 (流式需要 index)
         tool_calls, text_content = extract_tool_calls_from_parts(parts, is_streaming=True)
@@ -1816,7 +1743,7 @@ def convert_gemini_to_openai_stream(
         # 对并行调用恒为 0。改用流内递增序号，客户端才能把它们归并成独立调用。
         if tool_calls:
             for tool_call, stream_index in zip(
-                tool_calls, _next_stream_tool_call_indices(response_id, len(tool_calls))
+                tool_calls, _next_stream_tool_call_indices(state, candidate_index, len(tool_calls))
             ):
                 tool_call["index"] = stream_index
 
@@ -1860,9 +1787,7 @@ def convert_gemini_to_openai_stream(
                 inline_data = part["inlineData"]
                 mime_type = inline_data.get("mimeType", "image/png")
                 base64_data = inline_data.get("data", "")
-                from src.converter.utils import get_image_url
-                image_url = get_image_url(base64_data, mime_type)
-                content_parts.append(f"![gemini-generated-content]({image_url})")
+                content_parts.append(f"![gemini-generated-content](data:{mime_type};base64,{base64_data})")
         
         # 合并所有内容部分
         if content_parts:
@@ -1873,7 +1798,7 @@ def convert_gemini_to_openai_stream(
                 text_content = additional_content
         
         # 合并 reasoning content
-        reasoning_content = "\n\n".join(reasoning_parts) if reasoning_parts else ""
+        reasoning_content = "".join(reasoning_parts) if reasoning_parts else ""
 
         # 构建 delta 对象
         delta = {}
@@ -1894,7 +1819,7 @@ def convert_gemini_to_openai_stream(
         # 中间 chunk（思考/工具调用）的 finishReason 为 None，此时必须返回 null，
         # 否则 OpenAI 兼容客户端（如 DeepSeek Harness）会在第一个 chunk 后提前停止，
         # 导致只输出思考内容或只返回第一个工具调用就结束。
-        if gemini_finish_reason:
+        if gemini_finish_reason and gemini_finish_reason != "FINISH_REASON_UNSPECIFIED":
             finish_reason = _map_finish_reason(gemini_finish_reason)
         else:
             finish_reason = None
@@ -1902,20 +1827,29 @@ def convert_gemini_to_openai_stream(
         # 只有在正常停止（STOP）且有工具调用时才设为 tool_calls
         # 避免在 SAFETY、MAX_TOKENS 等情况下仍然返回 tool_calls 导致循环
         # 注意: 流式响应中 tool_calls 通常在前序 chunk，收尾 chunk 的 tool_calls 为空，
-        # 需检查当前流 (response_id) 之前是否分配过工具调用序号 (_STREAM_TOOL_INDEX > 0)。
-        had_tools = bool(tool_calls or _STREAM_TOOL_INDEX.get(response_id, 0) > 0)
+        # 只检查当前候选之前是否分配过工具调用序号。
+        had_tools = bool(tool_calls or state.get(candidate_index, 0) > 0)
         if had_tools and gemini_finish_reason == "STOP":
             finish_reason = "tool_calls"
 
         choices.append({
-            "index": candidate.get("index", 0),
+            "index": candidate.get("index", position),
             "delta": delta,
             "finish_reason": finish_reason,
         })
 
-    # 流已收尾，回收该 response_id 占用的工具调用序号
-    if any(choice.get("finish_reason") for choice in choices):
-        _STREAM_TOOL_INDEX.pop(response_id, None)
+        # One candidate ending must not reset the others' tool indices.
+        if finish_reason:
+            state.pop(candidate_index, None)
+
+    if tool_call_state is None:
+        if state:
+            _STREAM_TOOL_INDEX[response_id] = state
+            _STREAM_TOOL_INDEX.move_to_end(response_id)
+            while len(_STREAM_TOOL_INDEX) > _STREAM_TOOL_INDEX_MAX_ENTRIES:
+                _STREAM_TOOL_INDEX.popitem(last=False)
+        else:
+            _STREAM_TOOL_INDEX.pop(response_id, None)
 
     # 转换 usageMetadata (只在流结束时存在)
     usage = _convert_usage_metadata(gemini_response.get("usageMetadata"))
@@ -1929,11 +1863,9 @@ def convert_gemini_to_openai_stream(
         "choices": choices,
     }
 
-    # 只在有 usage 数据且有 finish_reason 时添加 usage
-    if usage:
-        has_finish_reason = any(choice.get("finish_reason") for choice in choices)
-        if has_finish_reason:
-            response_data["usage"] = usage
+    # The final usage report may follow the finished choices in its own event.
+    if usage and (not choices or any(choice["finish_reason"] for choice in choices)):
+        response_data["usage"] = usage
 
     # 转换为 SSE 格式: "data: {json}\n\n"
     return f"data: {json.dumps(response_data)}\n\n"

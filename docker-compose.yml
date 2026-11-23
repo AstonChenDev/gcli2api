@@ -1,97 +1,25 @@
-name: ${COMPOSE_PROJECT_NAME:-gcli2api}
-
-x-build: &build
-  context: .
-  dockerfile: Dockerfile
-
-x-environment: &environment
-  HOST: "0.0.0.0"
-  WORKERS: ${WORKERS:-4}
-  PASSWORD: ${PASSWORD:?Set PASSWORD in .env}
-  API_PASSWORD: ${API_PASSWORD:-}
-  PANEL_PASSWORD: ${PANEL_PASSWORD:-}
-  POSTGRESQL_URI: ${POSTGRESQL_URI:?Set POSTGRESQL_URI in .env}
-  MONGODB_URI: ${MONGODB_URI:-}
-  REDIS_URL: ${REDIS_URL:-}
-  CREDENTIALS_DIR: /app/creds
-
-x-service: &service
-  restart: unless-stopped
-  init: true
-  env_file:
-    - path: ${ENV_FILE:-.env}
-      required: true
-  extra_hosts:
-    - "host.docker.internal:host-gateway"
-  ulimits:
-    nofile:
-      soft: 65536
-      hard: 65536
-  volumes:
-    - ${CREDS_DIR:-./data/creds}:/app/creds
-  healthcheck:
-    test:
-      - CMD-SHELL
-      - >-
-        python -c "import os, urllib.request;
-        urllib.request.urlopen('http://127.0.0.1:' + os.environ['PORT'] + '/', timeout=5)"
-    interval: 30s
-    timeout: 10s
-    retries: 3
-    start_period: 40s
-  stop_grace_period: 30s
-  logging:
-    driver: json-file
-    options:
-      max-size: ${LOG_MAX_SIZE:-20m}
-      max-file: ${LOG_MAX_FILES:-5}
+version: '3.8'
 
 services:
-  # Primary production instance. This service always starts.
-  gcli2api:
-    <<: *service
-    build:
-      <<: *build
-      args:
-        VCS_REF: ${PRIMARY_IMAGE_TAG:-current}
-    image: ${IMAGE_REPOSITORY:-gcli2api}:${PRIMARY_IMAGE_TAG:-current}
-    container_name: ${PRIMARY_CONTAINER_NAME:-my-gcli2api}
-    ports:
-      - ${BIND_ADDRESS:-0.0.0.0}:${PRIMARY_PORT:-7861}:${PRIMARY_PORT:-7861}
-      - ${BIND_ADDRESS:-0.0.0.0}:${GEMINICLI_CALLBACK_HOST_PORT:-11452}:11451
-      - ${BIND_ADDRESS:-0.0.0.0}:${ANTIGRAVITY_CALLBACK_HOST_PORT:-11454}:11454
+  agy2api:
+    image: ghcr.io/su-kaka/agy2api:latest
+    container_name: agy2api
+    restart: unless-stopped
+    network_mode: host
     environment:
-      <<: *environment
-      PORT: ${PRIMARY_PORT:-7861}
+      # 密码配置（分离密码）
+      - API_PASSWORD=${API_PASSWORD:-your_api_password}
+      - PANEL_PASSWORD=${PANEL_PASSWORD:-your_panel_password}
 
-  # Blue/green candidate. Enable with COMPOSE_PROFILES=candidate.
-  gcli2api-candidate:
-    <<: *service
-    profiles: [candidate]
-    build:
-      <<: *build
-      args:
-        VCS_REF: ${CANDIDATE_IMAGE_TAG:-candidate}
-    image: ${IMAGE_REPOSITORY:-gcli2api}:${CANDIDATE_IMAGE_TAG:-candidate}
-    container_name: ${CANDIDATE_CONTAINER_NAME:-my-gcli2api-new}
-    ports:
-      - ${BIND_ADDRESS:-0.0.0.0}:${CANDIDATE_PORT:-7862}:${CANDIDATE_PORT:-7862}
-    environment:
-      <<: *environment
-      PORT: ${CANDIDATE_PORT:-7862}
+      # 服务器配置
+      - PORT=${PORT:-7861}
+      - HOST=${HOST:-0.0.0.0}
 
-  # Optional third instance used by production-1/jump. Enable with the v3 profile.
-  gcli2api-v3:
-    <<: *service
-    profiles: [v3]
-    build:
-      <<: *build
-      args:
-        VCS_REF: ${V3_IMAGE_TAG:-v3}
-    image: ${IMAGE_REPOSITORY:-gcli2api}:${V3_IMAGE_TAG:-v3}
-    container_name: ${V3_CONTAINER_NAME:-my-gcli2api-v3}
-    ports:
-      - ${BIND_ADDRESS:-0.0.0.0}:${V3_PORT:-7863}:${V3_PORT:-7863}
-    environment:
-      <<: *environment
-      PORT: ${V3_PORT:-7863}
+      # 可选: PostgreSQL 配置 (分布式存储)
+      # - POSTGRESQL_URI=${POSTGRESQL_URI}
+
+      # 可选: 代理配置
+      # - PROXY=${PROXY}
+    volumes:
+      - ./data/creds:/app/creds
+      - ./data/request_logs:/app/data/request_logs

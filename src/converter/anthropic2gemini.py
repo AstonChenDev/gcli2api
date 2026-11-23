@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from fastapi import Response
 from log import log
 from src.converter.utils import merge_system_messages
+from src.stream_metadata import token_counters
 
 from src.converter.thoughtSignature_fix import (
     decode_tool_id_and_signature,
@@ -196,25 +197,29 @@ def _anthropic_debug_enabled() -> bool:
     return str(os.getenv("ANTHROPIC_DEBUG", "true")).strip().lower() in _DEBUG_TRUE
 
 
-def _cached_content_token_count(usage_metadata: Any) -> int:
-    if not isinstance(usage_metadata, dict):
-        return 0
-    return int(usage_metadata.get("cachedContentTokenCount", 0) or 0)
+def _anthropic_usage_from_counts(counts: Dict[str, int]) -> Dict[str, Any]:
+    """
+    将 Gemini usageMetadata 转换为 Claude usage 字段
 
-
-def _anthropic_usage_from_metadata(usage_metadata: Any) -> Dict[str, int]:
-    if not isinstance(usage_metadata, dict):
-        return {"input_tokens": 0, "output_tokens": 0}
-
-    prompt_tokens_total = int(usage_metadata.get("promptTokenCount", 0) or 0)
-    cached_tokens = _cached_content_token_count(usage_metadata)
-    usage = {
-        "input_tokens": max(prompt_tokens_total - cached_tokens, 0),
-        "output_tokens": int(usage_metadata.get("candidatesTokenCount", 0) or 0),
+    语义对齐（Gemini -> Claude）:
+    - Gemini promptTokenCount 包含缓存 token -> Claude input_tokens 不含缓存
+      （input_tokens = promptTokenCount - cachedContentTokenCount）
+    - Gemini candidatesTokenCount 不含推理 token -> Claude output_tokens 包含推理 token
+      （output_tokens = candidatesTokenCount + thoughtsTokenCount）
+    - 明细: cache_read_input_tokens / output_tokens_details.thinking_tokens
+    """
+    cached_tokens = counts.get("cachedContentTokenCount", 0)
+    reasoning_tokens = counts.get("thoughtsTokenCount", 0)
+    usage: Dict[str, Any] = {
+        "input_tokens": max(counts.get("promptTokenCount", 0) - cached_tokens, 0),
+        "output_tokens": counts.get("candidatesTokenCount", 0) + reasoning_tokens,
     }
 
     if cached_tokens > 0:
         usage["cache_read_input_tokens"] = cached_tokens
+
+    if reasoning_tokens > 0:
+        usage["output_tokens_details"] = {"thinking_tokens": reasoning_tokens}
 
     return usage
 
@@ -331,24 +336,27 @@ def clean_json_schema(schema: Any) -> Any:
     if "properties" in cleaned and "type" not in cleaned:
         cleaned["type"] = "object"
 
+    # required 与 nullable 正交：null 也是合法取值，nullable 不等于可选。
+    # 保留原始接口契约中的 required 约束，避免上游把必填参数当作可选，
+    # 进而在工具调用时生成空参数 {}。
     if (
         isinstance(schema.get("properties"), dict)
         and isinstance(cleaned.get("required"), list)
     ):
-        nullable_fields = {
-            name
-            for name, prop in schema["properties"].items()
-            if isinstance(prop, dict)
-            and isinstance(prop.get("type"), list)
-            and any(str(t).lower() == "null" for t in prop["type"])
-        }
-        if nullable_fields:
-            cleaned["required"] = [
-                item for item in cleaned["required"]
-                if item not in nullable_fields
-            ]
-            if not cleaned["required"]:
-                cleaned.pop("required", None)
+        prop_names = set(cleaned.get("properties", {}).keys()) \
+            if isinstance(cleaned.get("properties"), dict) else None
+        required = []
+        for item in cleaned["required"]:
+            if not isinstance(item, str):
+                continue
+            if prop_names is not None and item not in prop_names:
+                continue
+            if item not in required:
+                required.append(item)
+        if required:
+            cleaned["required"] = required
+        else:
+            cleaned.pop("required", None)
 
     return cleaned
 
@@ -437,8 +445,8 @@ def convert_messages_to_contents(
     for msg in messages:
         role = msg.get("role", "user")
         
-        # system 消息已经由 merge_system_messages 处理，这里跳过
-        if role == "system":
+        # system/developer 消息已经由 merge_system_messages 处理，这里跳过
+        if role in ("system", "developer"):
             continue
         
         # 支持 'assistant' 和 'model' 角色（Google history usage）
@@ -806,7 +814,7 @@ def gemini_to_anthropic_response(
     if not (200 <= status_code < 300):
         return gemini_response
 
-    # 处理 GeminiCLI 的 response 包装格式
+    # 处理 Antigravity 的 response 包装格式
     if "response" in gemini_response:
         response_data = gemini_response["response"]
     else:
@@ -904,7 +912,7 @@ def gemini_to_anthropic_response(
         stop_reason = "end_turn"
 
     # 提取 token 使用情况
-    usage = _anthropic_usage_from_metadata(usage_metadata)
+    usage = _anthropic_usage_from_counts(token_counters(usage_metadata))
 
     # 构建 Anthropic 响应
     message_id = f"msg_{uuid.uuid4().hex}"
@@ -924,9 +932,8 @@ def gemini_to_anthropic_response(
 async def gemini_stream_to_anthropic_stream(
     gemini_stream: AsyncIterator[bytes],
     model: str,
-    status_code: int = 200,
-    credential_name: Optional[str] = None
-) -> AsyncIterator[bytes]:
+    status_code: int = 200
+) -> AsyncIterator[bytes | Response]:
     """
     将 Gemini 格式流式响应转换为 Anthropic SSE 格式流式响应
 
@@ -953,10 +960,9 @@ async def gemini_stream_to_anthropic_stream(
     current_block_index = -1
     current_thinking_signature: Optional[str] = None
     has_tool_use = False
-    input_tokens = 0
-    output_tokens = 0
-    cached_input_tokens = 0
+    counts: Dict[str, int] = {}
     finish_reason: Optional[str] = None
+    done_seen = False
 
     def _sse_event(event: str, data: Dict[str, Any]) -> bytes:
         """生成 SSE 事件"""
@@ -975,71 +981,63 @@ async def gemini_stream_to_anthropic_stream(
         current_block_type = None
         return event
 
-    def _usage_payload() -> Dict[str, int]:
-        usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
-        if cached_input_tokens > 0:
-            usage["cache_read_input_tokens"] = cached_input_tokens
-        return usage
-
     # 处理流式数据
     try:
         async for chunk in gemini_stream:
             # 检查是否是 Response 对象（错误情况）
             if isinstance(chunk, Response):
                 log.warning(f"[GEMINI_TO_ANTHROPIC] 收到 Response 对象，状态码: {chunk.status_code}，直接转发错误")
-                # 直接转发错误响应内容，不做格式转换
-                error_content = chunk.body if isinstance(chunk.body, bytes) else chunk.body.encode('utf-8')
-                yield error_content
+                from src.stream_events import error_payload
+                error = error_payload(chunk)["error"]
+                if not isinstance(error, dict):
+                    error = {"message": str(error)}
+                yield _sse_event("error", {"type": "error", "error": {
+                    **error, "type": error.get("type", "api_error"),
+                    "message": error.get("message", str(error)),
+                }})
                 return
 
-            # 记录接收到的原始chunk
-            log.debug(f"[GEMINI_TO_ANTHROPIC] Raw chunk: {chunk[:200] if chunk else b''}")
-
             # 解析 Gemini 流式块
-            if not chunk or not chunk.startswith(b"data: "):
-                log.debug(f"[GEMINI_TO_ANTHROPIC] Skipping chunk (not SSE format or empty)")
+            if done_seen or not chunk or not chunk.startswith(b"data: "):
                 continue
 
             raw = chunk[6:].strip()
             if raw == b"[DONE]":
-                log.debug(f"[GEMINI_TO_ANTHROPIC] Received [DONE] marker")
-                break
-
-            log.debug(f"[GEMINI_TO_ANTHROPIC] Parsing JSON: {raw[:200]}")
+                # 同 finishReason：不 break，改为消费剩余块直到流自然结束，
+                # 避免向底层 stream_request 下发 GeneratorExit 导致日志丢失
+                done_seen = True
+                continue
 
             try:
                 data = json.loads(raw.decode('utf-8', errors='ignore'))
-                log.debug(f"[GEMINI_TO_ANTHROPIC] Parsed data: {json.dumps(data, ensure_ascii=False)[:300]}")
             except Exception as e:
                 log.warning(f"[GEMINI_TO_ANTHROPIC] JSON parse error: {e}")
                 continue
 
-            # 处理 GeminiCLI 的 response 包装格式
+            # 处理 Antigravity 的 response 包装格式
             if "response" in data:
                 response = data["response"]
             else:
                 response = data
 
-            candidate = (response.get("candidates", []) or [{}])[0] or {}
-            parts = (candidate.get("content", {}) or {}).get("parts", []) or []
+            if response.get("error"):
+                error = response["error"]
+                if not isinstance(error, dict):
+                    error = {"message": str(error)}
+                yield _sse_event("error", {"type": "error", "error": {
+                    **error, "type": error.get("type", "api_error"),
+                    "message": error.get("message", str(error)),
+                }})
+                return
 
-            # 更新 usage metadata
-            if "usageMetadata" in response:
-                usage = response["usageMetadata"]
-                if isinstance(usage, dict):
-                    if "promptTokenCount" in usage:
-                        prompt_tokens_total = int(usage.get("promptTokenCount", 0) or 0)
-                        input_tokens = max(prompt_tokens_total - cached_input_tokens, 0)
-                    if "candidatesTokenCount" in usage:
-                        output_tokens = int(usage.get("candidatesTokenCount", 0) or 0)
-                    if "cachedContentTokenCount" in usage:
-                        cached_input_tokens = int(usage.get("cachedContentTokenCount", 0) or 0)
-                        input_tokens = max(
-                            int(usage.get("promptTokenCount", 0) or 0) - cached_input_tokens,
-                            0,
-                        )
+            counts.update(token_counters(response.get("usageMetadata")))
+            # A finish reason ends the content, but cumulative usage can arrive later.
+            if finish_reason:
+                continue
 
-            # 发送 message_start（仅一次）
+            candidate = (response.get("candidates") or [{}])[0] or {}
+            parts = (candidate.get("content") or {}).get("parts") or []
+
             if not message_start_sent:
                 message_start_sent = True
                 yield _sse_event(
@@ -1054,7 +1052,7 @@ async def gemini_stream_to_anthropic_stream(
                             "content": [],
                             "stop_reason": None,
                             "stop_sequence": None,
-                            "usage": _usage_payload(),
+                            "usage": _anthropic_usage_from_counts(counts),
                         },
                     },
                 )
@@ -1131,11 +1129,10 @@ async def gemini_stream_to_anthropic_stream(
                 if "text" in part:
                     if (
                         is_skip_thought_signature_placeholder(part)
-                        or is_internal_placeholder_text(part.get("text"))
                     ):
                         continue
                     text = part.get("text", "")
-                    if isinstance(text, str) and not text.strip():
+                    if not isinstance(text, str) or not text:
                         continue
 
                     if current_block_type != "text":
@@ -1223,10 +1220,9 @@ async def gemini_stream_to_anthropic_stream(
                     
                     continue
 
-            # 检查是否结束
-            if candidate.get("finishReason"):
-                finish_reason = candidate.get("finishReason")
-                break
+            reason = candidate.get("finishReason")
+            if isinstance(reason, str) and reason and reason != "FINISH_REASON_UNSPECIFIED":
+                finish_reason = reason
 
         # 关闭最后的内容块
         close_evt = _close_block()
@@ -1244,11 +1240,11 @@ async def gemini_stream_to_anthropic_stream(
             # 其他情况（SAFETY、RECITATION 等）默认为 end_turn
             stop_reason = "end_turn"
 
+        if _anthropic_debug_enabled():
             log.info(
-                f"[ANTHROPIC][stream_end] 流式结束: model={model}, stop_reason={stop_reason}, "
-                f"credential={credential_name or 'N/A'}, "
+                f"[ANTHROPIC][stream_end] 流式结束: stop_reason={stop_reason}, "
                 f"has_tool_use={has_tool_use}, finish_reason={finish_reason}, "
-                f"input_tokens={input_tokens}, output_tokens={output_tokens}"
+                f"usage={_anthropic_usage_from_counts(counts)}"
             )
 
         # 发送 message_delta 和 message_stop
@@ -1257,14 +1253,21 @@ async def gemini_stream_to_anthropic_stream(
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": _usage_payload(),
+                "usage": _anthropic_usage_from_counts(counts),
             },
         )
 
         yield _sse_event("message_stop", {"type": "message_stop"})
 
     except Exception as e:
-        log.error(f"[ANTHROPIC] 流式转换失败: {e}")
+        from src.stream_delivery import current_delivery, record_conversion_failure
+        from src.stream_events import error_payload
+        log.error(f"[ANTHROPIC] 流式转换失败: {type(e).__name__}")
+        error = record_conversion_failure()
+        delivery = current_delivery.get()
+        if delivery and not delivery.bytes_sent:
+            yield error
+            return
         # 发送错误事件
         if not message_start_sent:
             yield _sse_event(
@@ -1279,11 +1282,11 @@ async def gemini_stream_to_anthropic_stream(
                         "content": [],
                         "stop_reason": None,
                         "stop_sequence": None,
-                        "usage": _usage_payload(),
+                        "usage": _anthropic_usage_from_counts(counts),
                     },
                 },
             )
         yield _sse_event(
             "error",
-            {"type": "error", "error": {"type": "api_error", "message": str(e)}},
+            {"type": "error", "error": {"type": "api_error", **error_payload(error)["error"]}},
         )

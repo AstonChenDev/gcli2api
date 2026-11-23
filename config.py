@@ -6,9 +6,14 @@ Centralizes all configuration to avoid duplication across modules.
 - 修改配置时调用 reload_config() 重新从数据库加载
 """
 
-import math
+import ipaddress
+import json
 import os
+import re
 from typing import Any, Optional
+
+from log import log
+from src.storage import database as storage
 
 # 全局配置缓存
 _config_cache: dict[str, Any] = {}
@@ -19,22 +24,14 @@ _config_initialized = False
 # 需要自动封禁的错误码 (默认值，可通过环境变量或配置覆盖)
 AUTO_BAN_ERROR_CODES = [403]
 
-# Antigravity RESOURCE_EXHAUSTED 固定冷却策略。
-# 默认恢复为本项目历史上使用的 10 分钟；显式配置为 None 时关闭冷却。
-ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_DEFAULT_MINUTES = 10.0
-ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MAX_MINUTES = 525600.0  # 最长一年，避免误配置无限占用凭证
-
 # ====================== 环境变量映射表 ======================
 # 统一维护环境变量名和配置键名的映射关系
 # 格式: "环境变量名": "配置键名"
 ENV_MAPPINGS = {
-    "CODE_ASSIST_ENDPOINT": "code_assist_endpoint",
     "CREDENTIALS_DIR": "credentials_dir",
     "PROXY": "proxy",
     "OAUTH_PROXY_URL": "oauth_proxy_url",
     "GOOGLEAPIS_PROXY_URL": "googleapis_proxy_url",
-    "RESOURCE_MANAGER_API_URL": "resource_manager_api_url",
-    "SERVICE_USAGE_API_URL": "service_usage_api_url",
     "ANTIGRAVITY_API_URL": "antigravity_api_url",
     "AUTO_BAN": "auto_ban_enabled",
     "AUTO_BAN_ERROR_CODES": "auto_ban_error_codes",
@@ -42,75 +39,62 @@ ENV_MAPPINGS = {
     "RETRY_429_ENABLED": "retry_429_enabled",
     "RETRY_429_INTERVAL": "retry_429_interval",
     "ANTI_TRUNCATION_MAX_ATTEMPTS": "anti_truncation_max_attempts",
-    "COMPATIBILITY_MODE": "compatibility_mode_enabled",
     "RETURN_THOUGHTS_TO_FRONTEND": "return_thoughts_to_frontend",
-    "ANTIGRAVITY_STREAM2NOSTREAM": "antigravity_stream2nostream",
-    "ANTIGRAVITY_SWITCH_CREDENTIAL": "antigravity_switch_credential_enabled",
-    "ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MINUTES": "antigravity_resource_exhausted_cooldown_minutes",
-    "ANTIGRAVITY_CAPACITY_FALLBACK_ENABLED": "antigravity_capacity_fallback_enabled",
-    "ANTIGRAVITY_CAPACITY_FALLBACK_PROXY_URL": "antigravity_capacity_fallback_proxy_url",
-    "ANTIGRAVITY_CAPACITY_FALLBACK_HTTP_STATUSES": "antigravity_capacity_fallback_http_statuses",
-    "ANTIGRAVITY_CAPACITY_FALLBACK_ERROR_STATUSES": "antigravity_capacity_fallback_error_statuses",
-    "ANTIGRAVITY_CAPACITY_FALLBACK_REASONS": "antigravity_capacity_fallback_reasons",
-    "ANTIGRAVITY_CAPACITY_FALLBACK_MODELS": "antigravity_capacity_fallback_models",
-    "ANTIGRAVITY_CAPACITY_FALLBACK_MAX_ATTEMPTS": "antigravity_capacity_fallback_max_attempts",
-    "ANTIGRAVITY_CAPACITY_FALLBACK_CONNECT_TIMEOUT_SECONDS": (
-        "antigravity_capacity_fallback_connect_timeout_seconds"
-    ),
-    "ANTIGRAVITY_CAPACITY_FALLBACK_REQUEST_TIMEOUT_SECONDS": (
-        "antigravity_capacity_fallback_request_timeout_seconds"
-    ),
-    "ANTIGRAVITY_CAPACITY_FALLBACK_STATS_ENABLED": "antigravity_capacity_fallback_stats_enabled",
-    "ANTIGRAVITY_CAPACITY_FALLBACK_ROUTE_NAME": "antigravity_capacity_fallback_route_name",
+    "SYSTEM_INSTRUCTION_AS_USER_MESSAGE": "system_instruction_as_user_message",
+    "SENSITIVE_WORDS": "sensitive_words",
+    "SENSITIVE_WORDS_ENABLED": "sensitive_words_enabled",
+    "IP_WHITELIST": "ip_whitelist",
+    "IP_WHITELIST_ENABLED": "ip_whitelist_enabled",
+    "THINKING_MODEL_ROUTING_ENABLED": "thinking_model_routing_enabled",
+    "THINKING_MODEL_ROUTING_BASES": "thinking_model_routing_bases",
+    "MODEL_REWRITE_ENABLED": "model_rewrite_enabled",
+    "MODEL_REWRITE_RULES": "model_rewrite_rules",
+    "USAGE_LOG_ENABLED": "usage_log_enabled",
+    "REQUEST_LOG_ENABLED": "request_log_enabled",
+    "REQUEST_LOG_ALL_REQUESTS": "request_log_all_requests",
+    "REQUEST_LOG_ERROR_CODES": "request_log_error_codes",
+    "CREDENTIAL_SELECT_MODE": "credential_select_mode",
     "HOST": "host",
     "PORT": "port",
     "API_PASSWORD": "api_password",
     "PANEL_PASSWORD": "panel_password",
-    "PASSWORD": "password",
-    "KEEPALIVE_URL": "keepalive_url",
-    "KEEPALIVE_INTERVAL": "keepalive_interval",
-    "CREDENTIAL_SELECTION_STRATEGY": "credential_selection_strategy",
-    "VERTEX_MAX_RETRIES": "vertex_max_retries",
 }
 
 
 # ====================== 配置系统 ======================
 
+def apply_config_snapshot(values: dict):
+    global _config_cache, _config_initialized
+    _config_cache = values
+    _config_initialized = True
+
+
 async def init_config():
     """初始化配置缓存（启动时调用一次）"""
-    global _config_cache, _config_initialized
-
     if _config_initialized:
         return
 
     try:
-        from src.storage_adapter import get_storage_adapter
-        storage_adapter = await get_storage_adapter()
-        _config_cache = await storage_adapter.get_all_config()
-        _config_initialized = True
+        database = await storage.get_database()
+        apply_config_snapshot(await database.get_all_config())
     except Exception:
         # 初始化失败时使用空缓存
-        _config_cache = {}
-        _config_initialized = True
+        apply_config_snapshot({})
 
 
-async def reload_config():
+async def reload_config(*, only_if_changed=False) -> bool:
     """重新加载配置（修改配置后调用）"""
-    global _config_cache, _config_initialized
-
     try:
-        from src.storage_adapter import get_storage_adapter
-        storage_adapter = await get_storage_adapter()
+        database = await storage.get_database()
 
-        # 如果后端支持 reload_config_cache，调用它
-        if hasattr(storage_adapter._backend, 'reload_config_cache'):
-            await storage_adapter._backend.reload_config_cache()
+        # 重新加载数据库配置缓存
+        await database.reload_config_cache(only_if_changed=only_if_changed)
 
         # 重新加载配置缓存
-        _config_cache = await storage_adapter.get_all_config()
-        _config_initialized = True
+        apply_config_snapshot(await database.get_all_config())
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _get_cached_config(key: str, default: Any = None) -> Any:
@@ -138,9 +122,23 @@ async def get_config_value(key: str, default: Any = None, env_var: Optional[str]
 
 # Configuration getters - all async
 async def get_proxy_config():
-    """Get proxy configuration."""
+    """Get proxy configuration, validating the URL format.
+
+    Supports http://, https://, socks5://, socks5h:// schemes, all with
+    optional embedded credentials (user:pass@host:port).
+    """
     proxy_url = await get_config_value("proxy", env_var="PROXY")
-    return proxy_url if proxy_url else None
+    if not proxy_url:
+        return None
+
+    proxy_url = proxy_url.strip()
+    scheme = proxy_url.split("://", 1)[0].lower()
+    if scheme not in ("http", "https", "socks5", "socks5h"):
+        log.warning(
+            f"不支持的代理协议: {scheme}://（支持 http/https/socks5/socks5h），已忽略代理"
+        )
+        return None
+    return proxy_url
 
 
 async def get_auto_ban_enabled() -> bool:
@@ -152,13 +150,34 @@ async def get_auto_ban_enabled() -> bool:
     return bool(await get_config_value("auto_ban_enabled", False))
 
 
+def parse_auto_ban_error_codes(value: Any) -> list[int]:
+    """Accept the panel's text field and the config API's integer array."""
+    error = "自动封禁错误码必须是 100–599 的整数列表，如 [400, 403] 或 400,403"
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                value = json.loads(text)
+            except (ValueError, RecursionError):
+                raise ValueError(error) from None
+        elif not text:
+            value = []
+        elif re.fullmatch(r"[0-9]{3}(?:\s*,\s*[0-9]{3})*", text):
+            value = [int(code) for code in text.split(",")]
+        else:
+            raise ValueError(error)
+    if not isinstance(value, list) or any(type(code) is not int or not 100 <= code <= 599 for code in value):
+        raise ValueError(error)
+    return list(dict.fromkeys(value or AUTO_BAN_ERROR_CODES))
+
+
 async def get_auto_ban_error_codes() -> list:
     """
     Get auto ban error codes.
 
     Environment variable: AUTO_BAN_ERROR_CODES (comma-separated, e.g., "400,403")
     Database config key: auto_ban_error_codes
-    Default: [400, 403]
+    Default: [403]
     """
     env_value = os.getenv("AUTO_BAN_ERROR_CODES")
     if env_value:
@@ -170,6 +189,12 @@ async def get_auto_ban_error_codes() -> list:
     codes = await get_config_value("auto_ban_error_codes")
     if codes and isinstance(codes, list):
         return codes
+    if isinstance(codes, str):
+        # Earlier panel versions stored the text field verbatim.
+        try:
+            return parse_auto_ban_error_codes(codes)
+        except ValueError:
+            pass
     return AUTO_BAN_ERROR_CODES
 
 
@@ -260,15 +285,9 @@ async def get_api_password() -> str:
 
     Environment variable: API_PASSWORD
     Database config key: api_password
-    Default: Uses PASSWORD env var for compatibility, otherwise 'pwd'
+    Default: pwd
     """
-    # 优先使用 API_PASSWORD，如果没有则使用通用 PASSWORD 保证兼容性
-    api_password = await get_config_value("api_password", None, "API_PASSWORD")
-    if api_password is not None:
-        return str(api_password)
-
-    # 兼容性：使用通用密码
-    return str(await get_config_value("password", "pwd", "PASSWORD"))
+    return str(await get_config_value("api_password", "pwd", "API_PASSWORD"))
 
 
 async def get_panel_password() -> str:
@@ -277,26 +296,9 @@ async def get_panel_password() -> str:
 
     Environment variable: PANEL_PASSWORD
     Database config key: panel_password
-    Default: Uses PASSWORD env var for compatibility, otherwise 'pwd'
-    """
-    # 优先使用 PANEL_PASSWORD，如果没有则使用通用 PASSWORD 保证兼容性
-    panel_password = await get_config_value("panel_password", None, "PANEL_PASSWORD")
-    if panel_password is not None:
-        return str(panel_password)
-
-    # 兼容性：使用通用密码
-    return str(await get_config_value("password", "pwd", "PASSWORD"))
-
-
-async def get_server_password() -> str:
-    """
-    Get server password setting (deprecated, use get_api_password or get_panel_password).
-
-    Environment variable: PASSWORD
-    Database config key: password
     Default: pwd
     """
-    return str(await get_config_value("password", "pwd", "PASSWORD"))
+    return str(await get_config_value("panel_password", "pwd", "PANEL_PASSWORD"))
 
 
 async def get_credentials_dir() -> str:
@@ -308,40 +310,6 @@ async def get_credentials_dir() -> str:
     Default: ./creds
     """
     return str(await get_config_value("credentials_dir", "./creds", "CREDENTIALS_DIR"))
-
-
-async def get_code_assist_endpoint() -> str:
-    """
-    Get Code Assist endpoint setting.
-
-    Environment variable: CODE_ASSIST_ENDPOINT
-    Database config key: code_assist_endpoint
-    Default: https://cloudcode-pa.googleapis.com
-    """
-    return str(
-        await get_config_value(
-            "code_assist_endpoint", "https://cloudcode-pa.googleapis.com", "CODE_ASSIST_ENDPOINT"
-        )
-    )
-
-
-async def get_compatibility_mode_enabled() -> bool:
-    """
-    Get compatibility mode setting.
-
-    兼容性模式：启用后所有system消息全部转换成user，停用system_instructions。
-    该选项可能会降低模型理解能力，但是能避免流式空回的情况。
-
-    Environment variable: COMPATIBILITY_MODE
-    Database config key: compatibility_mode_enabled
-    Default: False
-    """
-    env_value = os.getenv("COMPATIBILITY_MODE")
-    if env_value:
-        return env_value.lower() in ("true", "1", "yes", "on")
-
-    return bool(await get_config_value("compatibility_mode_enabled", False))
-
 
 async def get_return_thoughts_to_frontend() -> bool:
     """
@@ -361,113 +329,483 @@ async def get_return_thoughts_to_frontend() -> bool:
     return bool(await get_config_value("return_thoughts_to_frontend", True))
 
 
-async def get_antigravity_stream2nostream() -> bool:
+async def get_system_instruction_as_user_message() -> bool:
     """
-    Get use stream for non-stream setting.
+    Get system instruction as user message setting.
 
-    控制antigravity非流式请求是否使用流式API并收集为完整响应。
-    启用后，非流式请求将在后端使用流式API，然后收集所有块后再返回完整响应。
+    启用后，Antigravity 转换时不再使用 systemInstruction 字段，
+    而是将系统指令用 <system-instructions> 标签（XML 格式）包裹后
+    作为第一条 user 消息插入 contents 开头。
 
-    Environment variable: ANTIGRAVITY_STREAM2NOSTREAM
-    Database config key: antigravity_stream2nostream
-    Default: True
-    """
-    env_value = os.getenv("ANTIGRAVITY_STREAM2NOSTREAM")
-    if env_value:
-        return env_value.lower() in ("true", "1", "yes", "on")
-
-    return bool(await get_config_value("antigravity_stream2nostream", True))
-
-
-async def get_antigravity_switch_credential_enabled() -> bool:
-    """
-    Get antigravity switch credential setting.
-
-    控制antigravity在重试时是否切换凭证。
-    禁用时会持续使用当前凭证，直到该凭证对当前模型进入CD或被禁用。
-
-    Environment variable: ANTIGRAVITY_SWITCH_CREDENTIAL
-    Database config key: antigravity_switch_credential_enabled
+    Environment variable: SYSTEM_INSTRUCTION_AS_USER_MESSAGE
+    Database config key: system_instruction_as_user_message
     Default: False
     """
-    env_value = os.getenv("ANTIGRAVITY_SWITCH_CREDENTIAL")
+    env_value = os.getenv("SYSTEM_INSTRUCTION_AS_USER_MESSAGE")
     if env_value:
         return env_value.lower() in ("true", "1", "yes", "on")
 
-    return bool(await get_config_value("antigravity_switch_credential_enabled", False))
+    return bool(await get_config_value("system_instruction_as_user_message", False))
 
 
-def validate_antigravity_resource_exhausted_cooldown_minutes(
-    value: Any,
-) -> Optional[float]:
+# ====================== 敏感词过滤 ======================
+
+# 敏感词正则编译缓存: (原始词表指纹, 编译后的 pattern 列表)
+_sensitive_words_cache: dict = {"fingerprint": None, "patterns": []}
+
+
+async def get_sensitive_words_enabled() -> bool:
     """
-    校验并规范化 Antigravity RESOURCE_EXHAUSTED 冷却分钟数。
+    敏感词过滤开关。
 
-    该函数只负责值语义，不读取环境变量或数据库，便于配置接口和测试复用：
-    - None：明确关闭冷却；
-    - 正有限数：固定冷却分钟数；
-    - 布尔值、字符串、零、负数、无穷大和超长时间：拒绝。
+    Environment variable: SENSITIVE_WORDS_ENABLED
+    Database config key: sensitive_words_enabled
+    Default: False
     """
-    if value is None:
-        return None
+    env_value = os.getenv("SENSITIVE_WORDS_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
 
-    # bool 是 int 的子类，必须在数值判断前单独排除。
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("冷却时间必须是数字或 null")
-
-    minutes = float(value)
-    if not math.isfinite(minutes):
-        raise ValueError("冷却时间必须是有限数字")
-    if minutes <= 0:
-        raise ValueError("冷却时间必须大于0分钟；如需关闭请设置为 null")
-    if minutes > ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MAX_MINUTES:
-        raise ValueError("冷却时间不能超过525600分钟（1年）")
-
-    return minutes
+    return bool(await get_config_value("sensitive_words_enabled", False))
 
 
-async def get_antigravity_resource_exhausted_cooldown_minutes() -> Optional[float]:
+async def get_sensitive_words() -> list:
     """
-    获取 Antigravity RESOURCE_EXHAUSTED 的固定冷却分钟数。
+    敏感词列表（支持正则），每行一个；空列表表示不过滤。
 
-    优先级：环境变量 > 数据库存储 > 默认 10 分钟。
-
-    环境变量 ``ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MINUTES`` 支持：
-    - 正数：启用固定时长冷却；
-    - ``none`` / ``null`` / ``off`` / ``disabled``：关闭冷却。
-
-    数据库中的 JSON ``null`` 会原样解释为关闭。这里直接检查配置键是否存在，
-    不使用通用 ``get_config_value``，因为后者会把显式 None 当成“未配置”。
+    Environment variable: SENSITIVE_WORDS (逗号或换行分隔)
+    Database config key: sensitive_words
+    Default: []
     """
-    env_name = "ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_MINUTES"
-    env_value = os.getenv(env_name)
-    if env_value is not None and env_value.strip():
-        normalized_env = env_value.strip().lower()
-        if normalized_env in {"none", "null", "off", "disabled"}:
-            return None
+    env_value = os.getenv("SENSITIVE_WORDS")
+    if env_value:
+        words = [w.strip() for w in re.split(r"[,\n]", env_value) if w.strip()]
+        return words
+
+    value = await get_config_value("sensitive_words")
+    if isinstance(value, list):
+        return [str(w) for w in value if str(w).strip()]
+    if isinstance(value, str) and value.strip():
+        return [w.strip() for w in re.split(r"[,\n]", value) if w.strip()]
+    return []
+
+
+def compile_sensitive_words(words: list):
+    """
+    编译敏感词为大小写敏感的正则列表（带缓存）。
+
+    每个词按字面量转义后编译（用户输入的是词/短语而非正则语法），
+    触发后整词替换为空。支持中文（re.UNICODE 默认开启）。
+
+    Returns:
+        编译后的 Pattern 列表；无效条目跳过并告警。
+    """
+    fingerprint = tuple(words)
+    if _sensitive_words_cache["fingerprint"] == fingerprint:
+        return _sensitive_words_cache["patterns"]
+
+    patterns = []
+    for word in words:
+        word = str(word).strip()
+        if not word:
+            continue
         try:
-            return validate_antigravity_resource_exhausted_cooldown_minutes(
-                float(normalized_env)
-            )
-        except (TypeError, ValueError):
-            # 无效环境变量不让请求链路报错，安全回退到默认冷却时间。
-            return ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_DEFAULT_MINUTES
+            patterns.append(re.compile(re.escape(word), re.UNICODE))
+        except re.error as e:
+            log.warning(f"敏感词编译失败，已跳过: {word!r} ({e})")
 
-    # 生产环境通常启用多个 worker。配置保存只会刷新处理该请求的进程，
-    # 因此这里在真正使用冷却策略前主动从共享存储重新加载，避免其他 worker
-    # 长期持有旧值，确保后台修改能够跨进程热生效。
-    await reload_config()
-    config_key = "antigravity_resource_exhausted_cooldown_minutes"
-    if config_key not in _config_cache:
-        return ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_DEFAULT_MINUTES
+    _sensitive_words_cache["fingerprint"] = fingerprint
+    _sensitive_words_cache["patterns"] = patterns
+    return patterns
 
+
+def apply_sensitive_word_filter(text: str, patterns) -> str:
+    """将文本中命中的敏感词（大小写敏感）替换为空"""
+    if not text or not patterns:
+        return text
+    for pattern in patterns:
+        text = pattern.sub("", text)
+    return text
+
+
+async def get_sensitive_word_filter():
+    """
+    获取生效的敏感词过滤条件（供请求处理管道调用）。
+
+    Returns:
+        (enabled, patterns)；未启用时 patterns 为空列表。
+    """
+    if not await get_sensitive_words_enabled():
+        return False, []
+    words = await get_sensitive_words()
+    if not words:
+        return False, []
+    return True, compile_sensitive_words(words)
+
+
+# ====================== IP 白名单 ======================
+
+# IP 白名单规则缓存: (原始条目指纹, 解析结果 (rules, invalid))
+_ip_whitelist_cache: dict = {"fingerprint": None, "result": ([], [])}
+
+
+def parse_ip_whitelist_line(line: str):
+    """
+    解析单条白名单条目为 (lo, hi, version) 网络对象；无效时抛出 ValueError。
+
+    支持格式（IPv4 / IPv6）：
+    - 单个 IP: 192.168.1.1 / ::1
+    - CIDR 网段: 192.168.1.0/24 / 2001:db8::/32
+    - IP 起止范围（- 或 ~ 分隔）: 192.168.1.1-192.168.1.100 / ::1-::10
+    """
+    line = str(line).strip()
+    if not line:
+        raise ValueError("空条目")
+
+    for sep in ("~", "-"):
+        if sep in line:
+            start_str, _, end_str = line.partition(sep)
+            if start_str.strip() and end_str.strip():
+                start = ipaddress.ip_address(start_str.strip())
+                end = ipaddress.ip_address(end_str.strip())
+                if start.version != end.version:
+                    raise ValueError(f"起止 IP 版本不一致: {line}")
+                if int(start) > int(end):
+                    start, end = end, start
+                return start, end, start.version
+
+    if "/" in line:
+        net = ipaddress.ip_network(line, strict=False)
+        return net.network_address, net.broadcast_address, net.version
+
+    addr = ipaddress.ip_address(line)
+    return addr, addr, addr.version
+
+
+def compile_ip_whitelist(entries: list):
+    """
+    解析白名单条目列表为规则列表（带缓存）。
+
+    Returns:
+        (rules, invalid)——rules 为 [(lo, hi, version), ...]，invalid 为解析失败的原始条目。
+    """
+    fingerprint = tuple(str(e) for e in entries)
+    if _ip_whitelist_cache["fingerprint"] == fingerprint:
+        return _ip_whitelist_cache["result"]
+
+    rules = []
+    invalid = []
+    for entry in entries:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        try:
+            rules.append(parse_ip_whitelist_line(entry))
+        except ValueError:
+            invalid.append(entry)
+
+    result = (rules, invalid)
+    _ip_whitelist_cache["fingerprint"] = fingerprint
+    _ip_whitelist_cache["result"] = result
+    return result
+
+
+def ip_in_whitelist(client_ip: str, rules: list) -> bool:
+    """判断客户端 IP 是否命中白名单规则（IPv4/IPv6 均支持）"""
+    if not client_ip:
+        return False
     try:
-        return validate_antigravity_resource_exhausted_cooldown_minutes(
-            _config_cache[config_key]
-        )
-    except (TypeError, ValueError):
-        # 数据库通常经由面板校验；若被外部工具写入非法值，仍保证服务可用。
-        return ANTIGRAVITY_RESOURCE_EXHAUSTED_COOLDOWN_DEFAULT_MINUTES
+        addr = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    return any(lo.version == addr.version and lo <= addr <= hi for lo, hi, _ in rules)
+
+
+async def get_ip_whitelist_enabled() -> bool:
+    """
+    IP 白名单开关。
+
+    Environment variable: IP_WHITELIST_ENABLED
+    Database config key: ip_whitelist_enabled
+    Default: False
+    """
+    env_value = os.getenv("IP_WHITELIST_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+
+    return bool(await get_config_value("ip_whitelist_enabled", False))
+
+
+async def get_ip_whitelist() -> list:
+    """
+    IP 白名单列表，每行一条；空列表表示不限制。
+
+    支持单个 IP、CIDR 网段、起止范围（- 或 ~ 分隔），IPv4/IPv6 均可。
+    仅在开关开启时生效，命中白名单以外 IP 的所有请求（面板 + API）将直接返回 403。
+
+    Environment variable: IP_WHITELIST (逗号或换行分隔)
+    Database config key: ip_whitelist
+    Default: []
+    """
+    env_value = os.getenv("IP_WHITELIST")
+    if env_value is not None and env_value.strip():
+        return [e.strip() for e in re.split(r"[,\n]", env_value) if e.strip()]
+
+    value = await get_config_value("ip_whitelist")
+    if isinstance(value, list):
+        return [str(e).strip() for e in value if str(e).strip()]
+    if isinstance(value, str) and value.strip():
+        return [e.strip() for e in re.split(r"[,\n]", value) if e.strip()]
+    return []
+
+
+async def get_ip_whitelist_rules():
+    """
+    获取生效的 IP 白名单规则（供请求拦截中间件调用）。
+
+    Returns:
+        (enabled, rules)；开关关闭或白名单为空时不启用限制。
+    """
+    if not await get_ip_whitelist_enabled():
+        return False, []
+    entries = await get_ip_whitelist()
+    if not entries:
+        return False, []
+    rules, invalid = compile_ip_whitelist(entries)
+    if invalid:
+        log.warning(f"IP 白名单中存在无效条目（已跳过）: {invalid}")
+    return bool(rules), rules
+
+
+# ====================== 模型名复写 ======================
+
+# 模型名复写规则缓存: (指纹, (编译后的规则列表, 无效规则列表))
+_model_rewrite_cache: dict = {"fingerprint": None, "result": ([], [])}
+
+
+async def get_model_rewrite_enabled() -> bool:
+    """
+    模型名复写开关。
+
+    Environment variable: MODEL_REWRITE_ENABLED
+    Database config key: model_rewrite_enabled
+    Default: False
+    """
+    env_value = os.getenv("MODEL_REWRITE_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+
+    return bool(await get_config_value("model_rewrite_enabled", False))
+
+
+async def get_model_rewrite_rules_config() -> list:
+    """
+    模型名复写规则列表，每条为 [pattern, replacement]。
+
+    pattern 支持正则（对模型名做全匹配搜索，命中任意一处即替换），
+    replacement 中可使用正则反向引用（如 \\1）。
+
+    Environment variable: MODEL_REWRITE_RULES (JSON 数组，如 [["gpt-4","gemini-2.5-pro"]]；也支持 "pat->rep" 逗号分隔的简化格式)
+    Database config key: model_rewrite_rules
+    Default: []
+    """
+    env_value = os.getenv("MODEL_REWRITE_RULES")
+    if env_value is not None and env_value.strip():
+        parsed = _parse_model_rewrite_rules_value(env_value)
+        if parsed is not None:
+            return parsed
+
+    value = await get_config_value("model_rewrite_rules")
+    return _parse_model_rewrite_rules_value(value) or []
+
+
+def _parse_model_rewrite_rules_value(value: Any) -> Optional[list]:
+    """将配置值解析为 [[pattern, replacement], ...]；无法解析时返回 None"""
+    if isinstance(value, list):
+        rules = []
+        for item in value:
+            if isinstance(item, (list, tuple)) and len(item) == 2 and all(isinstance(x, str) for x in item):
+                rules.append([item[0], item[1]])
+            elif isinstance(item, dict) and isinstance(item.get("pattern"), str) and isinstance(item.get("replacement"), str):
+                rules.append([item["pattern"], item["replacement"]])
+        return rules
+    if isinstance(value, str) and value.strip():
+        # 优先尝试 JSON 数组格式（环境变量推荐格式）
+        if value.strip().startswith("["):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    inner = _parse_model_rewrite_rules_value(parsed)
+                    if inner is not None:
+                        return inner
+            except (json.JSONDecodeError, ValueError):
+                pass
+        # 兼容 "pat->rep,pat->rep" 简化格式
+        rules = []
+        for pair in value.split(","):
+            pair = pair.strip()
+            if "->" in pair:
+                pat, _, rep = pair.partition("->")
+                rules.append([pat.strip(), rep.strip()])
+        return rules or None
+    return None
+
+
+def compile_model_rewrite_rule(pattern: str, replacement: str):
+    try:
+        regex = re.compile(pattern)
+    except (re.error, OverflowError, RecursionError) as exc:
+        raise ValueError(f"无效的匹配正则：{exc}") from exc
+    # sub validates the replacement's group references even without a match.
+    try:
+        regex.sub(replacement, "")
+    except (re.error, IndexError, ValueError, OverflowError) as exc:
+        raise ValueError(f"无效的替换模板：{exc}") from exc
+    return regex, replacement
+
+
+def compile_model_rewrite_rules(rules: list):
+    """
+    编译复写规则为 (pattern, replacement) 元组列表（带缓存）。
+
+    Returns:
+        (compiled, invalid)——invalid 为编译失败的原始规则。
+    """
+    fingerprint = tuple(tuple(r) for r in rules)
+    if _model_rewrite_cache["fingerprint"] == fingerprint:
+        return _model_rewrite_cache["result"]
+
+    compiled = []
+    invalid = []
+    for rule in rules:
+        if not (isinstance(rule, (list, tuple)) and len(rule) == 2):
+            continue
+        pattern, replacement = rule[0], rule[1]
+        try:
+            compiled.append(compile_model_rewrite_rule(str(pattern), str(replacement)))
+        except ValueError:
+            invalid.append(rule)
+
+    if invalid:
+        log.warning(f"已跳过 {len(invalid)} 条无效的模型名复写规则，请检查匹配正则与替换模板")
+    result = (compiled, invalid)
+    _model_rewrite_cache["fingerprint"] = fingerprint
+    _model_rewrite_cache["result"] = result
+    return result
+
+
+def rewrite_model_name(model_name: str, compiled_rules: list) -> str:
+    """
+    按规则顺序应用模型名复写（命中第一条即停止）。
+
+    使用 re.sub 全字符串搜索替换；replacement 支持 \\1 等反向引用。
+    """
+    for pattern, replacement in compiled_rules:
+        if pattern.search(model_name):
+            return pattern.sub(replacement, model_name)
+    return model_name
+
+
+async def get_model_rewrite_filter():
+    """
+    获取生效的模型名复写规则（供请求处理管道调用）。
+
+    Returns:
+        (enabled, compiled_rules)；未启用时 compiled_rules 为空列表。
+    """
+    if not await get_model_rewrite_enabled():
+        return False, []
+    rules = await get_model_rewrite_rules_config()
+    if not rules:
+        return False, []
+    compiled, _ = compile_model_rewrite_rules(rules)
+    return bool(compiled), compiled
+
+
+# ====================== 请求日志 ======================
+
+async def get_usage_log_enabled() -> bool:
+    """
+    请求日志（usage_log）开关。
+
+    Environment variable: USAGE_LOG_ENABLED
+    Database config key: usage_log_enabled
+    Default: True
+    """
+    env_value = os.getenv("USAGE_LOG_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+
+    return bool(await get_config_value("usage_log_enabled", True))
+
+
+async def get_request_log_enabled() -> bool:
+    """
+    请求体详细日志开关。
+
+    Environment variable: REQUEST_LOG_ENABLED
+    Database config key: request_log_enabled
+    Default: False
+    """
+    env_value = os.getenv("REQUEST_LOG_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+
+    return bool(await get_config_value("request_log_enabled", False))
+
+
+async def get_request_log_all_requests() -> bool:
+    """保存所有新模型调用的请求体（包括成功与失败）。"""
+    value = os.getenv("REQUEST_LOG_ALL_REQUESTS")
+    if value is not None:
+        return value.lower() in ("true", "1", "yes")
+    return bool(await get_config_value("request_log_all_requests", False))
+
+
+async def get_request_log_error_codes() -> list:
+    """
+    请求体详细日志记录的错误码列表（仅命中时写盘）。
+
+    Environment variable: REQUEST_LOG_ERROR_CODES (逗号分隔, 如 "400,429")
+    Database config key: request_log_error_codes
+    Default: [400]
+    """
+    env_value = os.getenv("REQUEST_LOG_ERROR_CODES")
+    if env_value:
+        try:
+            return [int(code.strip()) for code in env_value.split(",") if code.strip()]
+        except ValueError:
+            pass
+
+    codes = await get_config_value("request_log_error_codes")
+    if codes and isinstance(codes, list):
+        return codes
+    return [400]
+
+
+# ====================== 凭证选择模式 ======================
+
+# 合法的凭证选择模式
+CREDENTIAL_SELECT_MODES = ("random", "cache", "sticky")
+
+
+async def get_credential_select_mode() -> str:
+    """
+    凭证选择模式:
+    - random: 完全随机负载均衡（无亲和）
+    - cache:  会话缓存匹配（默认）——相同会话内容复用同一凭证，命中上游 prompt cache
+    - sticky: 凭证粘性——尽量保持同一凭证直到其进入 CD 或被禁用
+
+    Environment variable: CREDENTIAL_SELECT_MODE
+    Database config key: credential_select_mode
+    Default: cache
+    """
+    value = await get_config_value("credential_select_mode", "cache", "CREDENTIAL_SELECT_MODE")
+    value = str(value).strip().lower()
+    if value not in CREDENTIAL_SELECT_MODES:
+        log.warning(f"无效的凭证选择模式: {value}，回落为 cache")
+        return "cache"
+    return value
 
 
 async def get_oauth_proxy_url() -> str:
@@ -504,42 +842,6 @@ async def get_googleapis_proxy_url() -> str:
     )
 
 
-async def get_resource_manager_api_url() -> str:
-    """
-    Get Google Cloud Resource Manager API URL setting.
-
-    用于Google Cloud Resource Manager API的URL。
-
-    Environment variable: RESOURCE_MANAGER_API_URL
-    Database config key: resource_manager_api_url
-    Default: https://cloudresourcemanager.googleapis.com
-    """
-    return str(
-        await get_config_value(
-            "resource_manager_api_url",
-            "https://cloudresourcemanager.googleapis.com",
-            "RESOURCE_MANAGER_API_URL",
-        )
-    )
-
-
-async def get_service_usage_api_url() -> str:
-    """
-    Get Google Cloud Service Usage API URL setting.
-
-    用于Google Cloud Service Usage API的URL。
-
-    Environment variable: SERVICE_USAGE_API_URL
-    Database config key: service_usage_api_url
-    Default: https://serviceusage.googleapis.com
-    """
-    return str(
-        await get_config_value(
-            "service_usage_api_url", "https://serviceusage.googleapis.com", "SERVICE_USAGE_API_URL"
-        )
-    )
-
-
 async def get_antigravity_api_url() -> str:
     """
     Get Antigravity API URL setting.
@@ -559,73 +861,20 @@ async def get_antigravity_api_url() -> str:
     )
 
 
-async def get_keepalive_url() -> str:
-    """
-    Get keep-alive URL setting.
-
-    配置后保活服务会定期向该URL发送GET请求。
-    留空表示禁用保活服务。
-
-    Environment variable: KEEPALIVE_URL
-    Database config key: keepalive_url
-    Default: "" (disabled)
-    """
-    return str(await get_config_value("keepalive_url", "", "KEEPALIVE_URL"))
+async def get_thinking_model_routing_enabled() -> bool:
+    """按等级选择模型，默认关闭；环境变量优先。"""
+    value = os.getenv("THINKING_MODEL_ROUTING_ENABLED")
+    if value is not None:
+        return value.lower() in ("true", "1", "yes", "on")
+    return bool(await get_config_value("thinking_model_routing_enabled", False))
 
 
-async def get_keepalive_interval() -> int:
-    """
-    Get keep-alive interval in seconds.
-
-    保活请求发送间隔（秒）。
-
-    Environment variable: KEEPALIVE_INTERVAL
-    Database config key: keepalive_interval
-    Default: 60
-    """
-    env_value = os.getenv("KEEPALIVE_INTERVAL")
-    if env_value:
-        try:
-            return int(env_value)
-        except ValueError:
-            pass
-
-    return int(await get_config_value("keepalive_interval", 60))
-
-
-async def get_credential_selection_strategy() -> str:
-    """
-    Get credential selection strategy.
-
-    控制凭证的选取方式。
-    - random: 随机选取（默认，原版行为）
-    - sequential: 顺序选取（圆环模式，CD后排到队尾）
-
-    Environment variable: CREDENTIAL_SELECTION_STRATEGY
-    Database config key: credential_selection_strategy
-    Default: random
-    """
-    env_value = os.getenv("CREDENTIAL_SELECTION_STRATEGY")
-    if env_value and env_value in ("random", "sequential", "round_robin"):
-        return env_value
-
-    value = str(await get_config_value("credential_selection_strategy", "random"))
-    return value if value in ("random", "sequential", "round_robin") else "random"
-
-
-async def get_vertex_max_retries() -> int:
-    """
-    Get max retries for Vertex API.
-
-    Environment variable: VERTEX_MAX_RETRIES
-    Database config key: vertex_max_retries
-    Default: 3
-    """
-    env_value = os.getenv("VERTEX_MAX_RETRIES")
-    if env_value:
-        try:
-            return int(env_value)
-        except ValueError:
-            pass
-
-    return int(await get_config_value("vertex_max_retries", 3))
+async def get_thinking_model_routing_bases() -> list[str]:
+    """仅对明确配置的模型基础名称添加等级后缀。"""
+    value = os.getenv("THINKING_MODEL_ROUTING_BASES")
+    if value is not None:
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return await get_config_value(
+        "thinking_model_routing_bases",
+        ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen"],
+    )

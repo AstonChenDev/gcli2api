@@ -3,20 +3,29 @@ Antigravity Format Utilities - 独立的 Antigravity 请求处理和转换工具
 
 设计要点:
   * 每个模型家族在 resolve_profile 里有独立的一行配置 (后端模型 ID / 思考方式)
-  * 所有模型统一禁用预填充 (请求不能以 model 消息结尾)
+  * 所有模型禁用预填充 (profile.no_prefill 恒为 True)
   * 不修改调用方传入的 request (generationConfig / thinkingConfig / contents 均先复制)
 ────────────────────────────────────────────────────────────────
+按项目要求:
+- 使用 print 输出 warning/error，去掉 debug 日志
 """
-import copy
 import hashlib
 import json
 import re
-import uuid
+from fastapi import HTTPException
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import config
+from config import (
+    apply_sensitive_word_filter,
+    get_model_rewrite_filter,
+    get_sensitive_word_filter,
+    get_system_instruction_as_user_message,
+    rewrite_model_name,
+)
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
+from src.converter.request_fields import normalize_gemini_request_fields
 
 # ==================== 常量配置 ====================
 
@@ -44,15 +53,11 @@ DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_JAILBREAK", "threshold": "OFF"},
 ]
 
-LITE_SAFETY_SETTINGS = [
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
-]
-
-MAX_OUTPUT_TOKENS = 64000
-TOP_K = 64
+# 官方模型目录权威 maxOutputTokens：Claude 严禁超 64k；Gemini 家族 65536
+CLAUDE_MAX_OUTPUT_TOKENS = 64000
+GEMINI_MAX_OUTPUT_TOKENS = 65536
+# Anthropic 规范: Claude thinkingBudget 下限 1024
+CLAUDE_MIN_THINKING_BUDGET = 1024
 _CLAUDE_THINKING_SIGNATURE = "skip_thought_signature_validator"  # 官方文档推荐的虚拟签名
 
 
@@ -226,26 +231,19 @@ def _clean_parameters_json_schema(
         if key in unsupported_keys or key.startswith("x-"):
             del result[key]
 
-    nullable_props = set()
     if isinstance(result.get("properties"), dict):
-        cleaned_props = {}
-        for prop_name, prop_schema in result["properties"].items():
-            if isinstance(prop_schema, dict):
-                prop_type = prop_schema.get("type")
-                if (
-                    prop_schema.get("nullable") is True
-                    or (
-                        isinstance(prop_type, list)
-                        and any(str(t).lower() == "null" for t in prop_type)
-                    )
-                ):
-                    nullable_props.add(prop_name)
-            cleaned_props[prop_name] = _clean_parameters_json_schema(prop_schema, root_schema, visited)
-        result["properties"] = cleaned_props
+        result["properties"] = {
+            prop_name: _clean_parameters_json_schema(prop_schema, root_schema, visited)
+            for prop_name, prop_schema in result["properties"].items()
+        }
 
     if "properties" in result and "type" not in result:
         result["type"] = "object"
 
+    # required 仅约束字段必须出现，null 也是合法取值；nullable 不等于可选。
+    # 若把 nullable 属性（如 Pydantic v2 的 type: ["string", "null"]）从 required
+    # 中剔除，上游 Gemini 会认为所有参数都非必填，频繁生成空参数 {} 的工具调用，
+    # 因此保留原始接口契约中的 required 约束。
     if isinstance(result.get("required"), list):
         prop_names = set(result.get("properties", {}).keys()) if isinstance(result.get("properties"), dict) else None
         required = []
@@ -253,8 +251,6 @@ def _clean_parameters_json_schema(
             if not isinstance(item, str):
                 continue
             if prop_names is not None and item not in prop_names:
-                continue
-            if item in nullable_props:
                 continue
             if item not in required:
                 required.append(item)
@@ -312,7 +308,7 @@ def _normalize_tools_for_internal_api(tools: Any) -> Any:
     return normalized_tools
 
 
-def _ensure_empty_tool_schema_for_claude(tools: Any, model_name: str, mode: str = "antigravity") -> Any:
+def _ensure_empty_tool_schema_for_claude(tools: Any, model_name: str) -> Any:
     if not isinstance(tools, list):
         return tools
 
@@ -445,6 +441,25 @@ def _normalize_part_thought_signature(part: Dict[str, Any], model_name: str) -> 
     return normalized
 
 
+def _stable_json(value: Any) -> Optional[str]:
+    """稳定序列化（排序键），失败返回 None"""
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def _deterministic_tool_id(material: str) -> str:
+    """基于稳定材料确定性派生 toolu_ 前缀 ID（截断 32 hex）。
+
+    同一段历史在多轮往返中补全出的 ID 恒定不变，保证 Claude 路径下
+    KV 缓存依赖的前缀 token 序列字节级一致（随机 ID 会使前缀哈希
+    从缺失处开始全部改变，导致上游缓存彻底失效）。
+    """
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"toolu_{digest[:32]}"
+
+
 def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
     """
     确保 functionCall/functionResponse 携带 id 字段 (仅 Claude)。
@@ -454,6 +469,10 @@ def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
     tool_use/tool_result，而后者的 id 是必填字段。原生 Gemini 请求
     可能不带 id，因此这里按 name 补全缺失的 id，保证同一次调用的
     functionCall 与 functionResponse 使用相同 id。不修改入参。
+
+    缺失的 id 按「消息序号 + part 序号 + 函数名 + 载荷 JSON」确定性
+    派生：历史前缀索引跨轮次稳定（append-only），因此同一历史补全出的
+    ID 恒定，不会破坏多轮历史的字节级前缀一致性。
     """
     if "claude" not in (model_name or "").lower():
         return contents
@@ -463,19 +482,21 @@ def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
     pending_ids_by_name: Dict[str, list] = {}
     result = []
 
-    for content in contents:
+    for content_index, content in enumerate(contents):
         if not isinstance(content, dict) or not isinstance(content.get("parts"), list):
             result.append(content)
             continue
 
         new_parts = []
-        for part in content["parts"]:
+        for part_index, part in enumerate(content["parts"]):
             if isinstance(part, dict):
                 fc = part.get("functionCall")
                 fr = part.get("functionResponse")
                 if isinstance(fc, dict):
                     if not fc.get("id"):
-                        fc = {**fc, "id": f"toolu_{uuid.uuid4().hex}"}
+                        args_json = _stable_json(fc.get("args"))
+                        material = f"{content_index}:{part_index}:{fc.get('name')}:{args_json}"
+                        fc = {**fc, "id": _deterministic_tool_id(material)}
                         part = {**part, "functionCall": fc}
                     pending_ids_by_name.setdefault(fc.get("name"), []).append(fc["id"])
                 elif isinstance(fr, dict):
@@ -484,7 +505,12 @@ def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
                         if fr["id"] in queue:
                             queue.remove(fr["id"])
                     else:
-                        new_id = queue.pop(0) if queue else f"toolu_{uuid.uuid4().hex}"
+                        if queue:
+                            new_id = queue.pop(0)
+                        else:
+                            response_json = _stable_json(fr.get("response"))
+                            material = f"{content_index}:{part_index}:{fr.get('name')}:{response_json}"
+                            new_id = _deterministic_tool_id(material)
                         part = {**part, "functionResponse": {**fr, "id": new_id}}
             new_parts.append(part)
 
@@ -502,8 +528,6 @@ def _parse_size_to_image_config(size_str: str) -> Dict[str, str]:
     Returns:
         包含 aspectRatio 和/或 imageSize 的字典
     """
-    import re
-
     config = {}
     size_str = size_str.strip()
 
@@ -578,20 +602,11 @@ def prepare_image_generation_request(
         if image_size:
             image_config["imageSize"] = image_size
 
-    clean_model = model
-    for suffix in (
-        "-21x9", "-16x9", "-9x16", "-4x3", "-3x4", "-1x1",
-        "-4k", "-2k",
-    ):
-        clean_model = clean_model.replace(suffix, "").replace(suffix.upper(), "")
-    request_body["model"] = clean_model
-
-    # Preserve client generation settings, including an explicitly supplied imageConfig.
-    generation_config = (request_body.get("generationConfig") or {}).copy()
-    generation_config["candidateCount"] = 1
-    if "imageConfig" not in generation_config:
-        generation_config["imageConfig"] = image_config
-    request_body["generationConfig"] = generation_config
+    request_body["model"] = IMAGE_BASE_MODEL  # 统一使用基础模型名
+    request_body["generationConfig"] = {
+        "candidateCount": (request_body.get("generationConfig") or {}).get("candidateCount", 1),
+        "imageConfig": image_config
+    }
 
     # 移除不需要的字段
     for key in ("systemInstruction", "tools", "toolConfig"):
@@ -604,17 +619,23 @@ def prepare_image_generation_request(
 
 @dataclass(frozen=True)
 class ModelProfile:
-    family: str                     # "gemini3" | "gemini25" | "claude" | "image" | "other"
+    family: str                     # "gemini4" | "gemini3" | "claude" | "image" | "other"
     upstream: str                   # 实际发给 Antigravity 后端的模型 ID
     thinking: str = "none"          # "route" | "budget" | "none"，见 _apply_thinking
     thinking_budget: int = 1024     # 仅 thinking == "budget" 时使用
+    no_prefill: bool = True         # 所有模型禁用预填充
 
 
-# 兼容旧客户端别名及其后缀: 客户端模型名 -> 后端真实 ID
-_UPSTREAM_ALIASES = {
-    "gemini-3.1-pro-high": "gemini-pro-agent",
-    "gemini-3-pro-high": "gemini-pro-agent",
+# 精确别名: 客户端模型名 -> 后端真实 ID
+_UPSTREAM_ALIASES: Dict[str, str] = {
+    # gemini-3.1-pro-* 已从上游模型列表下线，别名已删除
 }
+
+
+async def _get_model_rewrite_rules():
+    """读取生效的模型名复写规则；未启用时返回 None"""
+    enabled, rules = await get_model_rewrite_filter()
+    return rules if enabled and rules else None
 
 
 def resolve_profile(model: str) -> ModelProfile:
@@ -622,14 +643,13 @@ def resolve_profile(model: str) -> ModelProfile:
     按关键词匹配模型，自上而下第一个命中的规则生效:
 
       image 图片生成，走独立路径
+      claude-opus-5-5 / claude-sonnet-5-5   思考强度由模型 ID 后缀决定，原样透传
       claude-opus-4-6   映射到 claude-opus-4-6-thinking
       claude-sonnet-4-6-thinking    映射到 claude-sonnet-4-6
       claude (其他)  原样透传
+      gemini-4*             (如 gemini-4-argon-low/-medium/-high) 思考深度由模型 ID 后缀决定，原样透传
       gemini-3* / *-agent   思考深度由模型 ID (-low/-medium/-high/-tiered/-extra-low) 决定
-      gemini (其他, 2.5 等) 名字含 think 才发 thinkingBudget
-      其他  原样透传
-
-    所有模型统一禁用预填充（见 normalize_antigravity_request）。
+      其他  名字含 think 才发 thinkingBudget，原样透传
     """
     model = model or ""
     lower = model.lower()
@@ -639,6 +659,11 @@ def resolve_profile(model: str) -> ModelProfile:
         return ModelProfile("image", model)
 
     if "claude" in lower:
+        # Opus 5.5 / Sonnet 5.5: 思考强度由模型 ID 后缀 (-low/-high 等) 决定，原样透传
+        normalized = lower.replace(".", "-")
+        if "claude-opus-5-5" in normalized or "claude-sonnet-5-5" in normalized:
+            return ModelProfile("claude", model, "route")
+
         upstream = model
         if "claude-opus-4-6" in lower:
             upstream = "claude-opus-4-6-thinking"
@@ -646,18 +671,11 @@ def resolve_profile(model: str) -> ModelProfile:
             upstream = "claude-sonnet-4-6"
         return ModelProfile("claude", upstream, think)
 
-    if "gemini-3" in lower or lower.endswith("-agent"):
-        return ModelProfile(
-            "gemini3",
-            next(
-                (upstream for alias, upstream in _UPSTREAM_ALIASES.items() if alias in lower),
-                model,
-            ),
-            "route",
-        )
+    if "gemini-4" in lower:
+        return ModelProfile("gemini4", _UPSTREAM_ALIASES.get(lower, model), "route")
 
-    if "gemini" in lower:
-        return ModelProfile("gemini25", model, think)
+    if "gemini-3" in lower or lower.endswith("-agent"):
+        return ModelProfile("gemini3", _UPSTREAM_ALIASES.get(lower, model), "route")
 
     return ModelProfile("other", model, think)
 
@@ -686,6 +704,64 @@ def _apply_thinking(profile: ModelProfile, generation_config: Dict[str, Any], re
 
 
 # ==================== contents 处理 ====================
+
+async def _get_sensitive_word_patterns():
+    """读取生效的敏感词正则列表；未启用时返回 None（避免无谓的配置读取开销为 0 时的开销可忽略）"""
+    enabled, patterns = await get_sensitive_word_filter()
+    return patterns if enabled and patterns else None
+
+
+def _filter_text(text: str, patterns) -> str:
+    """对文本应用敏感词过滤（大小写敏感，命中替换为空）"""
+    return apply_sensitive_word_filter(text, patterns)
+
+
+def _filter_contents_sensitive_words(contents: Any, patterns) -> Any:
+    """对 contents 内所有 text part 应用敏感词过滤（不修改入参）"""
+    if not isinstance(contents, list):
+        return contents
+
+    new_contents = []
+    for content in contents:
+        if not (isinstance(content, dict) and isinstance(content.get("parts"), list)):
+            new_contents.append(content)
+            continue
+
+        new_parts = []
+        for part in content["parts"]:
+            if (
+                isinstance(part, dict)
+                and isinstance(part.get("text"), str)
+                and part["text"]
+            ):
+                filtered = _filter_text(part["text"], patterns)
+                if filtered != part["text"]:
+                    part = {**part, "text": filtered}
+            new_parts.append(part)
+
+        new_contents.append({**content, "parts": new_parts})
+    return new_contents
+
+
+def _filter_system_instruction_sensitive_words(system_instruction: Any, patterns) -> Any:
+    """对 systemInstruction 的 text part 应用敏感词过滤（不修改入参）"""
+    if not (isinstance(system_instruction, dict) and isinstance(system_instruction.get("parts"), list)):
+        return system_instruction
+
+    new_parts = []
+    for part in system_instruction["parts"]:
+        if (
+            isinstance(part, dict)
+            and isinstance(part.get("text"), str)
+            and part["text"]
+        ):
+            filtered = _filter_text(part["text"], patterns)
+            if filtered != part["text"]:
+                part = {**part, "text": filtered}
+        new_parts.append(part)
+
+    return {**system_instruction, "parts": new_parts}
+
 
 def _clean_contents(contents: List[Any], model_name: str) -> List[Any]:
     """过滤空 part、规范 thoughtSignature、修正 text 字段类型、丢弃没有有效 part 的 content"""
@@ -793,6 +869,232 @@ def _prepare_claude_history(contents: List[Any], generation_config: Dict[str, An
     return contents
 
 
+# ==================== 官方报文结构规范化 ====================
+
+def _split_tools_single_function(tools: Any) -> Any:
+    """将 tools 拆解为官方单函数独立切片形态，保持客户端声明顺序。
+
+    官方 HAR 抓包铁律：原生 329 次带工具报文中，独立切片占比 100%：
+        "tools": [
+            { "functionDeclarations": [ { "name": "tool1", ... } ] },
+            { "functionDeclarations": [ { "name": "tool2", ... } ] }
+        ]
+    - 每个对象仅包含一个 functionDeclarations，且其中只有一个声明；
+    - 参数 schema 的 type 字段统一转大写（官方全工具采用 OBJECT/STRING/INTEGER/BOOLEAN/ARRAY）；
+    - 非 functionDeclarations 工具（googleSearch / codeExecution 等）严格保持就地位置。
+    """
+    if not isinstance(tools, list):
+        return tools
+
+    expanded_tools: List[Any] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            expanded_tools.append(tool)
+            continue
+
+        declarations = tool.get("functionDeclarations") or tool.get("function_declarations")
+        if isinstance(declarations, list):
+            for declaration in declarations:
+                if isinstance(declaration, dict):
+                    decl_copy = dict(declaration)
+                    parameters = decl_copy.get("parameters")
+                    if isinstance(parameters, (dict, list)):
+                        _enforce_uppercase_schema_types(parameters)
+                    expanded_tools.append({"functionDeclarations": [decl_copy]})
+                else:
+                    expanded_tools.append({"functionDeclarations": [declaration]})
+            continue
+
+        # 非 functionDeclarations 工具（googleSearch / codeExecution）严格保持就地位置
+        expanded_tools.append(tool)
+
+    return expanded_tools
+
+
+def _canonicalize_system_instruction(system_instruction: Dict[str, Any]) -> Dict[str, Any]:
+    """规范化 systemInstruction 为官方形态 {role: "user", parts: [...]}，统一键序 role -> parts -> 其余。
+
+    官方报文 systemInstruction 恒为:
+        { "role": "user", "parts": [ { "text": ... }, ... ] }
+    """
+    if not isinstance(system_instruction, dict):
+        return system_instruction
+
+    canonical: Dict[str, Any] = {}
+    role = system_instruction.get("role")
+    if not isinstance(role, str) or not role:
+        role = "user"
+    canonical["role"] = role
+    if "parts" in system_instruction:
+        canonical["parts"] = system_instruction["parts"]
+    for key, value in system_instruction.items():
+        if key not in ("role", "parts"):
+            canonical[key] = value
+    return canonical
+
+
+# systemInstruction 转首条 user 消息时的 XML 包裹标签
+SYSTEM_INSTRUCTIONS_TAG = "system-instructions"
+
+
+def _merge_system_instruction_text(system_instruction: Any) -> str:
+    """提取 systemInstruction 全部 text part，按 part 顺序以换行拼接"""
+    if not isinstance(system_instruction, dict):
+        return ""
+    parts = system_instruction.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    texts = [
+        str(part.get("text"))
+        for part in parts
+        if isinstance(part, dict) and isinstance(part.get("text"), str) and part.get("text").strip()
+    ]
+    return "\n".join(texts)
+
+
+def _convert_system_instruction_to_user_message(
+    result: Dict[str, Any],
+) -> None:
+    """将 systemInstruction 转换为 contents 开头的首条 user 消息（就地修改 result）。
+
+    文本内容用 <system-instructions> 标签（XML 格式）包裹后作为
+    role=user 的 content 插入 contents 最前面，并移除 systemInstruction 字段；
+    非文本 part（如 inlineData）按原顺序保留，不丢弃。
+
+    - 与已有首条 user 消息合并（系统指令 parts 前置），保证 Antigravity
+      上游对相邻同角色消息的兼容性；
+    - contents 缺失时创建仅含该消息的列表；
+    - 系统指令无有效内容时不做任何修改。
+    """
+    system_instruction = result.get("systemInstruction")
+    if not isinstance(system_instruction, dict):
+        return
+    parts = system_instruction.get("parts")
+    if not isinstance(parts, list):
+        return
+
+    system_text = _merge_system_instruction_text(system_instruction)
+    if not system_text:
+        return
+
+    wrapped = f"<{SYSTEM_INSTRUCTIONS_TAG}>\n{system_text}\n</{SYSTEM_INSTRUCTIONS_TAG}>"
+
+    # 文本 part 合并为单个包裹 part，非文本 part（inlineData 等）原样保留
+    system_parts: List[Dict[str, Any]] = [{"text": wrapped}]
+    for part in parts:
+        if isinstance(part, dict) and "text" not in part:
+            system_parts.append(part)
+
+    contents = result.get("contents")
+    if not isinstance(contents, list):
+        contents = []
+    contents = list(contents)
+
+    if (
+        contents
+        and isinstance(contents[0], dict)
+        and contents[0].get("role") == "user"
+        and isinstance(contents[0].get("parts"), list)
+    ):
+        # 与首条 user 消息合并：系统指令 parts 前置
+        first = contents[0]
+        contents[0] = {**first, "parts": system_parts + list(first["parts"])}
+    else:
+        contents.insert(0, {"role": "user", "parts": system_parts})
+
+    result["contents"] = contents
+    result.pop("systemInstruction", None)
+    print("[ANTIGRAVITY] systemInstruction 转换为首条 user 消息（<system-instructions> 包裹）", flush=True)
+
+
+def _enforce_uppercase_schema_types(schema: Any) -> None:
+    """递归将 schema 的 type 字段值转为大写（官方 HAR 全工具采用大写类型标记 OBJECT/STRING/...）。
+
+    注意：仅转换 type 键的值，其他字段（如 enum 值、format）保持原样。
+    """
+    if isinstance(schema, dict):
+        type_value = schema.get("type")
+        if isinstance(type_value, str):
+            schema["type"] = type_value.upper()
+        for key in ("properties",):
+            if isinstance(schema.get(key), dict):
+                for prop_schema in schema[key].values():
+                    _enforce_uppercase_schema_types(prop_schema)
+        if isinstance(schema.get("items"), (dict, list)):
+            _enforce_uppercase_schema_types(schema["items"])
+    elif isinstance(schema, list):
+        for item in schema:
+            _enforce_uppercase_schema_types(item)
+
+
+def _normalize_generation_config(
+    result: Dict[str, Any],
+    generation_config: Dict[str, Any],
+    profile: "ModelProfile",
+    upstream: str,
+) -> Dict[str, Any]:
+    """thinkingConfig / generationConfig 归一（对齐官方拓扑）。
+
+    - Claude + 强制工具调用（toolConfig mode=ANY）时剔除 thinkingConfig，
+      杜绝 Anthropic "Thinking may not be enabled when tool_choice forces tool use" 400；
+    - Claude thinkingBudget 下限保护（Anthropic 规范 >= 1024）；
+    - 不伪造 topK / topP（官方报文不携带，保留客户端显式值）。
+    """
+    is_claude = profile.family == "claude"
+
+    if is_claude:
+        tool_config = result.get("toolConfig")
+        forced_tool_choice = (
+            isinstance(tool_config, dict)
+            and str(
+                (tool_config.get("functionCallingConfig") or {}).get("mode", "")
+            ).upper() == "ANY"
+        )
+        if forced_tool_choice:
+            if generation_config.pop("thinkingConfig", None) is not None:
+                print(
+                    "[ANTIGRAVITY] Claude 目标带强制工具调用 (mode=ANY)，剔除 thinkingConfig "
+                    "防止上游 400 (thinking 与 tool_choice 冲突)",
+                    flush=True,
+                )
+
+        thinking_config = generation_config.get("thinkingConfig")
+        if isinstance(thinking_config, dict):
+            budget = thinking_config.get("thinkingBudget")
+            if isinstance(budget, int) and not isinstance(budget, bool) and 0 < budget < CLAUDE_MIN_THINKING_BUDGET:
+                print(
+                    f"[ANTIGRAVITY] Claude thinkingBudget {budget} 低于 Anthropic 规范下限，"
+                    f"钳制为 {CLAUDE_MIN_THINKING_BUDGET}",
+                    flush=True,
+                )
+                thinking_config["thinkingBudget"] = CLAUDE_MIN_THINKING_BUDGET
+
+    # 官方标配 maxOutputTokens（在 thinkingConfig 剔除/钳制之后补齐）：
+    # Claude 64000（严禁超 64k），Gemini 家族 65536
+    is_claude_model = is_claude or "claude" in (upstream or "").lower()
+    default_max_output = CLAUDE_MAX_OUTPUT_TOKENS if is_claude_model else GEMINI_MAX_OUTPUT_TOKENS
+    if generation_config.get("maxOutputTokens") in (None, 65536, 64000):
+        generation_config["maxOutputTokens"] = default_max_output
+
+    # generationConfig 内部键序: candidateCount -> maxOutputTokens -> thinkingConfig -> temperature -> topP -> topK -> 其余
+    ordered_keys = [
+        "candidateCount",
+        "maxOutputTokens",
+        "thinkingConfig",
+        "temperature",
+        "topP",
+        "topK",
+    ]
+    reordered: Dict[str, Any] = {}
+    for key in ordered_keys:
+        if key in generation_config:
+            reordered[key] = generation_config.pop(key)
+    for key, value in generation_config.items():
+        if key not in reordered:
+            reordered[key] = value
+    return reordered
+
+
 # ==================== 统一的 Antigravity 请求后处理 ====================
 
 async def normalize_antigravity_request(
@@ -802,28 +1104,60 @@ async def normalize_antigravity_request(
     规范化 Antigravity 请求
 
     处理逻辑:
+    0. 敏感词过滤（contents / systemInstruction，面板可配，热更新）
+    0.5 模型名复写（面板可配，热更新，支持正则与反向引用）
     1. 按模型名取 profile (关键词匹配)
     2. 图片模型走独立路径
     3. 模型映射 + thinkingConfig (按 profile.thinking)
     4. contents 清理 -> 预填充处理 -> Claude 专属处理 -> 工具调用 id
     5. 工具 schema 规范化
-    6. 公共参数 (safetySettings / maxOutputTokens / topK)
+    6. systemInstruction 规范化（或转首条 user 消息，面板可配，热更新）
+    7. 公共参数 (safetySettings / maxOutputTokens / topK)
 
     Args:
         request: 原始请求字典 (不会被修改)
-
     Returns:
         规范化后的请求
     """
-    result = request.copy()
+    result = normalize_gemini_request_fields(request)
     model = result.get("model", "")
     generation_config = (result.get("generationConfig") or {}).copy()
 
-    from config import get_return_thoughts_to_frontend
+    # The panel controls the default; an explicit per-request opt-out must survive.
+    return_thoughts = await config.get_return_thoughts_to_frontend()
+    requested_thinking = generation_config.get("thinkingConfig") or {}
+    if requested_thinking.get("includeThoughts") is False:
+        return_thoughts = False
+    system_instruction_as_user = await get_system_instruction_as_user_message()
 
-    return_thoughts = await get_return_thoughts_to_frontend()
+    # ========== 0.5 模型名复写（面板可配，热更新） ==========
+    # 在抗截断前缀剥离之后、profile 解析之前应用：
+    # 命中规则的模型名被替换为规则指定的模型名（支持正则与反向引用）
+    rewrite_rules = await _get_model_rewrite_rules()
+    if rewrite_rules and model:
+        rewritten = rewrite_model_name(model, rewrite_rules)
+        if rewritten != model:
+            result["model"] = rewritten
+            print(f"[ANTIGRAVITY] 模型名复写: {model} -> {rewritten}", flush=True)
+        model = rewritten
 
     profile = resolve_profile(model)
+
+    # ========== 0. 敏感词过滤 ==========
+    # 在所有内容处理之前应用：命中面板配置的敏感词（大小写敏感）直接替换为空，
+    # 避免触发 Google API 端点的敏感词拦截
+    sensitive_patterns = await _get_sensitive_word_patterns()
+    if sensitive_patterns:
+        if isinstance(result.get("contents"), list):
+            result["contents"] = _filter_contents_sensitive_words(result["contents"], sensitive_patterns)
+        if result.get("systemInstruction") is not None:
+            result["systemInstruction"] = _filter_system_instruction_sensitive_words(
+                result.get("systemInstruction"), sensitive_patterns
+            )
+        if result.get("system_instruction") is not None:
+            result["system_instruction"] = _filter_system_instruction_sensitive_words(
+                result.get("system_instruction"), sensitive_patterns
+            )
 
     # 图片模型走独立的图片生成处理路径
     if profile.family == "image":
@@ -839,213 +1173,63 @@ async def normalize_antigravity_request(
     if "contents" in result:
         contents = _clean_contents(result["contents"], upstream)
 
-        # 所有模型统一禁用预填充
-        contents, removed = _strip_trailing_model_turns(contents)
-        if removed:
-            print(f"[ANTIGRAVITY] {upstream} 不支持预填充，移除了 {removed} 条末尾 model 消息", flush=True)
+        if profile.no_prefill:
+            contents, removed = _strip_trailing_model_turns(contents)
+            if removed:
+                print(f"[ANTIGRAVITY] {upstream} 禁用预填充，移除了 {removed} 条末尾 model 消息", flush=True)
 
         if profile.family == "claude":
             contents = _prepare_claude_history(contents, generation_config)
 
         result["contents"] = _ensure_tool_call_ids(contents, upstream)
 
-    # ========== 3. 工具 ==========
+    # ========== 3. 工具 (单函数独立包装形态) ==========
     if "tools" in result:
         tools = _normalize_tools_for_internal_api(result.get("tools"))
         # Claude: functionDeclarations + parameters；Gemini: 只保留 parameters，避免与 parametersJsonSchema 冲突
-        result["tools"] = _ensure_empty_tool_schema_for_claude(tools, upstream, "antigravity")
+        tools = _ensure_empty_tool_schema_for_claude(tools, upstream)
+        # 拆解为官方单函数独立切片 [{"functionDeclarations": [single_decl]}]，保持客户端声明原序
+        result["tools"] = _split_tools_single_function(tools)
+
+    # ========== 4. systemInstruction 规范化 ==========
+    if not isinstance(result.get("systemInstruction"), dict) and isinstance(result.get("system_instruction"), dict):
+        # snake_case 键归一化为官方 camelCase
+        result["systemInstruction"] = result.pop("system_instruction")
+    # 双写时 camelCase 优先，清除残留的 snake_case 键
+    result.pop("system_instruction", None)
+
+    # ========== 4.5 systemInstruction 规范化 / 转首条 user 消息（面板可配，热更新） ==========
+    # 开启转换后：系统指令以 <system-instructions> 标签包裹，作为第一条 user 消息
+    # 插入 contents 开头，systemInstruction 字段不再发往上游；
+    # 转换未生效（无有效文本）或转换关闭时，规范化为官方形态
+    if isinstance(result.get("systemInstruction"), dict):
+        if system_instruction_as_user:
+            _convert_system_instruction_to_user_message(result)
+        if isinstance(result.get("systemInstruction"), dict):
+            result["systemInstruction"] = _canonicalize_system_instruction(result["systemInstruction"])
+
+    explicit_limit = None
+    if profile.family in ("gemini3", "gemini4") and "maxOutputTokens" in generation_config:
+        limit = generation_config["maxOutputTokens"]
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise HTTPException(400, "maxOutputTokens 必须是正整数")
+        explicit_limit = min(limit, GEMINI_MAX_OUTPUT_TOKENS)
+
+    # ========== 5. thinkingConfig / generationConfig 归一 ==========
+    generation_config = _normalize_generation_config(result, generation_config, profile, upstream)
+    if explicit_limit is not None:
+        generation_config["maxOutputTokens"] = explicit_limit
 
     # ========== 公共处理 ==========
     generation_config.pop("presencePenalty", None)
     generation_config.pop("frequencyPenalty", None)
     generation_config.pop("stopSequences", None)
 
-    if not result.get("safetySettings"):
-        if "image" in model.lower() and "preview" in model.lower():
-            result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
-        else:
-            result["safetySettings"] = LITE_SAFETY_SETTINGS
+    result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
 
+    # 显式覆盖（result 与入参共享 generationConfig 引用，必须切断）
+    result.pop("generationConfig", None)
     if generation_config:
-        generation_config["maxOutputTokens"] = MAX_OUTPUT_TOKENS
-        generation_config["topK"] = TOP_K
         result["generationConfig"] = generation_config
 
     return result
-
-
-# ==================== 请求构建 & Antigravity payload 准备 ====================
-
-
-def build_gemini_request(
-    model: str,
-    contents: Any,
-    generation_config: Optional[Dict[str, Any]] = None,
-    system_instruction: Optional[Dict[str, Any]] = None,
-    tools: Optional[list] = None,
-    tool_config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    构建 Gemini 请求格式（按需添加可选字段）。
-
-    采用“存在才添加”而非“先全量再排除”的策略，避免把 None/空字段
-    透传给上游导致不必要的校验问题。
-    """
-    gemini_request: Dict[str, Any] = {
-        "model": model,
-        "contents": contents,
-        "generationConfig": generation_config or {},
-    }
-    if system_instruction:
-        gemini_request["systemInstruction"] = system_instruction
-    if tools:
-        gemini_request["tools"] = tools
-    if tool_config:
-        gemini_request["toolConfig"] = tool_config
-    return gemini_request
-
-
-def _extract_first_user_text(request_payload: Dict[str, Any]) -> str:
-    contents = request_payload.get("contents", [])
-    if not isinstance(contents, list):
-        return ""
-    for content in contents:
-        if not isinstance(content, dict) or content.get("role") != "user":
-            continue
-        parts = content.get("parts", [])
-        if not isinstance(parts, list):
-            continue
-        for part in parts:
-            if isinstance(part, dict) and part.get("text"):
-                return str(part["text"])
-    return ""
-
-
-def _generate_stable_session_id(request_payload: Dict[str, Any]) -> str:
-    first_user_text = _extract_first_user_text(request_payload)
-    if first_user_text:
-        digest = hashlib.sha256(first_user_text.encode("utf-8")).digest()
-        value = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
-        return f"-{value}"
-
-    value = uuid.uuid4().int % 9_000_000_000_000_000_000
-    return f"-{value}"
-
-
-def _ensure_antigravity_session_id(payload: Dict[str, Any], model_name: str) -> None:
-    if "image" in (model_name or "").lower():
-        return
-
-    request_payload = payload.get("request")
-    if not isinstance(request_payload, dict):
-        return
-
-    if request_payload.get("sessionId"):
-        return
-
-    request_payload["sessionId"] = _generate_stable_session_id(request_payload)
-
-
-def _build_labels(model_name: str, trajectory_id: str, step: int) -> Dict[str, str]:
-    used_claude = "claude" in (model_name or "").lower()
-    return {
-        "last_step_index": str(step),
-        "model_enum": model_name or "",
-        "trajectory_id": trajectory_id,
-        "used_claude": str(used_claude).lower(),
-        "used_claude_conservative": str(used_claude).lower(),
-    }
-
-
-def prepare_antigravity_payload(payload: Dict[str, Any], model_name: str) -> Dict[str, Any]:
-    """
-    对 Antigravity 上游 payload 做最终的格式准备：
-    - 设置 userAgent / requestType / requestId
-    - 确保 sessionId / labels
-    - 移除 safetySettings（由 normalize 阶段统一覆盖）
-    - 规范化 toolConfig
-    """
-    payload = copy.deepcopy(payload)
-    if "image" in (model_name or "").lower():
-        payload["requestType"] = "image_gen"
-        payload.setdefault(
-            "requestId",
-            f"image_gen/{int(datetime.now(timezone.utc).timestamp() * 1000)}/{uuid.uuid4()}/12",
-        )
-    else:
-        payload["requestType"] = "agent"
-        trajectory_id = str(uuid.uuid4())
-        step = 1
-        payload.setdefault(
-            "requestId",
-            f"agent/{uuid.uuid4()}/{int(datetime.now(timezone.utc).timestamp() * 1000)}/{trajectory_id}/{step}",
-        )
-
-    request_payload = payload.get("request")
-    if not isinstance(request_payload, dict):
-        return payload
-
-    _ensure_antigravity_session_id(payload, model_name)
-    request_payload.pop("safetySettings", None)
-
-    if "image" not in (model_name or "").lower() and not request_payload.get("labels"):
-        request_payload["labels"] = _build_labels(
-            model_name,
-            str(request_payload.get("sessionId") or trajectory_id),
-            step,
-        )
-
-    # tools 已在 normalize_antigravity_request 阶段统一规范化，此处不再重复处理
-
-    if "image" not in (model_name or "").lower():
-        tool_config = request_payload.get("toolConfig")
-        if not isinstance(tool_config, dict):
-            tool_config = {}
-            request_payload["toolConfig"] = tool_config
-
-        function_config = tool_config.get("functionCallingConfig")
-        if not isinstance(function_config, dict):
-            function_config = {}
-            tool_config["functionCallingConfig"] = function_config
-
-        function_config["mode"] = "VALIDATED"
-
-    return payload
-
-
-async def build_antigravity_payload(
-    model: str,
-    contents: Any,
-    generation_config: Optional[Dict[str, Any]] = None,
-    system_instruction: Optional[Dict[str, Any]] = None,
-    tools: Optional[list] = None,
-    tool_config: Optional[Dict[str, Any]] = None,
-    *,
-    project_id: str = "",
-    enable_credit: bool = False,
-) -> Tuple[str, Dict[str, Any]]:
-    """
-    一站式构建 Antigravity 上游 payload。
-
-    串联三个步骤：
-      build_gemini_request → normalize_antigravity_request → prepare_antigravity_payload
-    并合并 client 侧 build_request_payload 的 project / enableCreditTypes 逻辑。
-
-    Returns:
-        (final_model, payload) — 最终模型名（经过映射）与可直接发送的上游 payload。
-    """
-    gemini_request = build_gemini_request(
-        model, contents, generation_config, system_instruction, tools, tool_config
-    )
-    normalized = await normalize_antigravity_request(gemini_request)
-    final_model = normalized.pop("model")
-
-    payload: Dict[str, Any] = {
-        "model": final_model,
-        "project": project_id,
-        "request": normalized,
-    }
-    if enable_credit:
-        payload["enabledCreditTypes"] = ["GOOGLE_ONE_AI"]
-
-    return final_model, prepare_antigravity_payload(payload, final_model)

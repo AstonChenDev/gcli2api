@@ -1,0 +1,275 @@
+"""
+请求日志路由模块 - 处理 /usage-logs/* 相关的HTTP请求
+查询 usage_log 表：分页列表、聚合统计、清理、请求体详细日志读取
+"""
+
+import asyncio
+import math
+import time
+from typing import Literal, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+
+from config import get_usage_log_enabled
+from log import log
+from src.request_body_log import delete_orphan_request_body_logs, delete_request_body_logs, read_request_body_log
+from src.usage_log import flush_usage_logs
+from src.storage.database import get_database
+from src.utils import verify_panel_token
+
+
+# 创建路由器
+router = APIRouter(prefix="/usage-logs", tags=["usage-logs"])
+
+
+def overall_filters(start_timestamp, end_timestamp, model_name):
+    if any(value is not None and not math.isfinite(value) for value in (start_timestamp, end_timestamp)):
+        raise HTTPException(400, "时间必须是有限数值")
+    if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
+        raise HTTPException(400, "开始时间不能晚于结束时间")
+    return dict(start_timestamp=start_timestamp, end_timestamp=end_timestamp, model_name=model_name.strip())
+
+
+@router.get("/model-tokens")
+async def get_model_token_stats(
+    token: str = Depends(verify_panel_token),
+    start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None,
+    model_name: str = "", credential_email: Optional[str] = None,
+):
+    filters = overall_filters(start_timestamp, end_timestamp, model_name)
+    filters["credential_email"] = credential_email.strip() if credential_email is not None else None
+    database = await get_database()
+    await flush_usage_logs()
+    result = await database.model_token_stats(**filters)
+    result["logging_enabled"] = await get_usage_log_enabled()
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/overall-stats")
+async def get_overall_usage_stats(
+    token: str = Depends(verify_panel_token),
+    start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None,
+    model_name: str = "",
+):
+    filters = overall_filters(start_timestamp, end_timestamp, model_name)
+    database = await get_database()
+    # Match /list: include completed calls still waiting in this worker's queue.
+    await flush_usage_logs()
+    result = await database.overall_usage_stats(**filters)
+    result["logging_enabled"] = await get_usage_log_enabled()
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/overall-errors")
+async def get_overall_usage_errors(
+    token: str = Depends(verify_panel_token), scope: Literal["requests", "attempts"] = "requests",
+    offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100),
+    start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None,
+    model_name: str = "", status_code: Optional[int] = None,
+):
+    filters = overall_filters(start_timestamp, end_timestamp, model_name)
+    database = await get_database()
+    await flush_usage_logs()
+    result = await database.overall_usage_errors(scope=scope, offset=offset, limit=limit,
+        status_code=status_code, **filters)
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/lookup")
+async def lookup_request(
+    identifier: str = Query(min_length=1, max_length=160),
+    id_type: Literal["auto", "request_id", "response_id", "log_id"] = "auto",
+    offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100),
+    token: str = Depends(verify_panel_token),
+):
+    identifier = identifier.strip()
+    if not identifier:
+        raise HTTPException(400, "请输入要查询的 ID")
+    if id_type == "log_id" and not (identifier.isascii() and identifier.isdecimal() and len(identifier) <= 19 and 0 < int(identifier) <= 9223372036854775807):
+        raise HTTPException(400, "日志 ID 必须是有效的正整数")
+    database = await get_database()
+    await flush_usage_logs()
+    items, total = await database.query_usage_logs(identifier=identifier, id_type=id_type, offset=offset, limit=limit)
+    return JSONResponse(content={"items": items, "total": total, "offset": offset, "limit": limit}, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/credential-stats")
+async def get_credential_usage_stats(
+    token: str = Depends(verify_panel_token),
+    offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200),
+    start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None,
+    model_name: str = "", credential_email: Optional[str] = None,
+):
+    if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
+        raise HTTPException(400, "开始时间不能晚于结束时间")
+    database = await get_database()
+    await flush_usage_logs()
+    result = await database.credential_usage_stats(offset=offset, limit=limit,
+        start_timestamp=start_timestamp, end_timestamp=end_timestamp,
+        model_name=model_name.strip(), credential_email=credential_email.strip() if credential_email is not None else None)
+    result["logging_enabled"] = await get_usage_log_enabled()
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/credential-errors")
+async def get_credential_usage_errors(
+    credential_email: str, model_name: str,
+    token: str = Depends(verify_panel_token),
+    offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100),
+    start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None,
+    status_code: Optional[int] = None,
+):
+    if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
+        raise HTTPException(400, "开始时间不能晚于结束时间")
+    database = await get_database()
+    await flush_usage_logs()
+    return JSONResponse(content=await database.credential_usage_errors(offset=offset, limit=limit,
+        status_code=status_code, start_timestamp=start_timestamp, end_timestamp=end_timestamp,
+        model_name=model_name.strip(), credential_email=credential_email.strip()), headers={"Cache-Control": "no-store"})
+
+
+@router.get("/list")
+async def get_usage_logs(
+    token: str = Depends(verify_panel_token),
+    offset: int = 0,
+    limit: int = 50,
+    start_timestamp: Optional[float] = None,
+    end_timestamp: Optional[float] = None,
+    model_name: str = "",
+    credential_email: str = "",
+    api_format: str = "",
+    status: str = "all",
+    is_stream: Optional[bool] = None,
+    status_code: Optional[int] = None,
+):
+    """分页查询请求日志（新 -> 旧）"""
+    try:
+        if limit < 1 or limit > 1000:
+            raise HTTPException(status_code=400, detail="limit 必须在 1-1000 之间")
+        if offset < 0:
+            raise HTTPException(status_code=400, detail="offset 不能为负数")
+
+        database = await get_database()
+        # 批量写队列中的待落库日志先刷盘，保证面板看到最新数据
+        await flush_usage_logs()
+        items, total = await database.query_usage_logs(
+            offset=offset,
+            limit=limit,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            model_name=model_name.strip(),
+            credential_email=credential_email.strip(),
+            api_format=api_format.strip(),
+            status=status,
+            is_stream=is_stream,
+            status_code=status_code,
+        )
+        return JSONResponse(content={"items": items, "total": total})
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"查询请求日志失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/stats")
+async def get_usage_stats(
+    token: str = Depends(verify_panel_token),
+    start_timestamp: Optional[float] = None,
+    end_timestamp: Optional[float] = None,
+    model_name: str = "",
+    credential_email: str = "",
+    api_format: str = "",
+):
+    """聚合统计：请求数 / 成功失败 / token 汇总 / 平均耗时 / 每模型分布"""
+    try:
+        database = await get_database()
+        # 批量写队列中的待落库日志先刷盘，保证统计完整
+        await flush_usage_logs()
+        stats = await database.usage_log_stats(
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            model_name=model_name.strip(),
+            credential_email=credential_email.strip(),
+            api_format=api_format.strip(),
+        )
+        return JSONResponse(content=stats)
+    except Exception as e:
+        log.error(f"查询日志统计失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/clear")
+async def clear_logs(
+    token: str = Depends(verify_panel_token),
+    days: int = 30,
+):
+    """清理 N 天前的日志，返回删除条数"""
+    try:
+        if days < 0:
+            raise HTTPException(status_code=400, detail="天数不能为负数")
+        cutoff = time.time() - days * 86400
+        await flush_usage_logs()
+        database = await get_database()
+        deleted, paths = await database.delete_usage_logs_with_files(cutoff)
+        files_deleted = await asyncio.to_thread(delete_request_body_logs, paths)
+        files_deleted += await delete_orphan_request_body_logs(database, cutoff)
+        return JSONResponse(content={
+            "message": "已清理已有日志" if days == 0 else f"已清理 {days} 天前的日志",
+            "deleted": deleted,
+            "files_deleted": files_deleted,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"清理日志失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/truncate")
+async def truncate_logs(token: str = Depends(verify_panel_token)):
+    """清空操作开始前的日志，保留并发完成的新请求记录。"""
+    try:
+        cutoff = time.time()
+        await flush_usage_logs()
+        database = await get_database()
+        deleted, paths = await database.delete_usage_logs_with_files(cutoff)
+        files_deleted = await asyncio.to_thread(delete_request_body_logs, paths)
+        files_deleted += await delete_orphan_request_body_logs(database, cutoff)
+
+        return JSONResponse(content={
+            "message": "已清空已有日志，保留清空期间新增的记录",
+            "deleted": deleted,
+            "files_deleted": files_deleted,
+        })
+    except Exception as e:
+        log.error(f"清空日志失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/request-body")
+async def get_request_body_log(
+    path: str,
+    token: str = Depends(verify_panel_token),
+):
+    """按文件索引从磁盘读取请求体详细日志（JSON）"""
+    try:
+        data = await asyncio.to_thread(read_request_body_log, path)
+        if data is None:
+            raise HTTPException(status_code=404, detail="详细日志文件不存在或已清理")
+        return JSONResponse(content=data, headers={"Cache-Control": "no-store"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"读取请求体详细日志失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/config")
+async def get_usage_log_config(token: str = Depends(verify_panel_token)):
+    """获取日志开关配置"""
+    return JSONResponse(content={
+        "enabled": await get_usage_log_enabled(),
+    })

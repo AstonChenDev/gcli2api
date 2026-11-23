@@ -1,0 +1,954 @@
+import {
+  AlertCircle,
+  Ban,
+  BarChart3,
+  CheckCircle,
+  ChevronDown,
+  ChevronUp,
+  Clock,
+  Download,
+  Loader2,
+  RefreshCw,
+  Shield,
+  Snowflake,
+  Trash2,
+  Zap,
+} from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import Modal from "../components/Modal";
+import Select from "../components/Select";
+import api from "../api";
+import QuotaSummary, { quotaGroups } from "../components/QuotaSummary";
+import CredentialQuota from "../components/CredentialQuota";
+import CredentialModels from "../components/CredentialModels";
+import CredentialProxy from "../components/CredentialProxy";
+import CredentialLimits from "../components/CredentialLimits";
+
+const hasActiveCooldown = (item, now) =>
+  Object.values(item.model_cooldowns || {}).some(until => until > now);
+
+export default function Credentials() {
+  const [items, setItems] = useState([]);
+  const [proxyItems, setProxyItems] = useState(null);
+  const [proxyLoadFailed, setProxyLoadFailed] = useState(false);
+  const [proxyReload, setProxyReload] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    setProxyLoadFailed(false);
+    api.get("/proxies", { signal: controller.signal })
+      .then(res => setProxyItems(res.data.items))
+      .catch(() => { if (!controller.signal.aborted) setProxyLoadFailed(true); });
+    return () => controller.abort();
+  }, [proxyReload]);
+  const savedEditVersion = useRef(0);
+  const applyCredentialEdit = ({ email, ...fields }) => {
+    savedEditVersion.current += 1;
+    setItems(rows => rows.map(row => row.email === email ? { ...row, ...fields } : row));
+  };
+  const [modelsCredential, setModelsCredential] = useState(null);
+  const [noteCredential, setNoteCredential] = useState(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteSaving, setNoteSaving] = useState(false);
+  const [noteError, setNoteError] = useState("");
+  const saveNote = async (event) => {
+    event.preventDefault(); setNoteSaving(true); setNoteError("");
+    try {
+      const { data } = await api.patch(`/creds/note/${encodeURIComponent(noteCredential.email)}`, { note: noteDraft });
+      applyCredentialEdit(data);
+      setNoteCredential(null);
+    } catch (err) { setNoteError(err.response?.data?.detail || "保存备注失败"); }
+    finally { setNoteSaving(false); }
+  };
+  const [stats, setStats] = useState({ total: 0, normal: 0, disabled: 0 });
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [errorCodeFilter, setErrorCodeFilter] = useState("all");
+  const [cooldownFilter, setCooldownFilter] = useState("all");
+  const [tierFilter, setTierFilter] = useState("all");
+  const [loading, setLoading] = useState(true);
+  const [listError, setListError] = useState("");
+  const reloadList = useRef(null);
+  const fetchCreds = useCallback(() => reloadList.current?.(), []);
+  const [selected, setSelected] = useState(new Set());
+  const [message, setMessage] = useState(null);
+  const [errorModal, setErrorModal] = useState(null);
+  const errorRequest = useRef(null);
+  useEffect(() => () => errorRequest.current?.abort(), []);
+  const [clearTargets, setClearTargets] = useState(null);
+  const [clearScope, setClearScope] = useState("all");
+  const [clearing, setClearing] = useState(false);
+  const [clearError, setClearError] = useState("");
+  const openClearCooldown = (emails) => {
+    setClearTargets(emails); setClearScope("all"); setClearError("");
+  };
+  const clearCooldown = async (event) => {
+    event.preventDefault(); setClearing(true); setClearError("");
+    try {
+      const { data } = await api.post("/creds/clear-cooldown", { emails: clearTargets, scope: clearScope });
+      setClearTargets(null);
+      showMessage(data.errors?.length ? "error" : "success", data.message);
+      await fetchCreds();
+    } catch (err) {
+      setClearError(err.response?.data?.detail || "清除 CD 失败");
+    } finally { setClearing(false); }
+  };
+  const [busyFiles, setBusyFiles] = useState(new Set());
+  const [now, setNow] = useState(Date.now() / 1000);
+  // 额度预览相关状态
+  const [quotaModal, setQuotaModal] = useState(null); // { email } 额度弹窗
+  const [quotaCache, setQuotaCache] = useState({}); // 缓存额度数据 { email: { claude, gemini } | { error } }
+
+  const [quotaLoading, setQuotaLoading] = useState(new Set());
+  const quotaCacheRef = useRef({});
+  const quotaRequests = useRef(new Map());
+  const quotaController = useRef(new AbortController());
+  const previousAutoQuotaEmails = useRef(new Set());
+  const [testModel, setTestModel] = useState("gemini-4-argon-medium");
+  const [batchProgress, setBatchProgress] = useState(null);
+  const [testResults, setTestResults] = useState({});
+  const stopBatch = useRef(false);
+  const [batchRunning, setBatchRunning] = useState(false);
+
+  useEffect(() => {
+    quotaController.current = new AbortController();
+    return () => { quotaController.current.abort(); stopBatch.current = true; };
+  }, []);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now() / 1000), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  useLayoutEffect(() => {
+    let activeRequest;
+    const load = async () => {
+      activeRequest?.abort();
+      const controller = new AbortController();
+      activeRequest = controller;
+      const versionAtStart = savedEditVersion.current;
+      setLoading(true);
+      setListError("");
+      setSelected(new Set());
+      try {
+        const { data } = await api.get("/creds/status", {
+          signal: controller.signal,
+          params: {
+            offset: (page - 1) * pageSize, limit: pageSize,
+            status_filter: statusFilter, error_code_filter: errorCodeFilter,
+            cooldown_filter: cooldownFilter, tier_filter: tierFilter,
+          },
+        });
+        if (controller.signal.aborted) return;
+        // The server may have read these rows before an overlapping PATCH committed.
+        if (versionAtStart !== savedEditVersion.current) return load();
+        setItems(data.items);
+        setTotal(data.total);
+        setStats(data.stats || { total: 0, normal: 0, disabled: 0 });
+        const lastPage = Math.max(1, Math.ceil(data.total / pageSize));
+        if (page > lastPage) setPage(lastPage);
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        setItems([]);
+        setTotal(0);
+        setListError(err.response?.data?.detail || "加载凭证失败");
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    };
+    // A mutation started on an earlier page may finish after the filters change.
+    reloadList.current = load;
+    load();
+    return () => {
+      activeRequest.abort();
+      reloadList.current = null;
+    };
+  }, [page, pageSize, statusFilter, errorCodeFilter, cooldownFilter, tierFilter]);
+
+  const showMessage = useCallback((type, text, title) => {
+    setMessage({ type, text, title: title || (type === "success" ? "操作成功" : type === "error" ? "操作失败" : "提示") });
+  }, []);
+
+  const setBusy = (email, busy) => {
+    setBusyFiles((prev) => {
+      const next = new Set(prev);
+      if (busy) next.add(email);
+      else next.delete(email);
+      return next;
+    });
+  };
+
+  const doAction = async (email, action) => {
+    setBusy(email, true);
+    try {
+      const res = await api.post("/creds/action", { email, action });
+      showMessage("success", res.data.message);
+      fetchCreds();
+    } catch (err) {
+      showMessage("error", err.response?.data?.detail || "操作失败");
+    } finally {
+      setBusy(email, false);
+    }
+  };
+
+  const doBatchAction = async (action) => {
+    if (selected.size === 0) return;
+    setBusy("__batch__", true);
+    try {
+      const res = await api.post("/creds/batch-action", {
+        action,
+        emails: Array.from(selected),
+      });
+      showMessage(res.data.errors?.length ? "error" : "success", res.data.message);
+      fetchCreds();
+    } catch (err) {
+      showMessage("error", err.response?.data?.detail || "批量操作失败");
+    } finally {
+      setBusy("__batch__", false);
+    }
+  };
+
+  const verifyProject = async (email) => {
+    setBusy(email, true);
+    try {
+      const res = await api.post(`/creds/verify-project/${encodeURIComponent(email)}`);
+      if (res.data.success) {
+        showMessage(
+          "success",
+          `Project=${res.data.project_id}, Tier=${res.data.subscription_tier}`,
+          `检验成功: ${email}`
+        );
+      } else {
+        showMessage("error", res.data.message || res.data.error || "检验失败", `检验失败: ${email}`);
+      }
+      fetchCreds();
+    } catch (err) {
+      showMessage(
+        "error",
+        err.response?.data?.detail || err.response?.data?.error || err.response?.data?.message || "检验失败",
+        `检验失败: ${email}`
+      );
+    } finally {
+      setBusy(email, false);
+    }
+  };
+
+  const runTest = async (email, model) => {
+    setBusy(email, true);
+    let result;
+    try {
+      const res = await api.post(`/creds/test/${encodeURIComponent(email)}`, null, {
+        params: { model }, timeout: 75000,
+      });
+      result = { email, model, status: res.data.status_code || res.status, message: res.data.message || "测试成功" };
+    } catch (err) {
+      const data = err.response?.data || {};
+      const raw = data.error || data.detail || data.message || (err.code === "ECONNABORTED" ? "测试超时" : "网络请求失败");
+      result = { email, model, status: err.response?.status || 0, message: typeof raw === "string" ? raw : JSON.stringify(raw) };
+    } finally { setBusy(email, false); }
+    setTestResults(prev => ({ ...prev, [email]: result }));
+    return result;
+  };
+
+  const testCredential = async (email) => {
+    if (!testModel.trim()) return showMessage("error", "请填写测试模型");
+    const result = await runTest(email, testModel.trim());
+    showMessage(result.status === 200 ? "success" : result.status === 429 ? "info" : "error",
+      `模型：${result.model}\nHTTP ${result.status || "—"}\n${result.message}`, `测试结果：${email}`);
+    fetchCreds();
+  };
+
+  const batchTest = async () => {
+    if (!selected.size || !testModel.trim() || batchRunning) return;
+    const queue = [...selected];
+    const model = testModel.trim();
+    let index = 0;
+    stopBatch.current = false;
+    setBatchRunning(true);
+    setBusy("__batch__", true);
+    setBatchProgress({ total: queue.length, done: 0, success: 0, limited: 0, failed: 0, results: [] });
+    try {
+      await Promise.all(Array.from({ length: Math.min(3, queue.length) }, async () => {
+        while (!stopBatch.current && index < queue.length) {
+          const result = await runTest(queue[index++], model);
+          setBatchProgress(prev => ({ ...prev, done: prev.done + 1,
+            success: prev.success + (result.status === 200 ? 1 : 0),
+            limited: prev.limited + (result.status === 429 ? 1 : 0),
+            failed: prev.failed + (![200, 429].includes(result.status) ? 1 : 0),
+            results: [...prev.results, result],
+          }));
+        }
+      }));
+      await fetchCreds();
+    } finally { setBatchRunning(false); setBusy("__batch__", false); }
+  };
+
+  const requestQuota = useCallback((email, force = false) => {
+    const cached = quotaCacheRef.current[email];
+    if (!force && cached && Date.now() - cached.updatedAt < 60000) return Promise.resolve();
+    if (quotaRequests.current.has(email)) return quotaRequests.current.get(email);
+    setQuotaLoading(prev => new Set([...prev, email]));
+    const signal = quotaController.current.signal;
+    const task = (async () => {
+      let value;
+      try {
+        const res = await api.get(`/creds/quota/${encodeURIComponent(email)}`, { timeout: 75000, signal });
+        value = res.data.success ? { groups: quotaGroups(res.data) } : { error: res.data.error || "获取额度失败" };
+      } catch (err) {
+        if (signal.aborted) return;
+        value = { error: err.response?.data?.detail || err.response?.data?.error || "额度查询失败，点击刷新重试" };
+      } finally {
+        quotaRequests.current.delete(email);
+        if (!signal.aborted) setQuotaLoading(prev => { const next = new Set(prev); next.delete(email); return next; });
+      }
+      if (signal.aborted) return;
+      value.updatedAt = Date.now();
+      quotaCacheRef.current[email] = value;
+      setQuotaCache(prev => ({ ...prev, [email]: value }));
+    })();
+    quotaRequests.current.set(email, task);
+    return task;
+  }, []);
+
+  // Only restart the queue when eligibility changes, not on each countdown tick.
+  const autoQuotaEmails = JSON.stringify(items
+    .filter(item => !item.disabled && !hasActiveCooldown(item, now))
+    .map(item => item.email));
+
+  useEffect(() => {
+    let cancelled = false;
+    let index = 0;
+    const emails = JSON.parse(autoQuotaEmails);
+    const previous = previousAutoQuotaEmails.current;
+    previousAutoQuotaEmails.current = new Set(emails);
+    const workers = Array.from({ length: Math.min(3, emails.length) }, async () => {
+      while (!cancelled && index < emails.length) {
+        const email = emails[index++];
+        // After CD expires, obtain fresh quota even if an old cache still exists.
+        await requestQuota(email, !previous.has(email));
+      }
+    });
+    Promise.all(workers);
+    return () => { cancelled = true; };
+  }, [autoQuotaEmails, requestQuota]);
+
+  const refreshPageQuotas = async () => {
+    setBusy("__quota__", true);
+    let index = 0;
+    const emails = items.filter(item => !item.disabled && !hasActiveCooldown(item, Date.now() / 1000)).map(item => item.email);
+    try {
+      await Promise.all(Array.from({ length: Math.min(3, emails.length) }, async () => {
+        while (index < emails.length) await requestQuota(emails[index++], true);
+      }));
+    } finally { setBusy("__quota__", false); }
+  };
+
+  const openQuotaModal = (email) => { setQuotaModal({ email }); requestQuota(email, true); };
+
+  const downloadSelected = async () => {
+    if (!selected.size) return;
+    setBusy("__batch__", true);
+    try {
+      const res = await api.post("/creds/download-selected", { emails: [...selected] }, { responseType: "blob" });
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement("a");
+      a.href = url; a.download = "antigravity_selected_credentials.zip";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showMessage("success", `已打包导出选中的 ${selected.size} 个凭证`);
+    } catch (err) {
+      let detail = "选中凭证导出失败";
+      try { detail = JSON.parse(await err.response.data.text()).detail || detail; } catch { /* fallback */ }
+      showMessage("error", detail);
+    } finally { setBusy("__batch__", false); }
+  };
+
+  const exportCredential = async (email) => {
+    try {
+      const res = await api.get(`/creds/export/${encodeURIComponent(email)}`, {
+        responseType: "blob",
+      });
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${email}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showMessage("success", `已导出 ${email}.json`);
+    } catch (err) {
+      showMessage("error", err.response?.data?.detail || "导出失败");
+    }
+  };
+
+  const downloadAll = async () => {
+    setBusy("__batch__", true);
+    try {
+      const res = await api.get("/creds/download-all", {
+        responseType: "blob",
+      });
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "antigravity_credentials.zip";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      showMessage("error", err.response?.data?.detail || "下载失败");
+    } finally {
+      setBusy("__batch__", false);
+    }
+  };
+
+  const openErrors = async (email) => {
+    errorRequest.current?.abort();
+    const request = new AbortController();
+    errorRequest.current = request;
+    try {
+      const res = await api.get(`/creds/errors/${encodeURIComponent(email)}`, { signal: request.signal });
+      if (!request.signal.aborted) setErrorModal(res.data);
+    } catch (err) {
+      if (!request.signal.aborted) showMessage("error", err.response?.data?.detail || "获取错误信息失败");
+    }
+  };
+
+  const toggleSelect = (email) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(email)) next.delete(email);
+      else next.add(email);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    if (selected.size === items.length) setSelected(new Set());
+    else setSelected(new Set(items.map((i) => i.email)));
+  };
+
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  const formatTime = (ts) => {
+    if (!ts) return "-";
+    return new Date(ts * 1000).toLocaleString();
+  };
+
+  const getCooldownText = (cooldowns) => {
+    const active = Object.entries(cooldowns || {}).filter(
+      ([, until]) => until > now
+    );
+    if (!active.length) return null;
+    const longest = Math.max(...active.map(([, until]) => until));
+    const remain = longest - now;
+    const h = Math.floor(remain / 3600);
+    const m = Math.floor((remain % 3600) / 60);
+    const s = Math.floor(remain % 60);
+    return h > 0 ? `${h}h${m}m` : m > 0 ? `${m}m${s}s` : `${s}s`;
+  };
+
+  const tierStyle = (tier) =>
+    tier === "ultra" || tier === "ultra_lite"
+      ? "bg-red-500/10 text-red-700 border-red-500/30"
+      : tier === "pro"
+      ? "bg-amber-500/10 text-amber-700 border-amber-500/30"
+      : "bg-blue-500/10 text-blue-700 border-blue-500/30";
+
+  return (
+    <div className="space-y-4 sm:space-y-6">
+      {/* 消息弹窗 */}
+      {message && (
+        <Modal
+          type={message.type}
+          title={message.title}
+          onClose={() => setMessage(null)}
+        >
+          <span className="whitespace-pre-wrap">{message.text}</span>
+        </Modal>
+      )}
+
+      {/* 状态统计 */}
+      <div className="grid grid-cols-3 gap-2 sm:gap-4">
+        <div className="bg-slate-50 border border-slate-300 rounded-xl p-3 sm:p-4 text-center">
+          <div className="text-xl sm:text-2xl font-bold text-slate-900">{stats.total}</div>
+          <div className="text-xs text-slate-500 mt-0.5">总计</div>
+        </div>
+        <div className="bg-emerald-50 border border-emerald-700/30 rounded-xl p-3 sm:p-4 text-center">
+          <div className="text-xl sm:text-2xl font-bold text-emerald-700">{stats.normal}</div>
+          <div className="text-xs text-slate-500 mt-0.5">正常</div>
+        </div>
+        <div className="bg-red-50 border border-red-700/30 rounded-xl p-3 sm:p-4 text-center">
+          <div className="text-xl sm:text-2xl font-bold text-red-700">{stats.disabled}</div>
+          <div className="text-xs text-slate-500 mt-0.5">禁用</div>
+        </div>
+      </div>
+
+      {/* 操作按钮 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={fetchCreds}
+          disabled={loading}
+          className="btn btn-secondary text-xs sm:text-sm px-3 py-1.5 sm:px-4 sm:py-2 flex items-center gap-1.5"
+        >
+          <RefreshCw size={15} className={loading ? "animate-spin" : ""} />
+          刷新状态
+        </button>
+        <button
+          onClick={downloadAll}
+          disabled={busyFiles.has("__batch__")}
+          className="btn btn-secondary text-xs sm:text-sm px-3 py-1.5 sm:px-4 sm:py-2 flex items-center gap-1.5"
+        >
+          <Download size={15} />
+          导出全部
+        </button>
+      </div>
+
+      <button onClick={refreshPageQuotas} disabled={loading || busyFiles.has("__quota__")} title="仅刷新本页已启用且未进入 CD 的凭证" className="btn btn-secondary text-xs flex items-center gap-1.5">
+        <RefreshCw size={14} className={busyFiles.has("__quota__") ? "animate-spin" : ""} /> 刷新本页额度
+      </button>
+
+      {/* 筛选器 */}
+      <div className="grid grid-cols-2 sm:flex sm:flex-wrap gap-2 sm:gap-3 text-sm">
+        <Select
+          value={statusFilter}
+          onChange={(v) => {
+            setStatusFilter(v);
+            setPage(1);
+          }}
+          className="w-full sm:w-32"
+          options={[
+            { value: "all", label: "全部凭证" },
+            { value: "enabled", label: "仅启用" },
+            { value: "disabled", label: "仅禁用" },
+          ]}
+        />
+        <Select
+          value={errorCodeFilter}
+          onChange={(v) => {
+            setErrorCodeFilter(v);
+            setPage(1);
+          }}
+          className="w-full sm:w-32"
+          options={[
+            { value: "all", label: "错误码: 全部" },
+            { value: "none", label: "无错误" },
+            { value: "400", label: "400" },
+            { value: "403", label: "403" },
+            { value: "404", label: "404" },
+            { value: "429", label: "429" },
+            { value: "500", label: "500" },
+          ]}
+        />
+        <Select
+          value={cooldownFilter}
+          onChange={(v) => {
+            setCooldownFilter(v);
+            setPage(1);
+          }}
+          className="w-full sm:w-32"
+          options={[
+            { value: "all", label: "配额CD: 全部" },
+            { value: "in_cooldown", label: "配额CD中" },
+            { value: "no_cooldown", label: "无配额CD" },
+          ]}
+        />
+        <Select
+          value={tierFilter}
+          onChange={(v) => {
+            setTierFilter(v);
+            setPage(1);
+          }}
+          className="w-full sm:w-32"
+          options={[
+            { value: "all", label: "Tier: 全部" },
+            { value: "free", label: "Free" },
+            { value: "pro", label: "Pro" },
+            { value: "ultra", label: "Ultra" },
+            { value: "ultra_lite", label: "Ultra Lite" },
+          ]}
+        />
+        <Select
+          value={pageSize}
+          onChange={(v) => {
+            setPageSize(Number(v));
+            setPage(1);
+          }}
+          className="w-full sm:w-32"
+          options={[20, 50, 100, 200, 500, 1000].map((n) => ({
+            value: n,
+            label: `每页 ${n}`,
+          }))}
+        />
+      </div>
+
+      {/* 批量操作 */}
+      <div className="card p-3 sm:p-4">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
+          <label className="flex items-center gap-2 text-slate-600 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={selected.size === items.length && items.length > 0}
+              disabled={loading || !items.length}
+              onChange={toggleSelectAll}
+              className="accent-purple-600 w-4 h-4"
+            />
+            全选本页
+          </label>
+          <span className="text-slate-500 text-xs">已选 {selected.size} 项</span>
+          <label className="flex items-center gap-2 text-xs text-slate-600">
+            测试模型
+            <input aria-label="测试模型" value={testModel} onChange={e => setTestModel(e.target.value)} disabled={batchRunning} className="input w-56 text-xs" maxLength={128} />
+          </label>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={batchTest} disabled={!selected.size || !testModel.trim() || busyFiles.has("__batch__")} className="btn btn-primary text-xs px-3 py-1.5 disabled:opacity-40">批量测试</button>
+            <button onClick={() => doBatchAction("refresh_models")} disabled={!selected.size || busyFiles.has("__batch__")} className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">批量刷新模型</button>
+            <button onClick={downloadSelected} disabled={!selected.size || busyFiles.has("__batch__")} className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">导出选中</button>
+            <button onClick={() => openClearCooldown([...selected])} disabled={!selected.size || busyFiles.has("__batch__")} className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">批量清除 CD</button>
+            <button
+              onClick={() => doBatchAction("enable")}
+              disabled={selected.size === 0 || busyFiles.has("__batch__")}
+              className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40"
+            >
+              批量启用
+            </button>
+            <button
+              onClick={() => doBatchAction("disable")}
+              disabled={selected.size === 0 || busyFiles.has("__batch__")}
+              className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40"
+            >
+              批量禁用
+            </button>
+            <button
+              onClick={() => doBatchAction("delete")}
+              disabled={selected.size === 0 || busyFiles.has("__batch__")}
+              className="btn btn-danger text-xs px-3 py-1.5 disabled:opacity-40"
+            >
+              批量删除
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {batchProgress && <div className="card p-4 text-sm space-y-2" aria-live="polite">
+        <div className="flex flex-wrap items-center gap-3">
+          <span>{batchRunning ? "测试中" : batchProgress.done < batchProgress.total ? "已停止" : "测试完成"}：{batchProgress.done}/{batchProgress.total}</span>
+          <span className="text-emerald-700">成功 {batchProgress.success}</span>
+          <span className="text-amber-700">限流 {batchProgress.limited}</span>
+          <span className="text-red-700">失败 {batchProgress.failed}</span>
+          {batchRunning && <button onClick={() => { stopBatch.current = true; }} className="btn btn-secondary text-xs">停止后续测试</button>}
+        </div>
+        <details><summary className="cursor-pointer text-slate-600">查看逐项结果</summary><div className="max-h-64 overflow-auto mt-2 space-y-2">
+          {batchProgress.results.map(r => <div key={r.email} className="border-b border-slate-100 pb-2 text-xs break-all"><strong>{r.email}</strong> · {r.model} · HTTP {r.status || "—"}<div className={r.status === 200 ? "text-emerald-700" : "text-red-700"}>{r.message}</div></div>)}
+        </div></details>
+      </div>}
+
+      {/* 凭证卡片列表 */}
+      {proxyLoadFailed && <p role="alert" className="text-sm text-red-700">
+        代理列表加载失败。<button className="underline" onClick={() => setProxyReload(n => n + 1)}>重试</button>
+      </p>}
+      {proxyItems?.length === 0 && items.length > 0 && <p className="text-sm text-slate-600">
+        要为凭证指定代理，请先在“IP 管理”中添加代理 IP。
+      </p>}
+      {loading ? (
+        <div className="flex items-center justify-center py-12">
+          <Loader2 className="animate-spin text-purple-500" size={28} />
+        </div>
+      ) : listError ? (
+        <p role="alert" className="card text-center py-12 text-red-700 text-sm">{listError}</p>
+      ) : items.length === 0 ? (
+        <div className="card text-center py-12 text-slate-500 text-sm">
+          {stats.total > 0 ? "没有符合当前筛选条件的凭证。" : "没有凭证。请先通过 OAuth 认证或批量导入添加凭证。"}
+        </div>
+      ) : (
+        <div className="grid gap-3 sm:gap-4 grid-cols-1 md:grid-cols-2 xl:grid-cols-3">
+          {items.map((cred) => {
+            const cooldownText = getCooldownText(cred.model_cooldowns);
+            const busy = busyFiles.has(cred.email);
+            return (
+              <div
+                key={cred.email}
+                className={`card p-3 sm:p-4 space-y-3 transition-colors ${
+                  cred.disabled ? "border-red-500/30" : ""
+                }`}
+              >
+                {/* 头部：选择框 + 邮箱 + 状态标签 */}
+                <div className="flex items-start gap-2.5">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(cred.email)}
+                    onChange={() => toggleSelect(cred.email)}
+                    className="accent-purple-600 w-4 h-4 flex-shrink-0 mt-0.5"
+                  />
+                  <div className="flex-1 min-w-0 space-y-1.5">
+                    <div className="text-sm font-medium text-slate-900 break-all leading-snug">
+                      {cred.email}
+                    </div>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span
+                        className={`text-xs px-2 py-0.5 rounded-full border ${tierStyle(cred.tier)}`}
+                      >
+                        {cred.tier === "ultra_lite" ? "Ultra Lite" : cred.tier === "ultra" ? "Ultra" : cred.tier || "pro"}
+                      </span>
+                      {cred.disabled ? (
+                        <span className="text-red-700 text-xs flex items-center gap-1">
+                          <Ban size={12} /> 禁用
+                        </span>
+                      ) : (
+                        <span className="text-emerald-700 text-xs flex items-center gap-1">
+                          <CheckCircle size={12} /> 启用
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="text-xs text-slate-600 space-y-1">
+                  <div className="whitespace-pre-wrap break-words">备注：{cred.note || "未设置"}</div>
+                  <button className="text-purple-700 underline" onClick={() => { setNoteCredential(cred); setNoteDraft(cred.note || ""); setNoteError(""); }}>{cred.note ? "编辑备注" : "添加备注"}</button>
+                </div>
+                <CredentialProxy credential={cred} proxies={proxyItems} onSaved={applyCredentialEdit} />
+                <CredentialLimits credential={cred} onSaved={applyCredentialEdit} />
+                {/* 信息区 */}
+                <div className="space-y-1 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    {cooldownText ? (
+                      <span className="text-cyan-700 flex items-center gap-1">
+                        <Snowflake size={12} /> 配额CD {cooldownText}
+                      </span>
+                    ) : (
+                      <span className="text-slate-500 flex items-center gap-1">
+                        <Clock size={12} /> 无配额CD
+                      </span>
+                    )}
+                    {cred.error_codes?.length ? (
+                      <button
+                        onClick={() => openErrors(cred.email)}
+                        className="text-red-700 hover:text-red-700 flex items-center gap-1"
+                      >
+                        <AlertCircle size={12} />
+                        {cred.error_codes.join(",")}
+                      </button>
+                    ) : (
+                      <span className="text-slate-500 flex items-center gap-1">
+                        <CheckCircle size={12} /> 无错误
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1 text-slate-500">
+                    <Clock size={12} className="flex-shrink-0" />
+                    <span className="truncate" title={formatTime(cred.last_success)}>
+                      {formatTime(cred.last_success)}
+                    </span>
+                  </div>
+                </div>
+
+                <CredentialQuota key={`${cred.email}:${Boolean(cooldownText)}`}
+                  email={cred.email} cooling={Boolean(cooldownText)} disabled={cred.disabled}
+                  data={quotaCache[cred.email]} loading={quotaLoading.has(cred.email)} onRequest={requestQuota} />
+                <button onClick={() => setModelsCredential(cred)} className="w-full text-xs px-3 py-2 rounded-lg border border-purple-200 text-purple-700 hover:bg-purple-50 text-left">
+                  查看可用模型 →
+                </button>
+                {testResults[cred.email] && <div className={`text-xs ${testResults[cred.email].status === 200 ? "text-emerald-700" : "text-red-700"}`}>最近测试：{testResults[cred.email].model} · HTTP {testResults[cred.email].status || "—"}</div>}
+
+                {/* 操作按钮（2×3 网格铺满卡片） */}
+                <div className="grid grid-cols-3 gap-1.5 pt-1 border-t border-slate-200">
+                  {busy ? (
+                    <div className="col-span-3 flex items-center justify-center py-1.5">
+                      <Loader2 size={16} className="animate-spin text-purple-700" />
+                    </div>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => verifyProject(cred.email)}
+                        className="text-xs px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center gap-1"
+                        title="检验 Project ID / Tier（可修复 403）"
+                      >
+                        <Shield size={13} /> 检验
+                      </button>
+                      <button
+                        onClick={() => testCredential(cred.email)}
+                        className="text-xs px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center gap-1"
+                        title="测试凭证"
+                      >
+                        <Zap size={13} /> 测试
+                      </button>
+                      <button
+                        onClick={() => openQuotaModal(cred.email)}
+                        disabled={cred.disabled}
+                        className="text-xs px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center gap-1 disabled:opacity-40"
+                        title="查看额度"
+                      >
+                        <BarChart3 size={13} /> 额度
+                      </button>
+                      <button
+                        onClick={() => exportCredential(cred.email)}
+                        className="text-xs px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center gap-1"
+                        title="导出凭证（邮箱.json）"
+                      >
+                        <Download size={13} /> 导出
+                      </button>
+                      <button onClick={() => openClearCooldown([cred.email])}
+                        className="text-xs px-2 py-1.5 rounded-lg bg-cyan-600/10 hover:bg-cyan-600/20 text-cyan-700 flex items-center justify-center gap-1"
+                        title="清除该凭证的冷却">
+                        <Snowflake size={13} /> 清除 CD
+                      </button>
+                      <button
+                        onClick={() =>
+                          doAction(cred.email, cred.disabled ? "enable" : "disable")
+                        }
+                        className={`text-xs px-2 py-1.5 rounded-lg flex items-center justify-center gap-1 ${
+                          cred.disabled
+                            ? "bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-700"
+                            : "bg-amber-600/20 hover:bg-amber-600/30 text-amber-700"
+                        }`}
+                      >
+                        {cred.disabled ? <CheckCircle size={13} /> : <Ban size={13} />}
+                        {cred.disabled ? "启用" : "禁用"}
+                      </button>
+                      <button
+                        onClick={() => doAction(cred.email, "delete")}
+                        className="text-xs px-2 py-1.5 rounded-lg bg-red-600/10 hover:bg-red-600/20 text-red-700 flex items-center justify-center gap-1"
+                        title="删除"
+                      >
+                        <Trash2 size={13} /> 删除
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 分页 */}
+      {total > pageSize && (
+        <div className="flex items-center justify-between text-sm">
+          <span className="text-slate-500 text-xs sm:text-sm">
+            共 {total} 个凭证，第 {page}/{totalPages} 页
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page <= 1}
+              className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40"
+            >
+              上一页
+            </button>
+            <span className="text-slate-600 text-xs sm:text-sm">
+              {page} / {totalPages}
+            </span>
+            <button
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={page >= totalPages}
+              className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40"
+            >
+              下一页
+            </button>
+          </div>
+        </div>
+      )}
+
+
+      {clearTargets && <Modal title="清除凭证 CD" onClose={() => { if (!clearing) setClearTargets(null); }}>
+        <form onSubmit={clearCooldown} className="space-y-3">
+          <p>将清除以下 {clearTargets.length} 个凭证的冷却：</p>
+          <div className="max-h-28 overflow-auto text-xs text-slate-600">{clearTargets.map(email => <div key={email}>{email}</div>)}</div>
+          <label className="block space-y-1">
+            <span>清除类型</span>
+            <select aria-label="清除类型" value={clearScope} disabled={clearing} onChange={e => setClearScope(e.target.value)} className="input w-full">
+              <option value="all">全部：配额冷却 + 499 保护冷却</option>
+              <option value="quota">仅配额冷却（所有模型家族）</option>
+              <option value="protection">仅 499 保护冷却（账号及所有家族）</option>
+            </select>
+          </label>
+          <p className="text-xs text-slate-600">清除所选类型下的全部家族冷却；499 保护同时重置本轮失败计数。正在进行的请求继续运行，禁用状态不变。</p>
+          {clearScope === "quota" && <p className="text-xs text-slate-600">499 保护仍可能限制派发；可在“配置管理 → 499 等待异常保护”查看其状态。</p>}
+          <p className="text-xs text-amber-700">此操作仅解除本服务的冷却，不会重置上游额度；再次触发限制时会重新进入冷却。</p>
+          {clearError && <p role="alert" className="text-red-700">{typeof clearError === "string" ? clearError : "清除 CD 失败"}</p>}
+          <button disabled={clearing} className="btn btn-primary">{clearing ? "清除中…" : "确认清除"}</button>
+        </form>
+      </Modal>}
+      {/* 额度弹窗 */}
+      {noteCredential && <Modal title="凭证备注" onClose={() => { if (!noteSaving) setNoteCredential(null); }}>
+        <form onSubmit={saveNote} className="space-y-3">
+          <p className="text-sm break-all">{noteCredential.email}</p>
+          <textarea aria-label="凭证备注" value={noteDraft} onChange={e => setNoteDraft(e.target.value)} maxLength={1000} rows={5} className="w-full rounded-lg border border-slate-300 bg-white p-3 text-sm" placeholder="填写备注；留空保存可删除备注" />
+          <p className="text-xs text-slate-500">{noteDraft.length} / 1000</p>
+          {noteError && <p role="alert" className="text-red-700 text-sm">{noteError}</p>}
+          <button disabled={noteSaving} className="btn btn-primary">{noteSaving ? "保存中…" : "保存备注"}</button>
+        </form>
+      </Modal>}
+      {quotaModal && (
+        <Modal
+          type="info"
+          title={`额度信息 - ${quotaModal.email}`}
+          onClose={() => setQuotaModal(null)}
+        >
+          <QuotaSummary data={quotaCache[quotaModal.email]} loading={quotaLoading.has(quotaModal.email)} />
+        </Modal>
+      )}
+      {modelsCredential && <CredentialModels key={modelsCredential.email} credential={modelsCredential}
+        onClose={() => setModelsCredential(null)} onUpdated={fetchCreds} />}
+
+      {/* 错误详情弹窗 */}
+      {errorModal && (
+        <div
+          className="fixed inset-0 bg-slate-900/30 flex items-center justify-center p-4 z-50"
+          onClick={() => setErrorModal(null)}
+        >
+          <div
+            className="bg-white border border-slate-300 rounded-xl max-w-2xl w-full max-h-[80vh] overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 sm:px-5 py-4 border-b border-slate-200">
+              <h3 className="font-semibold flex items-center gap-2 text-sm sm:text-base break-all">
+                <AlertCircle size={16} className="text-red-700 flex-shrink-0" />
+                错误详情 - {errorModal.email}
+              </h3>
+              <button
+                onClick={() => setErrorModal(null)}
+                className="text-slate-600 hover:text-slate-900 flex-shrink-0"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="p-4 sm:p-5 overflow-y-auto space-y-4">
+              <div>
+                <div className="text-sm text-slate-600 mb-1">错误码</div>
+                <div className="text-red-700 text-sm">
+                  {(errorModal.error_codes || []).join(", ") || "无"}
+                </div>
+              </div>
+              <div>
+                <div className="text-sm text-slate-600 mb-1">错误信息</div>
+                <pre className="bg-slate-50 border border-slate-300 rounded-lg p-3 sm:p-4 text-xs text-slate-700 overflow-auto max-h-56 whitespace-pre-wrap">
+                  {JSON.stringify(errorModal.error_messages, null, 2)}
+                </pre>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => {
+                    verifyProject(errorModal.email);
+                    setErrorModal(null);
+                  }}
+                  className="btn btn-primary text-sm"
+                >
+                  检验修复（重新获取Project ID）
+                </button>
+                <button
+                  onClick={() => {
+                    testCredential(errorModal.email);
+                    setErrorModal(null);
+                  }}
+                  className="btn btn-secondary text-sm"
+                >
+                  测试凭证
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

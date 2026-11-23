@@ -1,32 +1,25 @@
-.git
-.github
-.env
-.env.*
-.venv
-env
-venv
-__pycache__
+# Docker ignore
+.venv/
+venv/
+__pycache__/
 *.py[cod]
+.git/
+.github/
+.idea/
+.vscode/
+.claude/
+.pytest_cache/
+frontend/node_modules/
+creds/
 *.log
-*.tmp
-*.bak
-.DS_Store
+log.txt
+.env
+tests/
 
-# Runtime data and credentials must be mounted or injected, never baked in.
-creds
-data
+.env.*
+*.env
+data/
 *.pem
 *.key
 *.p12
 *.pfx
-
-# Local tooling and deployment metadata are not needed in the image.
-.idea
-.vscode
-.claude
-.kiro
-tools
-aicode
-streamchat
-docker-compose*.yml
-compose*.yml

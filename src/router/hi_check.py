@@ -3,8 +3,11 @@
 
 提供对OpenAI、Gemini和Anthropic格式的Hi消息的解析和响应
 """
+import json
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal
+
+from fastapi.responses import JSONResponse, Response
 
 
 # ==================== Hi消息检测 ====================
@@ -20,7 +23,16 @@ def is_health_check_request(request_data: dict, format: str = "openai") -> bool:
     Returns:
         是否是健康检查请求
     """
+    if any(request_data.get(key) for key in ("tools", "system", "systemInstruction")):
+        return False
+
     if format == "openai":
+        if (request_data.get("n", 1) != 1 or request_data.get("reasoning_effort") is not None
+                or request_data.get("reasoning")):
+            return False
+        response_format = request_data.get("response_format")
+        if response_format is not None and response_format.get("type") != "text":
+            return False
         # OpenAI格式健康检查: {"messages": [{"role": "user", "content": "Hi"}]}
         messages = request_data.get("messages", [])
         if len(messages) == 1:
@@ -29,15 +41,23 @@ def is_health_check_request(request_data: dict, format: str = "openai") -> bool:
                 return True
                 
     elif format == "gemini":
+        generation = request_data.get("generationConfig") or {}
+        if (request_data.get("cachedContent") or request_data.get("cached_content")
+                or generation.get("thinkingConfig") or generation.get("responseModalities")
+                or generation.get("candidateCount", 1) != 1
+                or generation.get("responseMimeType") == "application/json"
+                or "responseJsonSchema" in generation or "responseSchema" in generation):
+            return False
         # Gemini格式健康检查: {"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]}
         contents = request_data.get("contents", [])
         if len(contents) == 1:
             content = contents[0]
-            if (content.get("role") == "user" and 
-                content.get("parts", [{}])[0].get("text") == "Hi"):
+            if content.get("role") == "user" and content.get("parts") == [{"text": "Hi"}]:
                 return True
     
     elif format == "anthropic":
+        if request_data.get("output_config") or request_data.get("thinking"):
+            return False
         # Anthropic格式健康检查: {"messages": [{"role": "user", "content": "Hi"}]}
         messages = request_data.get("messages", [])
         if (len(messages) == 1 
@@ -104,7 +124,7 @@ def create_health_check_response(format: str = "openai", **kwargs) -> dict:
         return {
             "candidates": [{
                 "content": {
-                    "parts": [{"text": "gcli2api工作中"}],
+                    "parts": [{"text": "agy2api工作中"}],
                     "role": "model"
                 },
                 "finishReason": "STOP",
@@ -129,3 +149,33 @@ def create_health_check_response(format: str = "openai", **kwargs) -> dict:
     
     # 未知格式返回空字典
     return {}
+
+
+def greeting_probe_response(protocol: Literal["openai", "anthropic"], stream: bool) -> Response:
+    message = create_health_check_response(format=protocol)
+    if not stream:
+        return JSONResponse(message)
+
+    if protocol == "openai":
+        choice = message["choices"][0]
+        chunk = {**message, "object": "chat.completion.chunk"}
+        frames = []
+        for delta, finish in [(choice["message"], None), ({}, choice["finish_reason"])]:
+            chunk["choices"] = [{"index": choice["index"], "delta": delta, "finish_reason": finish}]
+            frames.append("data: " + json.dumps(chunk) + "\n\n")
+        frames.append("data: [DONE]\n\n")
+    else:
+        start = {**message, "content": [], "stop_reason": None}
+        events = [
+            {"type": "message_start", "message": start},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "text_delta", "text": message["content"][0]["text"]}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta",
+             "delta": {"stop_reason": message["stop_reason"], "stop_sequence": message["stop_sequence"]},
+             "usage": {"output_tokens": message["usage"]["output_tokens"]}},
+            {"type": "message_stop"},
+        ]
+        frames = [f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events]
+    return Response(content="".join(frames), media_type="text/event-stream")
