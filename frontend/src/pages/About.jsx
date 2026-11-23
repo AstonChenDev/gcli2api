@@ -1,7 +1,10 @@
 import { ExternalLink, Github, Info, RefreshCw, Rocket, Zap } from "lucide-react";
+import { useState } from "react";
 import { getBasePath } from "../basePath.js";
+import { copyText } from "../utils/clipboard";
 
 export default function About({ version, onCheckUpdate, checkingUpdate }) {
+  const [copyStatus, setCopyStatus] = useState("");
   const apiBase = `${window.location.origin}${getBasePath()}`;
   const apiEndpoints = [
     { label: "OpenAI 格式", value: `${apiBase}v1/chat/completions` },
@@ -9,8 +12,13 @@ export default function About({ version, onCheckUpdate, checkingUpdate }) {
     { label: "Claude 格式", value: `${apiBase}v1/messages` },
   ];
 
-  const copyText = (text) => {
-    navigator.clipboard.writeText(text);
+  const copyEndpoint = async (endpoint) => {
+    try {
+      await copyText(endpoint.value);
+      setCopyStatus(`已复制 ${endpoint.label}地址`);
+    } catch {
+      setCopyStatus(`浏览器未允许自动复制。请选中上方的 ${endpoint.label}地址后手动复制。`);
+    }
   };
 
   return (
@@ -27,13 +35,14 @@ export default function About({ version, onCheckUpdate, checkingUpdate }) {
               <span className="text-slate-500 sm:w-24 flex-shrink-0">{ep.label}</span>
               <code
                 className="bg-slate-50 border border-slate-300 rounded px-2 py-1 text-xs text-slate-700 cursor-pointer hover:text-slate-900 break-all"
-                onClick={() => copyText(ep.value)}
+                onClick={() => copyEndpoint(ep)}
               >
                 {ep.value}
               </code>
             </div>
           ))}
         </div>
+        {copyStatus && <p role="status" className="mt-2 text-xs text-slate-600">{copyStatus}</p>}
       </div>
 
       {/* 项目简介 */}

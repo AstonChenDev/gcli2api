@@ -91,6 +91,27 @@ class AnthropicConversionAccountingTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(row['success'])
                     self.assertNotIn('CLIENT_DISCONNECTED', row['error_message'])
 
+    async def test_unspecified_finish_keeps_later_text_and_actual_stop_reason(self):
+        async def source():
+            yield chunk("begin-", finish="FINISH_REASON_UNSPECIFIED").encode()
+            yield chunk("answer", finish="MAX_TOKENS").encode()
+
+        events = [item async for item in converter.gemini_stream_to_anthropic_stream(source(), "test")]
+        messages = [json.loads(line[5:]) for item in events for line in item.decode().splitlines() if line.startswith("data:")]
+        self.assertEqual([m["delta"]["text"] for m in messages if m["type"] == "content_block_delta"], ["begin-", "answer"])
+        self.assertEqual(messages[-2]["delta"]["stop_reason"], "max_tokens")
+
+    async def test_final_usage_after_stop_is_in_message_delta(self):
+        async def source():
+            yield chunk("answer", finish="STOP", usage={"promptTokenCount": 14}).encode()
+            yield b'data: {"candidates":null,"usageMetadata":{"total_cached_tokens":4,"total_thought_tokens":3,"total_output_tokens":5}}'
+
+        events = [item async for item in converter.gemini_stream_to_anthropic_stream(source(), "test")]
+        messages = [json.loads(line[5:]) for item in events for line in item.decode().splitlines() if line.startswith("data:")]
+        self.assertEqual([message["type"] for message in messages[-2:]], ["message_delta", "message_stop"])
+        self.assertEqual(messages[-2]["usage"], {"input_tokens": 10, "output_tokens": 8, "cache_read_input_tokens": 4,
+                                               "output_tokens_details": {"thinking_tokens": 3}})
+
     async def test_split_prompt_and_cached_metadata_keep_input_total(self):
         async def source():
             yield chunk('answer', finish=None, usage={'promptTokenCount': 100}).encode()

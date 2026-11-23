@@ -12,6 +12,8 @@ import config
 from src.thinking_model_routing import route_thinking_model, add_thinking_model_aliases
 from src.router.antigravity import openai, gemini, anthropic, model_list
 from src.utils import authenticate_bearer, authenticate_gemini_flexible
+from src.panel import config_routes
+from src.models import ConfigSaveRequest
 
 
 @pytest.fixture(autouse=True)
@@ -129,10 +131,100 @@ def test_actual_routes(client, protocol, stream, prefix, base, level):
     assert "thinkingLevel" not in calls[0]["body"]["request"].get("generationConfig", {}).get("thinkingConfig", {})
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("root_key", ["thinkingConfig", "thinking_config"])
+def test_gemini_root_effort_and_opt_out_reach_upstream(client, stream, root_key):
+    http, calls = client
+    path = "/v1beta/models/gemini-4-argon:" + ("streamGenerateContent" if stream else "generateContent")
+    body = {"contents": [{"role": "user", "parts": [{"text": "test"}]}],
+            root_key: {"thinking_level": "high", "include_thoughts": False}}
+    response = http.post(path, json=body)
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["body"]["model"] == "gemini-4-argon-high"
+    assert calls[0]["body"]["request"]["generationConfig"]["thinkingConfig"]["includeThoughts"] is False
+    assert root_key not in calls[0]["body"]["request"]
+
+    body[root_key] = "invalid"
+    assert http.post(path, json=body).status_code == 400
+    assert len(calls) == 1
+
+    body.update({"thinking_config": {"thinking_level": "low"},
+                 "thinkingConfig": {"thinkingLevel": "medium"},
+                 "generationConfig": {"thinkingConfig": {"thinkingLevel": "high", "includeThoughts": False}}})
+    assert http.post(path, json=body).status_code == 200
+    assert calls[-1]["body"]["model"] == "gemini-4-argon-high"
+    assert calls[-1]["body"]["request"]["generationConfig"]["thinkingConfig"]["includeThoughts"] is False
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(("limits", "expected"), [
+    ({}, 65536),
+    ({"max_completion_tokens": 24}, 24),
+    ({"max_tokens": 17, "max_completion_tokens": 24}, 24),
+    ({"max_tokens": 17, "max_completion_tokens": None}, 17),
+    ({"max_completion_tokens": 90000}, 65536),
+])
+def test_openai_output_token_limit_reaches_upstream(client, stream, limits, expected):
+    http, calls = client
+    response = http.post("/v1/chat/completions", json={
+        "model": "gemini-4-argon-medium", "stream": stream,
+        "messages": [{"role": "user", "content": "Write a sentence."}], **limits,
+    })
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["body"]["request"]["generationConfig"]["maxOutputTokens"] == expected
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_invalid_completion_limit_rejected_before_upstream(client, limit):
+    http, calls = client
+    response = http.post("/v1/chat/completions", json={
+        "model": "gemini-4-argon-medium", "max_tokens": 17, "max_completion_tokens": limit,
+        "messages": [{"role": "user", "content": "Write a sentence."}],
+    })
+    assert response.status_code == 422
+    assert not calls
+
+
 @pytest.mark.parametrize("effort", ["invalid", "", "none", "minimal"])
 def test_invalid_effort_rejected_before_upstream(client, effort):
     http, calls = client
     response = http.post("/v1/chat/completions", json={"model": "gemini-4-argon", "reasoning_effort": effort, "stream": True, "messages": [{"role": "user", "content": "Write a sentence."}]})
+    assert response.status_code == 400
+    assert not calls
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("format_type", ["text", "json_object", "json_schema"])
+def test_openai_response_format_reaches_generation(client, stream, format_type):
+    http, calls = client
+    schema = {
+        "type": "object", "properties": {"top_k": {"$ref": "#/$defs/value"}},
+        "$defs": {"value": {"type": ["integer", "null"], "default": None}},
+        "required": ["top_k"], "additionalProperties": False,
+    }
+    requested = {"type": format_type}
+    if format_type == "json_schema":
+        requested["json_schema"] = {"name": "result", "strict": True, "schema": schema}
+    response = http.post("/v1/chat/completions", json={
+        "model": "gemini-4-argon-medium", "stream": stream, "response_format": requested,
+        "messages": [{"role": "user", "content": "Say OK" if format_type == "text" else "Hi"}],
+    })
+    assert response.status_code == 200
+    assert len(calls) == 1
+    generation = calls[0]["body"]["request"]["generationConfig"]
+    assert generation.get("responseMimeType") == (None if format_type == "text" else "application/json")
+    assert generation.get("responseJsonSchema") == (schema if format_type == "json_schema" else None)
+
+
+@pytest.mark.parametrize("requested", [{}, {"type": "json_schema"}, {"type": "json_schema", "json_schema": {"schema": []}}])
+def test_invalid_response_format_skips_dispatch(client, requested):
+    http, calls = client
+    response = http.post("/v1/chat/completions", json={
+        "model": "gemini-4-argon-medium", "response_format": requested,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
     assert response.status_code == 400
     assert not calls
 
@@ -150,6 +242,26 @@ def test_explicit_hydrogen_suffix_takes_precedence(client):
     response = http.post("/v1/chat/completions", json={"model": "gemini-4-hydrogen-xhigh", "reasoning_effort": "low", "messages": [{"role": "user", "content": "Write a sentence."}]})
     assert response.status_code == 200
     assert calls[0]["body"]["model"] == "gemini-4-hydrogen-xhigh"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_gemini_compares_normalized_aliases_before_dispatch(client, stream):
+    http, calls = client
+    path = "/v1beta/models/gemini-4-argon:" + ("streamGenerateContent" if stream else "generateContent")
+    body = {"contents": [{"parts": [{"text": "audit"}]}]}
+    response = http.post(path, json={**body, "thinking_config": {"thinking_level": "low"},
+                                     "thinkingConfig": {"thinkingLevel": "high"}})
+    assert response.status_code == 400
+    assert calls == []
+    schema = {"type": "object", "properties": {"thinking_level": {"type": "string"}}}
+    response = http.post(path, json={
+        **body, "generation_config": {"thinking_config": {"thinking_level": "low"}, "response_json_schema": schema},
+        "generationConfig": {"thinkingConfig": {"thinkingLevel": " LOW "}, "responseJsonSchema": schema}
+    })
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["body"]["model"] == "gemini-4-argon-low"
+    assert calls[0]["body"]["request"]["generationConfig"]["responseJsonSchema"] == schema
 
 
 def test_conflicting_effort(client):
@@ -176,16 +288,7 @@ def test_existing_rewrite_applies_after_effort(client):
 
 
 @pytest.mark.asyncio
-async def test_panel_save_hot_reload_and_environment_lock(monkeypatch):
-    from src.panel import config_routes
-    from src.storage import database
-    from src.models import ConfigSaveRequest
-    stored = {"api_password": "test-only", "panel_password": "test-only"}
-    db = AsyncMock()
-    db.get_all_config.side_effect = lambda: dict(stored)
-    db.set_config.side_effect = lambda key, value: stored.update({key: value})
-    monkeypatch.setattr(config_routes, "get_database", AsyncMock(return_value=db))
-    monkeypatch.setattr(database, "get_database", AsyncMock(return_value=db))
+async def test_panel_save_hot_reload_and_environment_lock(monkeypatch, panel_config_db):
     for enabled in (True, False):
         await config_routes.save_config(ConfigSaveRequest(config={"thinking_model_routing_enabled": enabled, "thinking_model_routing_bases": ["gemini-4-custom"]}), token="test")
         assert await config.get_thinking_model_routing_enabled() is enabled

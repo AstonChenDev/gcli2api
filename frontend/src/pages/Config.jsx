@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
+import { configChanges } from "../utils/configChanges";
 
 // 错误码输入：编辑期间保留原始文本，仅在按键时把已解析的数组回写配置（保证保存时取到最新值），
 // 失焦时再归一化显示。原实现在每次按键即时解析并回写数组，导致分隔符与未成形的中间输入被即时
@@ -149,7 +150,7 @@ const CONFIG_GROUPS = [
     title: "自动封禁配置",
     fields: [
       { key: "auto_ban_enabled", label: "启用自动封禁", type: "bool", note: "遇到指定错误码时自动禁用凭证" },
-      { key: "auto_ban_error_codes", label: "自动封禁错误码", type: "text", note: "JSON 数组格式，如 [403, 400]" },
+      { key: "auto_ban_error_codes", label: "自动封禁错误码", type: "text", note: "填入状态码，如 400,403 或 [400, 403]。留空使用默认值 403。" },
     ],
   },
   {
@@ -185,6 +186,7 @@ const CONFIG_GROUPS = [
     title: "响应配置",
     fields: [
       { key: "return_thoughts_to_frontend", label: "返回思维链到前端", type: "bool", note: "向上游请求返回思考内容；关闭时请求上游省略。如果上游仍返回思考字段，按原版规则转发" },
+      { key: "system_instruction_as_user_message", label: "系统指令转为首条 user 消息", type: "bool", note: "启用后，转换时不再使用 systemInstruction 字段，而是将系统指令用 <system-instructions> 标签（XML 格式）包裹后作为第一条 user 消息插入对话开头。保存后立即生效（热更新）" },
     ],
   },
   {
@@ -197,7 +199,7 @@ const CONFIG_GROUPS = [
     title: "敏感词过滤",
     fields: [
       { key: "sensitive_words_enabled", label: "启用敏感词过滤", type: "bool", note: "请求中命中敏感词的内容会被替换为空，避免触发 Google API 端点的敏感词拦截" },
-      { key: "sensitive_words", label: "敏感词列表", type: "textarea", showIf: (cfg) => !!cfg.sensitive_words_enabled, note: "每行一个词或短语，不区分大小写，支持中文。命中后整词替换为空。保存后立即生效（热更新）", placeholder: "例如：\nsensitive word\n敏感词\n另一个词" },
+      { key: "sensitive_words", label: "敏感词列表", type: "textarea", showIf: (cfg) => !!cfg.sensitive_words_enabled, note: "每行一个词或短语，区分大小写，支持中文。命中后整词替换为空。保存后立即生效（热更新）", placeholder: "例如：\nsensitive word\n敏感词\n另一个词" },
     ],
   },
   {
@@ -233,6 +235,7 @@ const CONFIG_GROUPS = [
 
 export default function Config() {
   const [config, setConfig] = useState({});
+  const [savedConfig, setSavedConfig] = useState(null);
   const [envLocked, setEnvLocked] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -248,12 +251,15 @@ export default function Config() {
     setFamilyPreview(null);
   };
 
-  const preparedConfig = () => ({
-    ...config,
-    cooldown_499_family_rules: (config.cooldown_499_family_rules || []).map(rule => ({
-      name: rule.name.trim(), patterns: rule.patterns.map(p => p.trim()).filter(Boolean),
-    })),
-  });
+  const preparedConfig = (values = config) => {
+    if (!values.cooldown_499_family_rules) return values;
+    return {
+      ...values,
+      cooldown_499_family_rules: values.cooldown_499_family_rules.map(rule => ({
+        name: rule.name.trim(), patterns: rule.patterns.map(p => p.trim()).filter(Boolean),
+      })),
+    };
+  };
 
   const previewFamily = async () => {
     const version = familyDraftVersion.current;
@@ -286,7 +292,10 @@ export default function Config() {
     setLoading(true);
     try {
       const res = await api.get("/config/get");
-      setConfig(res.data.config || {});
+      const current = res.data.config;
+      if (!current || typeof current !== "object" || Array.isArray(current)) throw new Error("invalid config");
+      setConfig(current);
+      setSavedConfig(current);
       clearFamilyPreview();
       setEnvLocked(res.data.env_locked || []);
       await loadCooldownStatus();
@@ -299,9 +308,12 @@ export default function Config() {
   };
 
   const saveConfig = async () => {
+    if (!savedConfig || loading || saving) return;
     setSaving(true);
     try {
-      const res = await api.post("/config/save", { config: preparedConfig() });
+      const changes = preparedConfig(configChanges(savedConfig, config, envLocked));
+      const res = await api.post("/config/save", { config: changes });
+      setSavedConfig(config);
       setMessage({ type: "success", text: res.data.message || "配置保存成功" });
       // 静默刷新配置（不清空刚显示的弹窗消息）
       await loadConfig({ silent: true });
@@ -558,7 +570,7 @@ export default function Config() {
         <div className="flex items-center gap-2">
         <button
           onClick={loadConfig}
-          disabled={loading}
+          disabled={loading || saving}
           className="btn btn-secondary text-sm flex items-center gap-1.5"
         >
           <RefreshCw size={15} className={loading ? "animate-spin" : ""} />
@@ -566,7 +578,7 @@ export default function Config() {
         </button>
         <button
           onClick={saveConfig}
-          disabled={saving || loading}
+          disabled={saving || loading || !savedConfig}
           className="btn btn-primary text-sm flex items-center gap-1.5 disabled:opacity-50"
         >
           {saving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
@@ -586,8 +598,10 @@ export default function Config() {
         <div className="flex items-center justify-center py-12">
           <Loader2 className="animate-spin text-purple-500" size={28} />
         </div>
+      ) : !savedConfig ? (
+        <p className="card text-slate-600">尚未读取配置。请点击“刷新配置”重试。</p>
       ) : (
-        <div className="space-y-6">
+        <fieldset disabled={saving} className="min-w-0 space-y-6">
           {CONFIG_GROUPS.map((group) => (
             <div key={group.title} className="card">
               <h3 className="text-base font-semibold text-purple-700 mb-4 border-b border-slate-200 pb-3">
@@ -649,7 +663,7 @@ export default function Config() {
               </div>
             </div>
           ))}
-        </div>
+        </fieldset>
       )}
     </div>
   );

@@ -18,6 +18,8 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from fastapi import Response as FastAPIResponse
 from fastapi.responses import StreamingResponse
 
+from config import get_system_instruction_as_user_message
+from src.converter.antigravity_fix import SYSTEM_INSTRUCTIONS_TAG
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
 from src.converter.request_fields import normalize_gemini_request_fields
 
@@ -108,7 +110,7 @@ def _resolve_function_calling_mode(tools: List[Dict[str, Any]]) -> Tuple[str, bo
     return "AUTO", False
 
 
-def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
+async def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     对请求 payload 应用反截断处理：注入合成工具和控制指令
 
@@ -174,21 +176,64 @@ def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
             flush=True,
         )
 
-    # 3. 注入控制指令到 systemInstruction
-    system_instruction = dict(request_data.get("systemInstruction") or {})
-    if "parts" not in system_instruction:
-        system_instruction["parts"] = []
+    # 3. 注入控制指令：
+    #    - 常规模式：追加到 systemInstruction.parts
+    #    - systemInstruction 转首条 user 消息模式（面板可配）：
+    #      与转换后的系统指令在同一条 user 消息内合并，
+    #      不再重新引入 systemInstruction 字段
+    if await get_system_instruction_as_user_message():
+        contents = [
+            dict(c) if isinstance(c, dict) else c
+            for c in (request_data.get("contents") or [])
+        ]
+        injected_part = {"text": CONTROL_INSTRUCTION}
+        merged = False
+        if contents and isinstance(contents[0], dict) and contents[0].get("role") == "user":
+            first = contents[0]
+            first_parts = [
+                p if isinstance(p, dict) else p
+                for p in (first.get("parts") or [])
+            ]
+            # 定位 <system-instructions> 包裹 part，控制指令紧随其后
+            insert_at = None
+            for idx, part in enumerate(first_parts):
+                if (
+                    isinstance(part, dict)
+                    and isinstance(part.get("text"), str)
+                    and f"<{SYSTEM_INSTRUCTIONS_TAG}>" in part["text"]
+                ):
+                    insert_at = idx + 1
+                    break
+            if insert_at is not None:
+                first["parts"] = first_parts[:insert_at] + [injected_part] + first_parts[insert_at:]
+                merged = True
+        if not merged:
+            # 首条消息不含 <system-instructions>（无系统指令的请求），前置插入
+            if contents and isinstance(contents[0], dict) and contents[0].get("role") == "user":
+                first = contents[0]
+                first["parts"] = [injected_part] + list(first.get("parts") or [])
+            else:
+                contents.insert(0, {"role": "user", "parts": [injected_part]})
+        request_data["contents"] = contents
+        print(
+            "Anti-truncation: 控制指令合并到首条 user 消息（system-instructions 模式）",
+            flush=True,
+        )
     else:
-        # parts 列表可能来自调用方的原始对象，同样拷贝避免原地追加
-        system_instruction["parts"] = list(system_instruction["parts"])
+        system_instruction = dict(request_data.get("systemInstruction") or {})
+        if "parts" not in system_instruction:
+            system_instruction["parts"] = []
+        else:
+            # parts 列表可能来自调用方的原始对象，同样拷贝避免原地追加
+            system_instruction["parts"] = list(system_instruction["parts"])
 
-    has_control_instruction = any(
-        isinstance(part, dict) and SYNTHETIC_TOOL_NAME in part.get("text", "")
-        for part in system_instruction["parts"]
-    )
-    if not has_control_instruction:
-        system_instruction["parts"].append({"text": CONTROL_INSTRUCTION})
-        request_data["systemInstruction"] = system_instruction
+        has_control_instruction = any(
+            isinstance(part, dict) and SYNTHETIC_TOOL_NAME in part.get("text", "")
+            for part in system_instruction["parts"]
+        )
+        if not has_control_instruction:
+            system_instruction["parts"].append({"text": CONTROL_INSTRUCTION})
+            request_data["systemInstruction"] = system_instruction
 
     modified_payload["request"] = request_data
     return modified_payload
@@ -230,16 +275,19 @@ def extract_synthetic_content_from_response(
                 fc = part["functionCall"]
                 if fc.get("name") == SYNTHETIC_TOOL_NAME:
                     found_synthetic = True
-                    args = fc.get("args", {})
-                    if isinstance(args, dict):
-                        synthetic_content += args.get("content", "")
-                    elif isinstance(args, str):
-                        # 尝试解析 JSON 字符串
-                        extracted = _extract_content_from_json_str(args)
-                        if extracted is not None:
-                            synthetic_content += extracted
+                    synthetic_content += _synthetic_text(fc)
 
     return synthetic_content, found_synthetic
+
+
+def _synthetic_text(function_call: Dict[str, Any]) -> str:
+    args = function_call.get("args")
+    if isinstance(args, dict):
+        value = args.get("content")
+        return value if isinstance(value, str) else ""
+    if isinstance(args, str):
+        return _extract_content_from_json_str(args) or ""
+    return ""
 
 
 def _extract_content_from_json_str(args_str: str) -> Optional[str]:
@@ -340,14 +388,12 @@ def _replace_thought_signatures(data: Dict[str, Any]) -> bool:
 
 def build_text_chunk_from_synthetic(
     original_data: Dict[str, Any],
-    synthetic_content: str,
 ) -> Dict[str, Any]:
     """
     将合成工具提取的内容构建为普通文本 chunk
 
     Args:
         original_data: 原始 Gemini chunk 数据
-        synthetic_content: 从合成工具提取的文本
 
     Returns:
         修改后的 chunk 数据，functionCall(emit_answer) 被替换为 text part
@@ -376,9 +422,10 @@ def build_text_chunk_from_synthetic(
             if "functionCall" in part:
                 fc = part["functionCall"]
                 if fc.get("name") == SYNTHETIC_TOOL_NAME:
-                    # 替换为文本 part
-                    if synthetic_content:
-                        new_parts.append({"text": synthetic_content})
+                    # Each emitted part belongs to this call, even in a batched chunk.
+                    text = _synthetic_text(fc)
+                    if text:
+                        new_parts.append({"text": text})
                     # 如果 content 为空，跳过此 part
                     continue
                 else:
@@ -613,13 +660,9 @@ class AntiTruncationStreamProcessor:
                             is_truncated = chunk_finish in TRUNCATION_FINISH_REASONS
                             if is_truncated:
                                 stripped_data = self._strip_finish_reason(data)
-                                modified_data = build_text_chunk_from_synthetic(
-                                    stripped_data, synthetic_content
-                                )
+                                modified_data = build_text_chunk_from_synthetic(stripped_data)
                             else:
-                                modified_data = build_text_chunk_from_synthetic(
-                                    data, synthetic_content
-                                )
+                                modified_data = build_text_chunk_from_synthetic(data)
                             json_str = json.dumps(
                                 modified_data, separators=(",", ":"), ensure_ascii=False
                             )
@@ -1061,9 +1104,7 @@ class AntiTruncationStreamProcessor:
                 if found_synthetic or self.current_attempt >= self.max_attempts:
                     if found_synthetic:
                         # 替换响应中的合成工具调用为普通文本
-                        modified_data = build_text_chunk_from_synthetic(
-                            response_data, synthetic_content
-                        )
+                        modified_data = build_text_chunk_from_synthetic(response_data)
                         # 回传前把真实 thoughtSignature 替换为跳过校验占位符
                         _replace_thought_signatures(modified_data)
                         return json.dumps(modified_data, ensure_ascii=False).encode()

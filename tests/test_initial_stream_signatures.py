@@ -22,6 +22,53 @@ def parts_of(chunks):
 class InitialSignatureTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_custom_audit.CustomAuditTests.asyncSetUp
 
+    async def test_gemini_only_releases_metadata_from_the_attempt_with_output(self):
+        attempts = []
+        async def upstream(**kwargs):
+            tag = "retry" if attempts else "failed"
+            attempts.append(tag)
+            header = {"responseId": tag, "modelVersion": tag, "createTime": tag}
+            yield "data: " + json.dumps(header)
+            yield "data: " + json.dumps(header)
+            yield "data: " + json.dumps({"candidates": [
+                {"index": 0, "citationMetadata": {"citationSources": [{"uri": tag}]}}
+            ]})
+            yield "data: " + json.dumps({
+                "promptFeedback": {"safetyRatings": [{"category": tag}]},
+                "usageMetadata": {"promptTokenCount": 3, "promptTokensDetails": [{"modality": "AUDIO", "tokenCount": 3}]},
+            })
+            if tag == "failed":
+                yield Response(status_code=503, content='{"error":{"code":503}}')
+            else:
+                yield event([{"text": "answer"}], "STOP")
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(api, "stream_post_async", upstream))
+            stack.enter_context(patch.object(api, "get_retry_config", AsyncMock(return_value={
+                "retry_enabled": True, "max_retries": 1, "retry_interval": 0})))
+            stack.enter_context(patch.object(api, "record_api_call_error", AsyncMock()))
+            stack.enter_context(patch.object(api, "handle_error_with_retry", AsyncMock(return_value=True)))
+            stack.enter_context(patch.object(api, "_switch_credential_for_retry", AsyncMock(return_value=(True, None))))
+            out = [chunk async for chunk in api.stream_request(BODY, log_ctx={"api_format": "gemini"})]
+        self.assertEqual(attempts, ["failed", "retry"])
+        self.assertNotIn("failed", str(out))
+        self.assertEqual(decode(out[0]), {"responseId": "retry", "modelVersion": "retry", "createTime": "retry"})
+        self.assertEqual(decode(out[1])["candidates"][0]["citationMetadata"]["citationSources"], [{"uri": "retry"}])
+        self.assertEqual(decode(out[2])["promptFeedback"]["safetyRatings"], [{"category": "retry"}])
+        self.assertEqual(decode(out[2])["usageMetadata"], {
+            "promptTokenCount": 3, "promptTokensDetails": [{"modality": "AUDIO", "tokenCount": 3}]})
+        self.assertEqual(text_of(out), "answer")
+
+    async def test_oversized_optional_metadata_does_not_take_the_signature_budget(self):
+        async def upstream(**kwargs):
+            citation = {"citationMetadata": {"citationSources": [{"uri": "x" * (1024 * 1024)}]}}
+            yield "data: " + json.dumps({"candidates": [citation]})
+            yield event([{"text": "", "thoughtSignature": "keep"}])
+            yield event([{"text": "answer"}], "STOP")
+        with patch.object(api, "stream_post_async", upstream):
+            out = [c async for c in api.stream_request(BODY, log_ctx={"api_format": "gemini"})]
+        self.assertEqual(text_of(out), "answer")
+        self.assertIn("keep", str(parts_of(out)))
+
     def test_signature_for_another_candidate_does_not_renumber_implicit_index(self):
         chunk = api._prepend_signature_parts(event([{'text': 'candidate zero'}]), [
             (1, {'text': '', 'thoughtSignature': 'candidate-one-signature'})])
@@ -107,6 +154,32 @@ class InitialSignatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('failed', str(parts_of(out)))
         self.assertIn('keep', str(parts_of(out)))
         self.assertEqual([c.args[0]['status_code'] for c in self.saved.call_args_list], [503, 200])
+
+    async def test_retry_discards_pre_content_candidate_finish(self):
+        attempts = 0
+        async def upstream(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                yield event([], 'MAX_TOKENS')
+                yield Response(status_code=503, content='{"error":{"code":503}}')
+            else:
+                yield 'data: ' + json.dumps({'candidates': [
+                    {'index': 1, 'content': {'parts': [{'text': 'answer'}]}, 'finishReason': 'STOP'}]})
+
+        self.stack.enter_context(patch.object(api, 'stream_post_async', upstream))
+        self.stack.enter_context(patch.object(api, 'get_retry_config', AsyncMock(return_value={
+            'retry_enabled': True, 'max_retries': 1, 'retry_interval': 0})))
+        self.stack.enter_context(patch.object(api, 'record_api_call_error', AsyncMock()))
+        self.stack.enter_context(patch.object(api, 'handle_error_with_retry', AsyncMock(return_value=True)))
+        self.stack.enter_context(patch.object(api, '_switch_credential_for_retry', AsyncMock(return_value=(True, None))))
+        request = {'model': BODY['model'], 'request': {'generationConfig': {'candidateCount': 2}}}
+        out = [chunk async for chunk in api.stream_request(request)]
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(text_of(out), 'answer')
+        self.assertEqual(json.loads(out[-1].body)['error']['status'], 'UPSTREAM_INCOMPLETE_STREAM')
+        self.assertEqual([call.args[0]['status_code'] for call in self.saved.call_args_list], [503, 500])
 
     async def test_initial_signature_buffer_is_bounded_and_reports_error(self):
         async def upstream(**kwargs):

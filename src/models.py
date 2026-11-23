@@ -87,9 +87,12 @@ class OpenAIChatCompletionRequest(BaseModel):
     reasoning: Optional[Dict[str, Any]] = None
     model: str
     messages: List[OpenAIChatMessage]
+    n: Optional[int] = Field(default=None, ge=1, le=128, strict=True)
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = Field(default=None, gt=0, strict=True)
+    response_format: Optional[Dict[str, Any]] = None
     stream: bool = False
     tools: Optional[List[OpenAITool]] = None
     tool_choice: Optional[Any] = None

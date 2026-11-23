@@ -16,14 +16,25 @@ from config import (
 )
 from log import log
 
+from src.credential_expiry import parse_expiry
 from src.httpx_client import get_async, post_async
-from src.credential_tier import normalize_credential_tier
+from src.credential_tier import DEFAULT_PROJECT_ID, normalize_credential_tier, parse_project_id, parse_tier
 
 
 class TokenError(Exception):
     """Token相关错误"""
 
     pass
+
+
+def read_oauth_tokens(data, previous_refresh_token):
+    access = data.get("access_token") if isinstance(data, dict) else None
+    if not isinstance(access, str) or not access.strip():
+        raise TokenError("OAuth 响应缺少有效访问令牌")
+    rotated = data.get("refresh_token")
+    if rotated is not None and not isinstance(rotated, str):
+        raise TokenError("OAuth 响应中的刷新令牌格式有误")
+    return access.strip(), (rotated or "").strip() or previous_refresh_token
 
 
 class Credentials:
@@ -37,6 +48,8 @@ class Credentials:
         client_secret: str = None,
         expires_at: datetime = None,
         project_id: str = None,
+        credential_email: str = None,
+        credential_revision: str = None,
     ):
         self.access_token = access_token
         self.refresh_token = refresh_token
@@ -44,6 +57,8 @@ class Credentials:
         self.client_secret = client_secret
         self.expires_at = expires_at
         self.project_id = project_id
+        self.credential_email = credential_email
+        self.credential_revision = credential_revision
 
         # 反代配置将在使用时异步获取
         self.oauth_base_url = None
@@ -51,7 +66,7 @@ class Credentials:
 
     def is_expired(self) -> bool:
         """检查token是否过期"""
-        if not self.expires_at:
+        if not isinstance(self.access_token, str) or not self.access_token.strip() or not self.expires_at:
             return True
 
         # 提前3分钟认为过期
@@ -86,13 +101,14 @@ class Credentials:
             token_url = f"{oauth_base_url.rstrip('/')}/token"
             response = await post_async(
                 token_url,
+                credential_email=self.credential_email, credential_revision=self.credential_revision,
                 data=data,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
             response.raise_for_status()
 
             token_data = response.json()
-            self.access_token = token_data["access_token"]
+            access, refresh = read_oauth_tokens(token_data, self.refresh_token)
 
             if "expires_in" in token_data:
                 expires_in = int(token_data["expires_in"])
@@ -104,8 +120,7 @@ class Credentials:
                     f"过期时间={self.expires_at.isoformat()}"
                 )
 
-            if "refresh_token" in token_data:
-                self.refresh_token = token_data["refresh_token"]
+            self.access_token, self.refresh_token = access, refresh
 
             log.debug(f"Token刷新成功，过期时间: {self.expires_at}")
 
@@ -126,28 +141,15 @@ class Credentials:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Credentials":
         """从字典创建凭证"""
-        # 处理过期时间
-        expires_at = None
-        if "expiry" in data and data["expiry"]:
-            try:
-                expiry_str = data["expiry"]
-                if isinstance(expiry_str, str):
-                    if expiry_str.endswith("Z"):
-                        expires_at = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
-                    elif "+" in expiry_str:
-                        expires_at = datetime.fromisoformat(expiry_str)
-                    else:
-                        expires_at = datetime.fromisoformat(expiry_str).replace(tzinfo=timezone.utc)
-            except ValueError:
-                log.warning(f"无法解析过期时间: {expiry_str}")
-
         return cls(
             access_token=data.get("token") or data.get("access_token", ""),
             refresh_token=data.get("refresh_token"),
             client_id=data.get("client_id"),
             client_secret=data.get("client_secret"),
-            expires_at=expires_at,
+            expires_at=parse_expiry(data.get("expiry")),
             project_id=data.get("project_id"),
+            credential_email=data.get("email"),
+            credential_revision=data.get("credential_revision"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -336,7 +338,8 @@ async def get_user_info(credentials: Credentials) -> Optional[Dict[str, Any]]:
         googleapis_base_url = await get_googleapis_proxy_url()
         userinfo_url = f"{googleapis_base_url.rstrip('/')}/oauth2/v2/userinfo"
         response = await get_async(
-            userinfo_url, headers={"Authorization": f"Bearer {credentials.access_token}"}
+            userinfo_url, credential_email=credentials.credential_email, credential_revision=credentials.credential_revision,
+            headers={"Authorization": f"Bearer {credentials.access_token}"}
         )
         response.raise_for_status()
         return response.json()
@@ -405,6 +408,8 @@ async def fetch_project_id_and_tier(
     access_token: str,
     user_agent: str,
     api_base_url: str,
+    credential_email: str = None,
+    *, require_verified_tier: bool = False, credential_revision: str = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     从 API 获取 project_id 和订阅等级
@@ -429,7 +434,14 @@ async def fetch_project_id_and_tier(
 
     # 步骤 1: 尝试 loadCodeAssist
     try:
-        project_id, raw_tier = await _try_load_code_assist(api_base_url, headers)
+        if require_verified_tier:
+            data = await _load_code_assist_data(api_base_url, headers, credential_email, credential_revision)
+            try:
+                tier = parse_tier(data)
+            except ValueError:
+                tier = None
+            return parse_project_id(data), tier
+        project_id, raw_tier = await _try_load_code_assist(api_base_url, headers, credential_email=credential_email)
         subscription_tier = normalize_credential_tier(raw_tier)
 
         if raw_tier:
@@ -445,14 +457,18 @@ async def fetch_project_id_and_tier(
     except Exception as e:
         log.warning(f"[fetch_project_id_and_tier] loadCodeAssist failed: {type(e).__name__}: {e}")
 
+    if require_verified_tier:
+        return None, None
+
     # 获取失败 -> 使用固定回退值，避免空 project_id 写入数据库
     log.warning("[fetch_project_id_and_tier] 使用回退 project_id: aicode-consumers")
-    return "aicode-consumers", subscription_tier
+    return DEFAULT_PROJECT_ID, subscription_tier
 
 
 async def _try_load_code_assist(
     api_base_url: str,
-    headers: dict
+    headers: dict,
+    credential_email: str = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     尝试通过 loadCodeAssist 获取 project_id 和订阅等级
@@ -461,6 +477,38 @@ async def _try_load_code_assist(
         (project_id, subscription_tier) 元组
         subscription_tier 可能是 "FREE", "PRO", "ULTRA" 或 None
     """
+    data = await _load_code_assist_data(api_base_url, headers, credential_email)
+    # 提取订阅等级 - 优先使用 paidTier（更准确反映实际权益）
+    paid_tier = data.get("paidTier", {})
+    current_tier = data.get("currentTier", {})
+
+    # paidTier.id 优先，然后是 currentTier.id
+    subscription_tier = None
+    if isinstance(paid_tier, dict) and paid_tier.get("id"):
+        subscription_tier = paid_tier.get("id")
+        log.info(f"[loadCodeAssist] Found paidTier: {subscription_tier}")
+    elif isinstance(current_tier, dict) and current_tier.get("id"):
+        subscription_tier = current_tier.get("id")
+        log.info(f"[loadCodeAssist] Found currentTier: {subscription_tier}")
+
+    # 检查是否有 currentTier（表示用户已激活）
+    if current_tier:
+        log.info("[loadCodeAssist] User is already activated")
+
+        # 使用服务器返回的 project_id
+        project_id = parse_project_id(data)
+        if project_id:
+            log.info(f"[loadCodeAssist] Successfully fetched project_id: {project_id}, tier: {subscription_tier}")
+            return project_id, subscription_tier
+
+        log.warning("[loadCodeAssist] No project_id in response")
+        return None, subscription_tier
+    else:
+        log.info("[loadCodeAssist] User not activated yet (no currentTier)")
+        return None, None
+
+
+async def _load_code_assist_data(api_base_url, headers, credential_email, credential_revision=None):
     request_url = f"{api_base_url.rstrip('/')}/v1internal:loadCodeAssist"
     request_body = {
         "metadata": {
@@ -473,6 +521,7 @@ async def _try_load_code_assist(
 
     response = await post_async(
         request_url,
+        credential_email=credential_email, credential_revision=credential_revision,
         json=request_body,
         headers=headers,
         timeout=30.0,
@@ -487,34 +536,7 @@ async def _try_load_code_assist(
         data = response.json()
         log.debug(f"[loadCodeAssist] Response JSON keys: {list(data.keys())}")
 
-        # 提取订阅等级 - 优先使用 paidTier（更准确反映实际权益）
-        paid_tier = data.get("paidTier", {})
-        current_tier = data.get("currentTier", {})
-
-        # paidTier.id 优先，然后是 currentTier.id
-        subscription_tier = None
-        if isinstance(paid_tier, dict) and paid_tier.get("id"):
-            subscription_tier = paid_tier.get("id")
-            log.info(f"[loadCodeAssist] Found paidTier: {subscription_tier}")
-        elif isinstance(current_tier, dict) and current_tier.get("id"):
-            subscription_tier = current_tier.get("id")
-            log.info(f"[loadCodeAssist] Found currentTier: {subscription_tier}")
-
-        # 检查是否有 currentTier（表示用户已激活）
-        if current_tier:
-            log.info("[loadCodeAssist] User is already activated")
-
-            # 使用服务器返回的 project_id
-            project_id = data.get("cloudaicompanionProject")
-            if project_id:
-                log.info(f"[loadCodeAssist] Successfully fetched project_id: {project_id}, tier: {subscription_tier}")
-                return project_id, subscription_tier
-
-            log.warning("[loadCodeAssist] No project_id in response")
-            return None, subscription_tier
-        else:
-            log.info("[loadCodeAssist] User not activated yet (no currentTier)")
-            return None, None
+        return data
     else:
         log.warning(f"[loadCodeAssist] Failed: HTTP {response.status_code}")
         log.warning(f"[loadCodeAssist] Response body: {response.text[:500]}")

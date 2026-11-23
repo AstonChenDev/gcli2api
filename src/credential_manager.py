@@ -14,9 +14,12 @@ from log import log
 
 from config import get_credential_select_mode
 from src import session_cache
+from src.credential_expiry import expiry_allows_dispatch
+from src.credential_refresh import refresh_stored
 from src.google_oauth_api import Credentials
 from src.storage.database import get_database
 from src.credential_entitlements import queue_refresh
+from src.credential_cooldown import report_pool_limit
 
 # sticky 模式的当前粘性凭证（进程内唯一状态；重置函数供测试使用）
 _sticky_email: Optional[str] = None
@@ -34,6 +37,8 @@ async def get_valid_credential(
     model_name: Optional[str] = None,
     session_key: Optional[str] = None,
     exclude_emails=None,
+    *,
+    report_missing_model=False,
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """
     获取可用凭证：按凭证选择模式选取，自动跳过禁用/冷却凭证。
@@ -48,14 +53,18 @@ async def get_valid_credential(
         (email, credential_data) 或 None
     """
     global _sticky_email
-    exclude_emails = set(exclude_emails or ())
+    caller_exclusions = set(exclude_emails or ())
+    failed_emails = set()
     database = await get_database()
+    # Metadata-only first pass, before cache/sticky lookup and OAuth refresh.
+    limited = await database.get_dispatch_limit_waits(model_name) if model_name else {}
+    initial_exclusions = caller_exclusions.union(limited)
     mode = await get_credential_select_mode()
 
     # cache 模式：先查会话绑定
     if mode == "cache" and session_key:
         bound_email = await session_cache.get_session_binding(session_key)
-        if bound_email and bound_email not in exclude_emails:
+        if bound_email and bound_email not in initial_exclusions:
             result = await database.get_available_credential_by_email(
                 bound_email, model_name=model_name
             )
@@ -63,34 +72,41 @@ async def get_valid_credential(
                 log.debug(f"会话缓存命中: {bound_email}")
                 final = await _validate_or_refresh(result[0], result[1])
                 if final is None:
-                    # 绑定凭证 token 永久失效等，解绑走正常选取
-                    await session_cache.delete_session_binding(session_key)
+                    failed_emails.add(bound_email)
+                    await session_cache.delete_session_binding(session_key, expected_email=bound_email)
                 else:
                     return final
             else:
                 # 绑定凭证不可用（禁用/CD/删除），解绑
-                await session_cache.delete_session_binding(session_key)
+                await session_cache.delete_session_binding(session_key, expected_email=bound_email)
 
     # sticky 模式：优先当前粘性凭证
-    if mode == "sticky" and _sticky_email and _sticky_email not in exclude_emails:
+    sticky_email = _sticky_email
+    if mode == "sticky" and sticky_email and sticky_email not in initial_exclusions:
         result = await database.get_available_credential_by_email(
-            _sticky_email, model_name=model_name
+            sticky_email, model_name=model_name
         )
         if result:
             final = await _validate_or_refresh(result[0], result[1])
             if final is not None:
                 return final
-        # 粘性凭证 CD/禁用/失效，清除指针换新
-        _sticky_email = None
+            failed_emails.add(sticky_email)
+        if _sticky_email == sticky_email:
+            _sticky_email = None
 
     # 通用随机选取（random 模式 / cache 未命中 / sticky 无可用粘性凭证）
     max_retries = 3
     for attempt in range(max_retries):
-        result = await database.get_next_available_credential(model_name=model_name, exclude_emails=exclude_emails)
+        result = await database.get_next_available_credential(
+            model_name=model_name, exclude_emails=initial_exclusions.union(failed_emails),
+            report_missing_model=report_missing_model,
+        )
 
         if not result:
-            if attempt == 0:
-                log.warning(f"没有可用凭证 (model_name={model_name})")
+            if failed_emails:
+                break
+            await report_pool_limit(database, model_name, caller_exclusions, limited)
+            log.warning(f"没有可用凭证 (model_name={model_name})")
             return None
 
         email, credential_data = result
@@ -104,13 +120,29 @@ async def get_valid_credential(
             log.warning(
                 f"Token刷新失败，尝试下一个凭证: {email} (attempt={attempt + 1}/{max_retries})"
             )
-            exclude_emails.add(email)
+            failed_emails.add(email)
             continue
 
         await _after_picked(mode, email, session_key)
         return email, credential_data
 
-    log.error(f"重试{max_retries}次后仍无可用凭证 (model_name={model_name})")
+    # A concurrent import or refresh may have published a ready token under
+    # an email whose previous token failed. This pass never performs OAuth.
+    limited = await database.get_dispatch_limit_waits(model_name) if model_name else {}
+    excluded = caller_exclusions.union(limited)
+    while True:
+        ready = await database.get_next_available_credential(
+            model_name=model_name, exclude_emails=excluded, require_ready_token=True,
+            report_missing_model=report_missing_model,
+        )
+        if not ready:
+            break
+        if not await should_refresh_token(ready[1]):
+            await _after_picked(mode, ready[0], session_key)
+            return ready
+        excluded.add(ready[0])
+    await report_pool_limit(database, model_name, caller_exclusions, limited)
+    log.warning(f"刷新失败后未找到可直接调用的凭证 (model_name={model_name})")
     return None
 
 
@@ -150,20 +182,18 @@ async def add_credential(email: str, credential_data: Dict[str, Any]):
 async def remove_credential(email: str) -> bool:
     """删除凭证"""
     database = await get_database()
-    try:
-        await database.delete_credential(email)
+    removed = await database.delete_credential(email)
+    if removed:
         log.info(f"Credential removed: {email}")
-        return True
-    except Exception as e:
-        log.error(f"Error removing credential {email}: {e}")
-        return False
+    return removed
 
 
-async def update_credential_state(email: str, state_updates: Dict[str, Any]) -> bool:
+
+async def update_credential_state(email: str, state_updates: Dict[str, Any], *, expected_revision=None) -> bool:
     """更新凭证状态字段（disabled/error_codes/tier/project_id 等）"""
     database = await get_database()
     try:
-        success = await database.update_credential_state(email, state_updates)
+        success = await database.update_credential_state(email, state_updates, expected_revision=expected_revision)
         if not success:
             log.warning(f"Failed to update credential state: {email}")
         return success
@@ -172,9 +202,9 @@ async def update_credential_state(email: str, state_updates: Dict[str, Any]) -> 
         return False
 
 
-async def set_cred_disabled(email: str, disabled: bool):
+async def set_cred_disabled(email: str, disabled: bool, *, expected_revision=None):
     """设置凭证的启用/禁用状态"""
-    success = await update_credential_state(email, {"disabled": disabled})
+    success = await update_credential_state(email, {"disabled": disabled}, expected_revision=expected_revision)
     if success:
         log.info(f"Credential {'disabled' if disabled else 'enabled'}: {email}")
     return success
@@ -189,6 +219,7 @@ async def record_api_call_result(
     cooldown_until: Optional[float] = None,
     model_name: Optional[str] = None,
     error_message: Optional[str] = None,
+    *, expected_revision=None,
 ):
     """
     记录 API 调用结果：
@@ -198,25 +229,28 @@ async def record_api_call_result(
     database = await get_database()
     try:
         if success:
-            asyncio.create_task(database.record_success(email, model_name=model_name))
+            asyncio.create_task(database.record_success(email, model_name=model_name, expected_revision=expected_revision))
         elif error_code:
-            if error_code == 404:
-                await queue_refresh(email, database)
             error_messages = {}
             if error_message:
                 error_messages[str(error_code)] = error_message
 
-            await update_credential_state(email, {
+            saved = await database.update_credential_state(email, {
                 "error_codes": [error_code],
                 "error_messages": error_messages,
-            })
+            }, expected_revision=expected_revision)
+            if not saved:
+                return
+            if error_code == 404:
+                await queue_refresh(email, database, expected_revision=expected_revision)
 
             if cooldown_until is not None and model_name:
-                await database.set_model_cooldown(email, model_name, cooldown_until)
-                log.info(
-                    f"设置模型级冷却: {email}, model={model_name}, "
-                    f"冷却至: {datetime.fromtimestamp(cooldown_until, timezone.utc).isoformat()}"
-                )
+                applied = await database.set_model_cooldown(email, model_name, cooldown_until, expected_revision=expected_revision)
+                if applied:
+                    log.info(
+                        f"设置模型级冷却: {email}, model={model_name}, "
+                        f"冷却至: {datetime.fromtimestamp(cooldown_until, timezone.utc).isoformat()}"
+                    )
     except Exception as e:
         log.error(f"Error recording API call result for {email}: {e}")
 
@@ -225,33 +259,9 @@ async def record_api_call_result(
 
 async def should_refresh_token(credential_data: Dict[str, Any]) -> bool:
     """检查 token 是否需要刷新（剩余有效期不足 5 分钟视为需要刷新）"""
-    access_token = credential_data.get("access_token") or credential_data.get("token")
-    if not access_token:
-        return True
-
-    expiry_str = credential_data.get("expiry")
-    if not expiry_str:
-        return True
-
-    try:
-        if not isinstance(expiry_str, str):
-            return True
-        if "+" in expiry_str:
-            expiry = datetime.fromisoformat(expiry_str)
-        elif expiry_str.endswith("Z"):
-            expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
-        else:
-            expiry = datetime.fromisoformat(expiry_str)
-
-        if expiry.tzinfo is None:
-            expiry = expiry.replace(tzinfo=timezone.utc)
-
-        time_left = (expiry - datetime.now(timezone.utc)).total_seconds()
-        return time_left <= 300  # 5 分钟缓冲
-
-    except Exception as e:
-        log.warning(f"解析过期时间失败: {e}，需要刷新")
-        return True
+    token = credential_data.get("access_token") or credential_data.get("token")
+    return not (isinstance(token, str) and token.strip() and
+                expiry_allows_dispatch(credential_data.get("expiry"), datetime.now(timezone.utc)))
 
 
 async def refresh_token(
@@ -262,62 +272,12 @@ async def refresh_token(
     try:
         creds = Credentials.from_dict(credential_data)
 
-        if not creds.refresh_token:
-            log.error(f"没有refresh_token，无法刷新: {email}")
-            await update_credential_state(email, {"disabled": True})
-            log.warning(f"凭证已自动禁用（缺少refresh_token）: {email}")
-            return None
-
         log.debug(f"正在刷新token: {email}")
-        await creds.refresh()
-
-        if creds.access_token:
-            credential_data["access_token"] = creds.access_token
-            credential_data["token"] = creds.access_token
-        if creds.expires_at:
-            credential_data["expiry"] = creds.expires_at.isoformat() if hasattr(creds.expires_at, "isoformat") else str(creds.expires_at)
-
-        if not await database.update_access_token(
-            email, credential_data.get("refresh_token", ""),
-            credential_data.get("access_token", ""), credential_data.get("expiry", ""),
-        ):
-            return None
+        creds = await refresh_stored(database, email, creds, disable_on_rejection=True)
+        credential_data.update(creds.to_dict(), token=creds.access_token)
         log.info(f"Token刷新成功并已保存: {email}")
         return credential_data
 
     except Exception as e:
-        error_msg = str(e)
-        log.error(f"Token刷新失败 {email}: {error_msg}")
-
-        status_code = getattr(e, "status_code", None)
-
-        if _is_permanent_refresh_failure(error_msg, status_code):
-            log.warning(f"检测到凭证永久失效 (HTTP {status_code}): {email}")
-            await record_api_call_result(email, False, error_code=status_code or 400)
-            if await update_credential_state(email, {"disabled": True}):
-                log.warning(f"永久失效凭证已禁用: {email}")
-        else:
-            log.warning(f"Token刷新失败但非永久性错误 (HTTP {status_code})，不封禁凭证: {email}")
-
+        log.error(f"Token刷新失败 {email}: {e}")
         return None
-
-
-def _is_permanent_refresh_failure(error_msg: str, status_code: Optional[int] = None) -> bool:
-    """判断是否是凭证永久失效（客户端错误/明确失效错误）"""
-    if status_code is not None:
-        if status_code in (400, 401, 403):
-            return True
-        if status_code in (500, 502, 503, 504):
-            return False
-        if status_code == 429:
-            return False
-
-    permanent_patterns = (
-        "invalid_grant",
-        "refresh_token_expired",
-        "invalid_refresh_token",
-        "unauthorized_client",
-        "access_denied",
-    )
-    error_msg_lower = error_msg.lower()
-    return any(p in error_msg_lower for p in permanent_patterns)

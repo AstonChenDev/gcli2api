@@ -186,7 +186,7 @@ async def stream_generate_content(
         max_attempts = await get_anti_truncation_max_attempts()
 
         # 首先对payload应用反截断指令
-        anti_truncation_payload = apply_anti_truncation(api_request)
+        anti_truncation_payload = await apply_anti_truncation(api_request)
 
         first_attempt_stream = antigravity_api.stream_request(body=anti_truncation_payload, native=False, log_ctx=log_ctx)
         try:
@@ -328,11 +328,15 @@ async def stream_generate_content(
                     yield chunk
 
     # ========== 根据模式选择生成器 ==========
-    if use_anti_truncation:
+    # The continuation processor represents one answer history. Keep independent
+    # upstream choices intact when a caller requests multiple candidates.
+    if use_anti_truncation and (normalized_dict.get("generationConfig") or {}).get("candidateCount", 1) == 1:
         log.info("启用流式抗截断功能")
         return await build_streaming_response_or_error(anti_truncation_generator(), request=request)
-    else:
-        return await build_streaming_response_or_error(normal_stream_generator(), request=request)
+    response = await build_streaming_response_or_error(normal_stream_generator(), request=request)
+    if use_anti_truncation:
+        response.headers["X-Anti-Truncation"] = "disabled-multiple-candidates"
+    return response
 
 @router.post("/v1beta/models/{model:path}:countTokens")
 @router.post("/v1/models/{model:path}:countTokens")

@@ -1,6 +1,7 @@
 import { Eye, EyeOff, Rocket } from "lucide-react";
 import { useState } from "react";
 import api from "../api";
+import { panelTokenKey } from "../panelSession.js";
 
 export default function Login({ onSuccess }) {
   const [password, setPassword] = useState("");
@@ -15,7 +16,7 @@ export default function Login({ onSuccess }) {
 
     try {
       const res = await api.post("/auth/login", { password });
-      localStorage.setItem("agy2apiPreviewPanelToken", res.data.token);
+      localStorage.setItem(panelTokenKey, res.data.token);
       onSuccess();
     } catch (err) {
       setError(err.response?.data?.detail || "登录失败");

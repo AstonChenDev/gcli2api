@@ -22,6 +22,17 @@ def normalize_system_instruction(request: dict) -> dict:
     return result
 
 
+def _comparison_value(key, value):
+    # Effort routing ignores case and surrounding whitespace. Apply that rule
+    # only to the protocol field, without rewriting the selected wire value.
+    if key == 'thinkingLevel' and isinstance(value, str):
+        return value.strip().lower()
+    child = {'generationConfig': 'thinkingConfig', 'thinkingConfig': 'thinkingLevel'}.get(key)
+    if child and isinstance(value, dict) and child in value:
+        return {**value, child: _comparison_value(child, value[child])}
+    return value
+
+
 def _normalize_aliases(value: dict, names: tuple) -> dict:
     result = dict(value)
     for snake, camel in names:
@@ -29,41 +40,65 @@ def _normalize_aliases(value: dict, names: tuple) -> dict:
             continue
         supplied = result.pop(snake)
         existing = result.get(camel)
-        if supplied is not None and existing is not None and supplied != existing:
+        if supplied is not None and existing is not None and _comparison_value(camel, supplied) != _comparison_value(camel, existing):
             raise HTTPException(400, f"{snake} 与 {camel} 内容冲突，请只提供其中一个字段")
         if existing is None and supplied is not None:
             result[camel] = supplied
     return result
 
 
+def _normalize_container(owner, snake, camel, normalize):
+    # Compare equivalent containers only after their protocol keys are canonical.
+    values = dict(owner)
+    for key in (snake, camel):
+        if isinstance(values.get(key), dict):
+            values[key] = normalize(values[key])
+    return _normalize_aliases(values, ((snake, camel),))
+
+
+def _thinking(value):
+    return _normalize_aliases(value, (
+        ('include_thoughts', 'includeThoughts'), ('thinking_budget', 'thinkingBudget'),
+        ('thinking_level', 'thinkingLevel'),
+    ))
+
+
+def _generation(value):
+    result = _normalize_container(value, 'thinking_config', 'thinkingConfig', _thinking)
+    if result.get('thinkingConfig') is not None and not isinstance(result['thinkingConfig'], dict):
+        raise HTTPException(400, "thinkingConfig 必须是对象")
+    result = _normalize_container(result, 'image_config', 'imageConfig', lambda image: _normalize_aliases(
+        image, (('aspect_ratio', 'aspectRatio'), ('image_size', 'imageSize'))
+    ))
+    return _normalize_aliases(result, (
+        ('top_p', 'topP'), ('top_k', 'topK'), ('max_output_tokens', 'maxOutputTokens'),
+        ('candidate_count', 'candidateCount'), ('stop_sequences', 'stopSequences'),
+        ('response_mime_type', 'responseMimeType'), ('response_schema', 'responseSchema'),
+        ('response_json_schema', 'responseJsonSchema'), ('response_modalities', 'responseModalities'),
+        ('presence_penalty', 'presencePenalty'), ('frequency_penalty', 'frequencyPenalty'),
+    ))
+
+
+def _tool_config(value):
+    return _normalize_container(value, 'function_calling_config', 'functionCallingConfig', lambda config:
+        _normalize_aliases(config, (('allowed_function_names', 'allowedFunctionNames'),))
+    )
+
+
 def normalize_gemini_request_fields(request: dict) -> dict:
     """Normalize protocol containers only; never rename schema properties or tool arguments."""
     result = _normalize_aliases(normalize_system_instruction(request), (
-        ('generation_config', 'generationConfig'), ('safety_settings', 'safetySettings'),
-        ('tool_config', 'toolConfig'), ('session_id', 'sessionId'),
+        ('safety_settings', 'safetySettings'), ('session_id', 'sessionId'),
     ))
+    result = _normalize_container(result, 'tool_config', 'toolConfig', _tool_config)
+    result = _normalize_container(result, 'generation_config', 'generationConfig', _generation)
+    # Explicit nested settings take precedence over both legacy root aliases.
+    legacy = {key: result.pop(key) for key in ('thinking_config', 'thinkingConfig') if key in result}
     generation = result.get('generationConfig')
-    if isinstance(generation, dict):
-        generation = _normalize_aliases(generation, (
-            ('top_p', 'topP'), ('top_k', 'topK'), ('max_output_tokens', 'maxOutputTokens'),
-            ('candidate_count', 'candidateCount'), ('stop_sequences', 'stopSequences'),
-            ('response_mime_type', 'responseMimeType'), ('response_schema', 'responseSchema'),
-            ('response_json_schema', 'responseJsonSchema'), ('thinking_config', 'thinkingConfig'),
-            ('response_modalities', 'responseModalities'), ('image_config', 'imageConfig'),
-            ('presence_penalty', 'presencePenalty'), ('frequency_penalty', 'frequencyPenalty'),
-        ))
-        if isinstance(generation.get('thinkingConfig'), dict):
-            generation['thinkingConfig'] = _normalize_aliases(generation['thinkingConfig'], (
-                ('include_thoughts', 'includeThoughts'), ('thinking_budget', 'thinkingBudget'), ('thinking_level', 'thinkingLevel'),
-            ))
-        if isinstance(generation.get('imageConfig'), dict):
-            generation['imageConfig'] = _normalize_aliases(generation['imageConfig'], (
-                ('aspect_ratio', 'aspectRatio'), ('image_size', 'imageSize'),
-            ))
-        result['generationConfig'] = generation
-    if isinstance(result.get('toolConfig'), dict):
-        tool = _normalize_aliases(result['toolConfig'], (('function_calling_config', 'functionCallingConfig'),))
-        if isinstance(tool.get('functionCallingConfig'), dict):
-            tool['functionCallingConfig'] = _normalize_aliases(tool['functionCallingConfig'], (('allowed_function_names', 'allowedFunctionNames'),))
-        result['toolConfig'] = tool
+    if legacy and (generation is None or isinstance(generation, dict) and 'thinkingConfig' not in generation):
+        thinking = _normalize_container(legacy, 'thinking_config', 'thinkingConfig', _thinking).get('thinkingConfig')
+        if thinking is not None:
+            if not isinstance(thinking, dict):
+                raise HTTPException(400, "thinkingConfig 必须是对象")
+            result['generationConfig'] = {**(generation or {}), 'thinkingConfig': thinking}
     return result

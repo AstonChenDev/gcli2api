@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Loader2 } from 'lucide-react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
+import { ChevronRight, Loader2 } from 'lucide-react';
 import api from '../api';
 import { formatMillions } from '../utils/tokens';
-import { estimateQuota, percent, quotaPool, defaultEstimateMode } from '../utils/modelUsage';
+import { estimateQuota, groupModelUsage, percent, quotaPool, defaultEstimateMode } from '../utils/modelUsage';
 import { quotaCalibration } from '../utils/quotaCalibration';
 
 const WEIGHTS_KEY = `agy-model-quota-weights-v1:${window.location.pathname}`;
@@ -20,11 +20,26 @@ const loadWeights = () => {
   } catch { return {}; }
 };
 
+function UsageCells({ row, estimateMode }) {
+  return <><td>{number(row.attempts)}</td>
+            <td className="whitespace-nowrap" title={number(row.prompt_tokens)}>{formatMillions(row.prompt_tokens)}<div className="text-xs text-slate-500">{percent(row.prompt_tokens_percentage)}</div></td>
+            <td className="whitespace-nowrap" title={number(row.completion_tokens)}>{formatMillions(row.completion_tokens)}<div className="text-xs text-slate-500">{percent(row.completion_tokens_percentage)}</div></td>
+            <td className="whitespace-nowrap" title={number(row.cached_tokens)}>{formatMillions(row.cached_tokens)}</td>
+            <td className="min-w-40" title={number(row.total_tokens)}><div className="font-semibold whitespace-nowrap">{formatMillions(row.total_tokens)}</div>
+              <div className="text-xs text-purple-700">{percent(row.total_tokens_percentage)}</div>
+              <div className="bg-purple-100 rounded-full h-1.5 mt-1"><div className="h-full bg-purple-500 rounded-full" style={{ width: `${row.total_tokens_percentage || 0}%` }} /></div></td>
+            <td className="whitespace-nowrap" title={number(row.failed_tokens)}>{formatMillions(row.failed_tokens)}</td>
+            <td className="min-w-40"><span className="font-medium">{percent(row.estimated_quota_percentage)}</span><div className="text-xs text-slate-500">{row.quota_pool || '未识别额度组'}</div>
+              <div className="text-xs text-slate-500">{!row.quota_pool ? '不参与估算' : estimateMode === 'calibrated' ? row.estimate_missing_models ? `${row.estimate_missing_models} 个模型待校准` : row.calibration ? '实测权重 · 缓存按输入估算' : '尚无实测权重' : estimateMode === 'tokens' ? '等权 Token 估算' : row.estimate_missing_models ? `${row.estimate_missing_models} 个模型待配置` : row.estimated_units == null ? '未配置权重' : `${row.estimated_units.toLocaleString('zh-CN', { maximumFractionDigits: 4 })} 估算单位`}</div></td>
+  </>;
+}
+
 export default function ModelTokenStats({ filters }) {
   const [data, setData] = useState(null), [error, setError] = useState(''), [loading, setLoading] = useState(true);
   const [weights, setWeights] = useState(loadWeights), [storageError, setStorageError] = useState('');
   const [estimateMode, setEstimateMode] = useState(loadMode);
   const [sort, setSort] = useState('total_tokens');
+  const [expandedModels, setExpandedModels] = useState(() => new Set());
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true); setError(''); setData(null);
@@ -36,6 +51,12 @@ export default function ModelTokenStats({ filters }) {
   }, [filters]);
   const rows = useMemo(() => estimateQuota(data?.items || [], weights, estimateMode)
     .sort((a, b) => (b[sort] || 0) - (a[sort] || 0) || a.model_name.localeCompare(b.model_name)), [data, weights, sort, estimateMode]);
+  const groups = useMemo(() => groupModelUsage(rows, sort), [rows, sort]);
+  const toggleModel = model => setExpandedModels(previous => {
+    const next = new Set(previous);
+    if (next.has(model)) next.delete(model); else next.add(model);
+    return next;
+  });
   const changeMode = value => {
     setEstimateMode(value);
     try { localStorage.setItem(MODE_KEY, value); setStorageError(''); }
@@ -83,20 +104,32 @@ export default function ModelTokenStats({ filters }) {
         {storageError && <p role="alert" className="text-xs">{storageError}</p>}
       </div>
       {!rows.length ? <p className="py-4 text-sm text-slate-500">所选范围暂无模型用量记录。</p> : <>
-        <div className="table-container"><table>
-          <thead><tr>{['实际模型', '调用次数', '输入 / 占比', '输出 / 占比', '缓存（已含输入）', '总 Token / 占比', '失败 Token', '额度估算（组内）'].map(h => <th key={h} className="whitespace-nowrap">{h}</th>)}</tr></thead>
-          <tbody>{rows.map(row => <tr key={row.model_name}>
-            <td className="break-all min-w-48">{row.model_name}</td><td>{number(row.attempts)}</td>
-            <td className="whitespace-nowrap" title={number(row.prompt_tokens)}>{formatMillions(row.prompt_tokens)}<div className="text-xs text-slate-500">{percent(row.prompt_tokens_percentage)}</div></td>
-            <td className="whitespace-nowrap" title={number(row.completion_tokens)}>{formatMillions(row.completion_tokens)}<div className="text-xs text-slate-500">{percent(row.completion_tokens_percentage)}</div></td>
-            <td className="whitespace-nowrap" title={number(row.cached_tokens)}>{formatMillions(row.cached_tokens)}</td>
-            <td className="min-w-40" title={number(row.total_tokens)}><div className="font-semibold whitespace-nowrap">{formatMillions(row.total_tokens)}</div>
-              <div className="text-xs text-purple-700">{percent(row.total_tokens_percentage)}</div>
-              <div className="bg-purple-100 rounded-full h-1.5 mt-1"><div className="h-full bg-purple-500 rounded-full" style={{ width: `${row.total_tokens_percentage || 0}%` }} /></div></td>
-            <td className="whitespace-nowrap" title={number(row.failed_tokens)}>{formatMillions(row.failed_tokens)}</td>
-            <td className="min-w-40"><span className="font-medium">{percent(row.estimated_quota_percentage)}</span><div className="text-xs text-slate-500">{row.quota_pool || '未识别额度组'}</div>
-              <div className="text-xs text-slate-500">{!row.quota_pool ? '不参与估算' : estimateMode === 'calibrated' ? row.estimate_missing_models ? `${row.estimate_missing_models} 个模型待校准` : row.calibration ? '实测权重 · 缓存按输入估算' : '尚无实测权重' : estimateMode === 'tokens' ? '等权 Token 估算' : row.estimate_missing_models ? `${row.estimate_missing_models} 个模型待配置` : row.estimated_units == null ? '未配置权重' : `${row.estimated_units.toLocaleString('zh-CN', { maximumFractionDigits: 4 })} 估算单位`}</div></td>
-          </tr>)}</tbody>
+        <p className="text-xs text-slate-500">按模型类型汇总，点击模型展开各思考等级。明细占比仍以全部筛选结果为分母；额度占比仍在原额度组内计算。仅合并筛选后可见的实际模型。</p>
+        <div className="table-container"><table aria-label="按模型类型汇总的 Token 与额度占比">
+          <thead><tr>{['模型类型 / 思考等级', '调用次数', '输入 / 占比', '输出 / 占比', '缓存（已含输入）', '总 Token / 占比', '失败 Token', '额度估算（组内）'].map(h => <th key={h} className="whitespace-nowrap">{h}</th>)}</tr></thead>
+          <tbody>{groups.map(group => {
+            const expanded = expandedModels.has(group.model_name);
+            return <Fragment key={group.model_name}>
+              <tr className="bg-purple-50/60">
+                <td className="min-w-56">
+                  <button type="button" aria-expanded={expanded} aria-label={`${expanded ? '收起' : '展开'} ${group.model_name} 等级明细`}
+                    onClick={() => toggleModel(group.model_name)}
+                    className="flex w-full items-start gap-2 rounded text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-purple-500">
+                    <ChevronRight size={18} aria-hidden="true" className={`mt-0.5 shrink-0 transition-transform ${expanded ? 'rotate-90' : ''}`} />
+                    <span><span className="font-semibold break-all">{group.model_name}</span><span className="block text-xs text-slate-500 mt-1">合计 · {group.variants.length} 个实际模型 · {expanded ? '收起' : '展开'}等级明细</span></span>
+                  </button>
+                </td>
+                <UsageCells row={group} estimateMode={estimateMode} />
+              </tr>
+              {expanded && group.variants.map(row => <tr key={row.model_name} className="bg-white">
+                <td className="min-w-56"><div className="pl-7 border-l-2 border-purple-100 ml-2">
+                  <span className="text-sm font-medium text-purple-800">{row.thinking_level || '未标注等级'}</span>
+                  <div className="break-all text-xs text-slate-500 mt-1">{row.model_name}</div>
+                </div></td>
+                <UsageCells row={row} estimateMode={estimateMode} />
+              </tr>)}
+            </Fragment>;
+          })}</tbody>
         </table></div>
         {(estimateMode === 'calibrated' || quotaCalibration.observations?.length > 0) && <details className="rounded-lg border border-slate-200 p-3">
           <summary className="cursor-pointer text-sm font-medium">查看额度校准记录与适用范围</summary>

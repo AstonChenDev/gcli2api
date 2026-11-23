@@ -21,6 +21,7 @@ from src.converter.thoughtSignature_fix import (
     SKIP_THOUGHT_SIGNATURE_VALIDATOR,
 )
 from src.converter.utils import merge_system_messages
+from src.stream_metadata import BLOCK_REASONS, token_counters
 
 from log import log
 
@@ -56,21 +57,12 @@ def _convert_usage_metadata(usage_metadata: Dict[str, Any]) -> Optional[Dict[str
     if not isinstance(usage_metadata, dict) or not usage_metadata:
         return None
 
-    def token_count(key, default=0):
-        # Usage is optional metadata, never a reason to discard valid content.
-        value = usage_metadata.get(key)
-        try:
-            return max(0, int(value)) if value is not None and not isinstance(value, bool) else default
-        except (ValueError, TypeError, OverflowError):
-            return default
-
-    prompt_tokens = token_count("promptTokenCount")
-    cached_tokens = token_count("cachedContentTokenCount")
-    reasoning_tokens = token_count("thoughtsTokenCount")
-    completion_tokens = (
-        token_count("candidatesTokenCount") + reasoning_tokens
-    )
-    total_tokens = token_count("totalTokenCount", prompt_tokens + completion_tokens)
+    counts = token_counters(usage_metadata)
+    prompt_tokens = counts.get("promptTokenCount", 0)
+    cached_tokens = counts.get("cachedContentTokenCount", 0)
+    reasoning_tokens = counts.get("thoughtsTokenCount", 0)
+    completion_tokens = counts.get("candidatesTokenCount", 0) + reasoning_tokens
+    total_tokens = counts.get("totalTokenCount", prompt_tokens + completion_tokens)
 
     usage = {
         "prompt_tokens": prompt_tokens,
@@ -112,7 +104,7 @@ def _map_finish_reason(gemini_reason: str) -> str:
         return "stop"
     elif gemini_reason == "MAX_TOKENS":
         return "length"
-    elif gemini_reason in ["SAFETY", "RECITATION"]:
+    elif isinstance(gemini_reason, str) and gemini_reason in BLOCK_REASONS:
         return "content_filter"
     else:
         # 对于 None 或未知的 finishReason，返回 "stop" 作为默认值
@@ -747,20 +739,20 @@ def _clean_schema_for_parameters_json_schema(
         if key in unsupported_keys or key.startswith("x-"):
             del result[key]
 
-    nullable_props = set()
     if "properties" in result and isinstance(result["properties"], dict):
-        cleaned_props = {}
-        for prop_name, prop_schema in result["properties"].items():
-            if isinstance(prop_schema, dict):
-                prop_type = prop_schema.get("type")
-                if isinstance(prop_type, list) and any(str(t).lower() == "null" for t in prop_type):
-                    nullable_props.add(prop_name)
-            cleaned_props[prop_name] = _clean_schema_for_parameters_json_schema(prop_schema, root_schema, visited)
+        cleaned_props = {
+            prop_name: _clean_schema_for_parameters_json_schema(prop_schema, root_schema, visited)
+            for prop_name, prop_schema in result["properties"].items()
+        }
         result["properties"] = cleaned_props
 
     if "properties" in result and "type" not in result:
         result["type"] = "object"
 
+    # required 仅约束字段必须出现，null 也是合法取值；nullable 不等于可选。
+    # 若把 nullable 属性（如 Pydantic v2 的 type: ["string", "null"]）从 required
+    # 中剔除，上游 Gemini 会认为所有参数都非必填，频繁生成空参数 {} 的工具调用，
+    # 因此保留原始接口契约中的 required 约束。
     if "required" in result and isinstance(result["required"], list):
         prop_names = set(result.get("properties", {}).keys()) if isinstance(result.get("properties"), dict) else None
         required = []
@@ -768,8 +760,6 @@ def _clean_schema_for_parameters_json_schema(
             if not isinstance(item, str):
                 continue
             if prop_names is not None and item not in prop_names:
-                continue
-            if item in nullable_props:
                 continue
             if item not in required:
                 required.append(item)
@@ -1065,8 +1055,15 @@ def extract_tool_calls_from_parts(
             function_call = part["functionCall"]
             # 获取原始ID或生成新ID
             original_id = function_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"
-            # 获取参数并转换类型
+            # 获取参数并转换类型（容错：部分代理上游会返回 JSON 字符串格式的 args）
             args = function_call.get("args", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
             # 将字符串类型的值转回原始类型
             args = _reverse_transform_args(args)
 
@@ -1423,9 +1420,10 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
         generation_config["topP"] = openai_request["top_p"]
     if "top_k" in openai_request:
         generation_config["topK"] = openai_request["top_k"]
-    if "max_tokens" in openai_request or "max_completion_tokens" in openai_request:
-        # max_completion_tokens 优先于 max_tokens
-        max_tokens = openai_request.get("max_completion_tokens") or openai_request.get("max_tokens")
+    max_tokens = openai_request.get("max_completion_tokens")
+    if max_tokens is None:
+        max_tokens = openai_request.get("max_tokens")
+    if max_tokens is not None:
         generation_config["maxOutputTokens"] = max_tokens
     if "stop" in openai_request:
         stop = openai_request["stop"]
@@ -1440,23 +1438,21 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
         generation_config["seed"] = openai_request["seed"]
 
     # 处理 response_format
-    if "response_format" in openai_request and openai_request["response_format"]:
-        response_format = openai_request["response_format"]
+    response_format = openai_request.get("response_format")
+    if response_format is not None:
+        if not isinstance(response_format, dict):
+            raise ValueError("response_format 必须是对象")
         format_type = response_format.get("type")
-
         if format_type == "json_schema":
-            # JSON Schema 模式
-            if "json_schema" in response_format and "schema" in response_format["json_schema"]:
-                schema = response_format["json_schema"]["schema"]
-                # 清理 schema
-                generation_config["responseSchema"] = _clean_schema_for_gemini(schema)
-                generation_config["responseMimeType"] = "application/json"
-        elif format_type == "json_object":
-            # JSON Object 模式
+            definition = response_format.get("json_schema")
+            if not isinstance(definition, dict) or not isinstance(definition.get("schema"), dict):
+                raise ValueError("response_format.json_schema.schema 必须是 JSON Schema 对象")
+            generation_config["responseJsonSchema"] = definition["schema"]
             generation_config["responseMimeType"] = "application/json"
-        elif format_type == "text":
-            # Text 模式
-            generation_config["responseMimeType"] = "text/plain"
+        elif format_type == "json_object":
+            generation_config["responseMimeType"] = "application/json"
+        elif format_type != "text":
+            raise ValueError("response_format.type 必须是 text、json_object 或 json_schema")
 
     # 如果contents为空,添加默认用户消息
     if not contents:
@@ -1549,15 +1545,16 @@ def convert_gemini_to_openai_response(
     # 转换为 OpenAI 格式
     choices = []
 
-    for position, candidate in enumerate(gemini_response.get("candidates", [])):
-        role = candidate.get("content", {}).get("role", "assistant")
+    for position, candidate in enumerate(gemini_response.get("candidates") or []):
+        content = candidate.get("content") or {}
+        role = content.get("role", "assistant")
 
         # 将Gemini角色映射回OpenAI角色
         if role == "model":
             role = "assistant"
 
         # 提取并分离thinking tokens和常规内容
-        parts = candidate.get("content", {}).get("parts", [])
+        parts = content.get("parts", [])
 
         # 提取工具调用和文本内容
         tool_calls, text_content = extract_tool_calls_from_parts(parts)
@@ -1727,16 +1724,17 @@ def convert_gemini_to_openai_stream(
     choices = []
     state = tool_call_state if tool_call_state is not None else _STREAM_TOOL_INDEX.get(response_id, {})
 
-    for position, candidate in enumerate(gemini_response.get("candidates", [])):
+    for position, candidate in enumerate(gemini_response.get("candidates") or []):
         candidate_index = candidate.get("index", position)
-        role = candidate.get("content", {}).get("role", "assistant")
+        content = candidate.get("content") or {}
+        role = content.get("role", "assistant")
 
         # 将Gemini角色映射回OpenAI角色
         if role == "model":
             role = "assistant"
 
         # 提取并分离thinking tokens和常规内容
-        parts = candidate.get("content", {}).get("parts", [])
+        parts = content.get("parts", [])
 
         # 提取工具调用和文本内容 (流式需要 index)
         tool_calls, text_content = extract_tool_calls_from_parts(parts, is_streaming=True)
@@ -1865,11 +1863,9 @@ def convert_gemini_to_openai_stream(
         "choices": choices,
     }
 
-    # 只在有 usage 数据且有 finish_reason 时添加 usage
-    if usage:
-        has_finish_reason = any(choice.get("finish_reason") for choice in choices)
-        if has_finish_reason:
-            response_data["usage"] = usage
+    # The final usage report may follow the finished choices in its own event.
+    if usage and (not choices or any(choice["finish_reason"] for choice in choices)):
+        response_data["usage"] = usage
 
     # 转换为 SSE 格式: "data: {json}\n\n"
     return f"data: {json.dumps(response_data)}\n\n"

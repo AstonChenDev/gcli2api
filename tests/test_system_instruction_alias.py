@@ -77,7 +77,7 @@ class SystemAliasTests(unittest.IsolatedAsyncioTestCase):
         before = copy.deepcopy(original)
         normalized = await normalize_antigravity_request(original)
         self.assert_system(normalized)
-        anti = apply_anti_truncation({'model': original['model'], 'request': original})
+        anti = await apply_anti_truncation({'model': original['model'], 'request': original})
         self.assert_system(anti['request'])
         self.assertGreater(len(anti['request']['systemInstruction']['parts']), 2)
         payload, _ = await api.wrap_cli_request(original, original['model'], 'test')

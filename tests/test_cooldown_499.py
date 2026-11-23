@@ -11,8 +11,11 @@ import httpx
 from fastapi import FastAPI, HTTPException
 
 from src import credential_cooldown as cooldown
+from src import credential_manager as manager
 from src.api import antigravity as api
-from src.storage.database import Database, Credential499State
+from src.panel import creds as panel_creds
+from src.utils import verify_panel_token
+from src.storage.database import Database, Credential499State, CredentialEntitlement, PoolModelUnavailable
 from src.stream_delivery import StreamDelivery, current_delivery
 
 
@@ -53,6 +56,65 @@ class CooldownTests(unittest.IsolatedAsyncioTestCase):
     async def trip(self):
         for i in range(3):
             await self.qualifying_failure(str(i))
+
+    async def test_prefetched_replaced_credential_reselects_before_admission(self):
+        old = await self.db.get_credential(self.email)
+        await self.db.store_credential(self.email, dict(self.cred, access_token="new", refresh_token="new-rt"))
+        new = await self.db.get_credential(self.email)
+        selector = AsyncMock(return_value=(self.email, new))
+        picked, lease = await cooldown.acquire_dispatch((self.email, old), "gemini-flash", None, "request", selector)
+        try:
+            self.assertEqual(picked[1]["access_token"], "new")
+            selector.assert_awaited_once()
+            self.assertEqual(len((await self.state())["dispatch_starts"]), 1)
+        finally:
+            await lease.result()
+            await lease.close()
+
+    async def test_prefetched_model_loss_checks_alternative_before_pool_404(self):
+        async with self.db.session() as session:
+            session.add(CredentialEntitlement(email=self.email, snapshot=json.dumps({"models": ["available"]})))
+        candidate = (self.email, self.cred)
+        with self.assertRaises(PoolModelUnavailable):
+            await cooldown.acquire_dispatch(candidate, "lost", None, "first", AsyncMock(return_value=None))
+        other = "second@example.invalid"
+        await self.db.store_credential(other, self.cred)
+        picked, lease = await cooldown.acquire_dispatch(
+            candidate, "lost", None, "next", AsyncMock(return_value=(other, self.cred))
+        )
+        try:
+            self.assertEqual(picked[0], other)
+        finally:
+            await lease.close()
+
+    async def test_panel_reports_unsupported_model_before_oauth_and_at_final_admission(self):
+        async with self.db.session() as session:
+            session.add(CredentialEntitlement(email=self.email, snapshot=json.dumps({"models": ["available"]})))
+        with patch.object(panel_creds, "get_database", AsyncMock(return_value=self.db)), patch.object(
+            panel_creds, "refresh_stored", AsyncMock(side_effect=AssertionError("unexpected OAuth"))
+        ) as oauth, patch.object(panel_creds.httpx_client, "post_async", AsyncMock()) as upstream:
+            with self.assertRaises(HTTPException) as error:
+                await panel_creds.test_credential(self.email, "absent", "test")
+            self.assertEqual(error.exception.status_code, 404)
+            self.assertIn("absent", error.exception.detail)
+            oauth.assert_not_awaited()
+            with patch.object(self.db, "get_dispatch_limit_waits", AsyncMock(return_value={})), patch.object(
+                panel_creds.Credentials, "is_expired", return_value=False
+            ), patch.object(panel_creds, "get_antigravity_api_url", AsyncMock(return_value="http://upstream.invalid")):
+                with self.assertRaises(HTTPException) as error:
+                    await panel_creds.test_credential(self.email, "absent", "test")
+                self.assertEqual(error.exception.status_code, 404)
+                self.assertFalse(error.exception.headers)
+            upstream.assert_not_awaited()
+
+    async def test_reimport_during_old_request_cannot_trip_replacement_499_protection(self):
+        await self.settings(threshold=1)
+        key, _ = await self.admit("before")
+        await self.db.store_credential(self.email, dict(self.cred, refresh_token="new-rt"))
+        await self.store.finish(self.email, key, elapsed=100, cancelled_empty=True)
+        self.assertEqual((await self.state())["groups"]["*"]["phase"], "closed")
+        await self.qualifying_failure("real-new-failure")
+        self.assertIsNone((await self.admit())[0])
 
     async def test_manual_clear_preserves_live_leases_and_fences_old_results(self):
         old, _ = await self.admit("old")
@@ -477,6 +539,128 @@ class CooldownTests(unittest.IsolatedAsyncioTestCase):
         await lease.result(success=True)
         await lease.close()
 
+    async def test_dispatch_limits_are_atomic_and_span_models(self):
+        await self.settings(mode="off")
+        await self.db.update_credential_state(self.email, {"concurrency_limit": 2, "rpm_limit": 3})
+        def worker():
+            return cooldown.CooldownStore(self.db, lambda: self.now)
+        results = await asyncio.gather(*(worker().admit(self.email, f"model-{i}", "same-request")
+                                         for i in range(8)), return_exceptions=True)
+        keys = [r[0] for r in results if isinstance(r, tuple)]
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(sum(isinstance(r, cooldown.DispatchLimited) for r in results), 6)
+        await self.store.finish(self.email, keys[0])
+        self.now += 5
+        key, _ = await self.admit("retry")
+        await self.store.finish(self.email, key)
+        with self.assertRaises(cooldown.DispatchLimited) as full:
+            await self.store.admit(self.email, "panel-model", "manual", manual=True)
+        self.assertEqual(full.exception.retry_after, 55)
+        await self.store.clear(self.email)
+        with self.assertRaises(cooldown.DispatchLimited):
+            await self.admit()
+        self.now += 55
+        self.assertIsNotNone((await self.admit())[0])
+
+    async def test_selection_skips_saturated_expired_token_before_refresh_in_all_modes(self):
+        await self.db.update_credential_state(self.email, {"rpm_limit": 1})
+        await self.admit()
+        second = "spare@example.invalid"
+        await self.db.store_credential(second, self.cred)
+        self.stack.enter_context(patch.object(manager, "get_database", AsyncMock(return_value=self.db)))
+        self.stack.enter_context(patch.object(manager.session_cache, "get_session_binding", AsyncMock(return_value=self.email)))
+        self.stack.enter_context(patch.object(manager, "_after_picked", AsyncMock()))
+        self.stack.enter_context(patch("src.storage.database.time.time", return_value=self.now))
+        refresh = self.stack.enter_context(patch.object(manager, "refresh_token", AsyncMock()))
+        check = self.stack.enter_context(patch.object(manager, "should_refresh_token", AsyncMock(return_value=False)))
+        for mode in ("random", "sticky", "cache"):
+            with patch.object(manager, "get_credential_select_mode", AsyncMock(return_value=mode)), patch.object(manager, "_sticky_email", self.email):
+                picked = await manager.get_valid_credential("gemini-4-argon", "session")
+                self.assertEqual(picked[0], second)
+                self.assertEqual(check.await_args.args[0]["email"], second)
+                check.reset_mock()
+                with self.assertRaises(cooldown.DispatchLimited) as full:
+                    await manager.get_valid_credential("gemini-4-argon", "session", exclude_emails={second})
+                self.assertEqual(full.exception.retry_after, 60)
+                check.assert_not_awaited()
+        refresh.assert_not_awaited()
+        self.assertEqual(len((await self.state())["dispatch_starts"]), 1)
+
+    async def test_limit_edit_api_and_failover(self):
+        app = FastAPI()
+        app.include_router(panel_creds.router)
+        app.dependency_overrides[verify_panel_token] = lambda: "test"
+        limits = {"concurrency_limit": 0, "rpm_limit": 1}
+        with patch.object(panel_creds, "get_database", AsyncMock(return_value=self.db)):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+                path = "/creds/limits/" + self.email
+                self.assertEqual((await client.patch(path, json=limits)).status_code, 200)
+                self.assertEqual((await client.patch(path, json={**limits, "rpm_limit": -1})).status_code, 422)
+                self.assertEqual((await client.patch("/creds/limits/missing", json=limits)).status_code, 404)
+        self.assertEqual((await self.db.get_credentials_summary())["items"][0]["rpm_limit"], 1)
+        await self.admit()
+        second = "available@example.invalid"
+        await self.db.store_credential(second, self.cred)
+        with patch.object(cooldown, "CooldownStore", return_value=self.store):
+            chosen, lease = await cooldown.acquire_dispatch((self.email, self.cred), "model", None, "r",
+                                                            AsyncMock(return_value=(second, self.cred)))
+            self.assertEqual(chosen[0], second)
+            await lease.result(success=True)
+            await lease.close()
+            with self.assertRaises(cooldown.DispatchLimited):
+                await cooldown.acquire_dispatch((self.email, self.cred), "model", None, "r", AsyncMock(return_value=None))
+        await self.db.update_credential_state(self.email, {"rpm_limit": 0})
+        self.assertIsNotNone((await self.admit())[0])
+
+    async def test_enforced_breaker_deadline_extends_only_same_family_retry_hint(self):
+        model = "gemini-4-argon"
+        await self.settings(scope="family", threshold=1, duration_seconds=120)
+        await self.db.update_credential_state(self.email, {"rpm_limit": 1})
+        await self.qualifying_failure("disconnect", model=model)
+        with patch("src.storage.database.time.time", return_value=self.now), patch.object(
+            manager, "get_database", AsyncMock(return_value=self.db)
+        ), patch.object(manager, "get_credential_select_mode", AsyncMock(return_value="random")):
+            for family, wait in [(model, 120), ("claude-test", 60)]:
+                with self.assertRaises(cooldown.DispatchLimited) as rejected:
+                    await manager.get_valid_credential(family)
+                self.assertEqual(rejected.exception.retry_after, wait)
+            await self.db.set_model_cooldown(self.email, model, self.now + 3)
+            for dispatch in (False, True):
+                with self.assertRaises(cooldown.QuotaCooling) as rejected:
+                    if dispatch:
+                        await self.store.admit(self.email, model, "in-flight")
+                    else:
+                        await manager.get_valid_credential(model)
+                self.assertEqual(rejected.exception.retry_after, 120)
+            await self.settings(mode="observe")
+            with self.assertRaises(cooldown.QuotaCooling) as rejected:
+                await manager.get_valid_credential(model)
+            self.assertEqual(rejected.exception.retry_after, 60)
+
+    async def test_shorter_breaker_wait_wins_over_other_accounts_rpm(self):
+        model = "gemini-4-argon"
+        other = "limited@example.invalid"
+        await self.settings(threshold=1, duration_seconds=3)
+        await self.qualifying_failure("disconnect")
+        await self.db.store_credential(other, self.cred)
+        await self.db.update_credential_state(other, {"rpm_limit": 1})
+        key, _ = await self.store.admit(other, model, "recent")
+        await self.store.finish(other, key)
+        with patch.object(cooldown, "CooldownStore", return_value=self.store), patch.object(
+            manager, "get_database", AsyncMock(return_value=self.db)
+        ), patch.object(manager, "get_credential_select_mode", AsyncMock(return_value="random")), patch(
+            "src.storage.database.time.time", return_value=self.now
+        ):
+            with self.assertRaises(cooldown.PoolCooling) as blocked:
+                await cooldown.acquire_dispatch((self.email, self.cred), model, None, "blocked", manager.get_valid_credential)
+            self.assertEqual((blocked.exception.status_code, blocked.exception.retry_after), (503, 3))
+            self.now += 3
+            chosen, lease = await cooldown.acquire_dispatch(
+                (self.email, self.cred), model, None, "probe", manager.get_valid_credential
+            )
+            self.assertEqual(chosen[0], self.email)
+            await lease.close()
+
     async def test_pool_cooling_returns_503_without_calling_upstream(self):
         self.patch_api()
         await self.trip()
@@ -511,9 +695,21 @@ class CooldownTests(unittest.IsolatedAsyncioTestCase):
             await other.close()
 
     async def test_all_protocols_preserve_pool_503_and_retry_after(self):
+        await self.trip()
+        await self.check_pool_response(503, "1200")
+
+    async def test_upstream_quota_after_prefetch_returns_429_across_protocols(self):
+        await self.db.set_model_cooldown(self.email, "gemini-4-argon", self.now + 45)
+        await self.check_pool_response(429, "45")
+
+    async def test_all_protocols_preserve_local_429_and_retry_after(self):
+        await self.db.update_credential_state(self.email, {"rpm_limit": 1})
+        await self.admit()
+        await self.check_pool_response(429, "60")
+
+    async def check_pool_response(self, status, retry_after):
         from src.router.antigravity import openai, anthropic, gemini
         self.patch_api()
-        await self.trip()
         cases = [
             (openai, "/v1/chat/completions", {"model": "gemini-4-argon", "messages": [{"role": "user", "content": "test"}]}),
             (anthropic, "/v1/messages", {"model": "gemini-4-argon", "max_tokens": 8, "messages": [{"role": "user", "content": "test"}]}),
@@ -531,8 +727,8 @@ class CooldownTests(unittest.IsolatedAsyncioTestCase):
                     async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
                         response = await client.post(request_path, json=request_body)
                     with self.subTest(module=module.__name__, streaming=streaming):
-                        self.assertEqual(response.status_code, 503)
-                        self.assertEqual(response.headers.get("retry-after"), "1200")
+                        self.assertEqual(response.status_code, status)
+                        self.assertEqual(response.headers.get("retry-after"), retry_after)
             post.assert_not_awaited()
             stream.assert_not_called()
 
@@ -626,6 +822,17 @@ class CooldownTests(unittest.IsolatedAsyncioTestCase):
                             await asyncio.gather(task, return_exceptions=True)
                     self.assertTrue(leases[0].heartbeat.done())
                     self.assertEqual((await self.state())["leases"], {})
+
+    async def test_expired_lease_observes_new_concurrency_limit_in_passive_mode(self):
+        await self.settings(mode="observe")
+        for initial, updated in [(0, 1), (1, 0)]:
+            with self.subTest(initial=initial, updated=updated):
+                await self.db.update_credential_state(self.email, {"concurrency_limit": initial})
+                key, _ = await self.admit()
+                await self.db.update_credential_state(self.email, {"concurrency_limit": updated})
+                self.now += cooldown.LEASE_SECONDS + 1
+                self.assertFalse(await self.store.renew(self.email, key))
+                self.assertEqual(self.store.concurrency_limited, bool(updated))
 
     async def test_renewal_failure_uses_latest_successfully_read_mode(self):
         for initial, updated in (("enforce", "off"), ("enforce", "observe"), ("off", "enforce")):
@@ -744,7 +951,9 @@ class CooldownTests(unittest.IsolatedAsyncioTestCase):
     async def test_custom_rules_never_bypass_existing_quota_cooldown(self):
         await self.custom_groups([{"name": "高档", "patterns": ["*argon*"]}])
         await self.db.set_model_cooldown(self.email, "gemini-4-argon", self.now + 300)
-        self.assertIsNone((await self.admit("quota", "gemini-4-argon-high"))[0])
+        with self.assertRaises(cooldown.QuotaCooling) as blocked:
+            await self.admit("quota", "gemini-4-argon-high")
+        self.assertEqual(blocked.exception.retry_after, 300)
         self.assertIsNotNone((await self.admit("unrelated", "claude-sonnet"))[0])
 
     async def test_family_rule_edit_regroups_inflight_and_fences_old_success(self):

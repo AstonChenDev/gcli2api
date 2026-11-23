@@ -14,6 +14,15 @@ def event(text='OK', reason=None, index=0):
 
 
 class CompletionTests(unittest.TestCase):
+    def test_candidate_metadata_and_signature_are_not_another_answer(self):
+        state = StreamCompletion(2)
+        state.observe(event(reason="STOP"))
+        state.observe('data: {"candidates":[{"index":1,"groundingMetadata":{},'
+                      '"content":{"parts":[{"thoughtSignature":"only-signature"}]}}]}')
+        state.observe("data: [DONE]")
+        self.assertFalse(state.complete)
+        self.assertEqual(state.candidates, {0})
+
     def test_multiple_candidates_must_all_finish(self):
         state=StreamCompletion(2)
         state.observe(event(reason='STOP'));self.assertFalse(state.complete)
@@ -33,6 +42,81 @@ class CompletionTests(unittest.TestCase):
 
 class StreamAccountingTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_custom_audit.CustomAuditTests.asyncSetUp
+
+    async def collect_pair(self, chunks):
+        async def upstream(**kwargs):
+            for chunk in chunks:
+                yield chunk
+
+        body = {'model': 'gemini-4-argon-medium', 'request': {
+            'contents': [], 'generationConfig': {'candidateCount': 2}}}
+        with patch.object(api, 'stream_post_async', upstream):
+            return [chunk async for chunk in api.stream_request(body)]
+
+    async def test_empty_candidate_finishes_before_sibling_text(self):
+        for early_index in (0, 1):
+            with self.subTest(early_index=early_index):
+                candidate = {'index': early_index, 'finishReason': 'MAX_TOKENS',
+                             'finishMessage': 'token limit reached'}
+                early = 'data: ' + json.dumps({'candidates': [candidate]})
+                chunks = await self.collect_pair([early, event('answer', 'STOP', 1 - early_index)])
+                first, last = [json.loads(chunk[5:]) for chunk in chunks]
+                self.assertEqual(first['candidates'], [candidate])
+                self.assertEqual(last['response']['candidates'][0]['index'], 1 - early_index)
+                self.assertEqual(self.saved.call_args.args[0]['status_code'], 200)
+
+    async def test_refused_candidate_keeps_its_reason_and_completed_sibling(self):
+        answer = event('answer', 'STOP')
+        for text in ('', 'partial'):
+            refused = event(text, 'RECITATION', 1)
+            for upstream in ([refused, answer], [answer, refused]):
+                chunks = await self.collect_pair(upstream)
+                self.assertEqual([json.loads(chunk[5:]) for chunk in chunks],
+                                 [json.loads(chunk[5:]) for chunk in upstream])
+                self.assertEqual(self.saved.call_args.args[0]['status_code'], 200)
+
+    async def test_partial_refusal_without_sibling_keeps_error_at_eof_or_done(self):
+        refused = event('partial', 'RECITATION', 1)
+        for ending in ([], ['data: [DONE]']):
+            partial, error = await self.collect_pair([refused, *ending])
+            self.assertIn('partial', partial)
+            self.assertEqual(json.loads(error.body)['error']['blockReason'], 'RECITATION')
+            self.assertEqual(self.saved.call_args.args[0]['status_code'], 400)
+
+    async def test_refusal_without_an_answer_remains_a_client_error(self):
+        refused = event('', 'RECITATION', 1)
+        prompt_block = 'data: {"promptFeedback":{"blockReason":"SAFETY"}}'
+        for upstream in ([refused], [refused, event('', 'SAFETY')],
+                         [refused, prompt_block, event('answer', 'STOP')]):
+            chunks = await self.collect_pair(upstream)
+            self.assertEqual(len(chunks), 1)
+            self.assertEqual(chunks[0].status_code, 400)
+            self.assertEqual(self.saved.call_args.args[0]['status_code'], 400)
+
+    async def test_finished_candidate_alone_still_has_no_output(self):
+        chunks = await self.collect_pair([event('', 'MAX_TOKENS'), event('', 'STOP', index=1)])
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].status_code, 502)
+
+    async def test_done_with_a_missing_candidate_reports_error_before_client_can_stop(self):
+        for index in (0, 1):
+            with self.subTest(index=index):
+                chunks = await self.collect_pair([event('answer', 'STOP', index), 'data: [DONE]'])
+                answer, error = chunks
+                self.assertEqual(json.loads(answer[5:])['response']['candidates'][0]['index'], index)
+                self.assertEqual(json.loads(error.body)['error']['status'], 'UPSTREAM_INCOMPLETE_STREAM')
+                self.assertEqual(self.saved.call_args.args[0]['status_code'], 500)
+
+    async def test_done_can_finish_two_observed_candidates_without_separate_stops(self):
+        chunks = await self.collect_pair([event('second', index=1), event('first'), 'data: [DONE]'])
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(chunks[-1].strip(), 'data: [DONE]')
+        self.assertEqual(self.saved.call_args.args[0]['status_code'], 200)
+
+    async def test_finished_candidate_does_not_finish_an_interrupted_sibling(self):
+        chunks = await self.collect_pair([event('', 'MAX_TOKENS'), event('partial', index=1)])
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(json.loads(chunks[-1].body)['error']['status'], 'UPSTREAM_INCOMPLETE_STREAM')
 
     async def run_close(self, chunks, expected, *, close=False):
         blocked=asyncio.Event()

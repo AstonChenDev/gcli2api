@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 from datetime import datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import httpx
 from fastapi import FastAPI
@@ -51,7 +51,7 @@ class RTImportTests(unittest.IsolatedAsyncioTestCase):
         result = response.json()
         self.assertEqual((result["imported_count"], result["failed_count"]), (1, 1))
         self.assertEqual(result["results"][0]["error_code"], "invalid_refresh_token")
-        prepare.assert_awaited_once_with("synthetic-good")
+        prepare.assert_awaited_once_with("synthetic-good", existing_emails=ANY)
         self.assertNotIn("synthetic-good", response.text)
 
     async def test_excessive_json_depth_is_input_error(self):
@@ -95,7 +95,7 @@ class RTImportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mixed_import_and_duplicates(self):
         await self.db.store_credential("existing@example.invalid", credential("synthetic-existing"))
-        async def prepare(token):
+        async def prepare(token, *, existing_emails):
             if token == "synthetic-rejected":
                 raise rt.ImportFailure("oauth_rejected", "RT 无效")
             return "verified@example.invalid", credential(token)
@@ -121,7 +121,7 @@ class RTImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.get_credential("verified@example.invalid"), before)
 
     async def test_same_email_in_batch_and_shared_project(self):
-        async def prepare(token):
+        async def prepare(token, *, existing_emails):
             return ("other@example.invalid" if token == "third" else "same@example.invalid"), credential(token)
         with patch.object(rt, "prepare_credential", prepare):
             response = await self.post({"refresh_tokens": ["first", "second", "third"]})
@@ -129,7 +129,7 @@ class RTImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["skipped_count"], 1)
 
     async def test_timeout_leaves_no_partial_credentials(self):
-        async def slow(token):
+        async def slow(token, *, existing_emails):
             await asyncio.sleep(.1)
             return "test@example.invalid", credential()
         with patch.object(rt, "prepare_credential", slow), patch.object(rt, "IMPORT_BATCH_TIMEOUT_SECONDS", .01):
@@ -143,8 +143,31 @@ class RTImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["failed_count"], 1)
         self.assertNotIn("synthetic-sensitive", response.text + str(warning.call_args_list))
 
+    async def test_verified_existing_email_skips_project_lookup(self):
+        await self.db.store_credential("existing@example.invalid", credential())
+        token = httpx.Response(200, json={"access_token": "synthetic-access"})
+        user = httpx.Response(200, json={"email": "EXISTING@example.invalid", "verified_email": True})
+        with patch.object(rt, "post_async", AsyncMock(side_effect=[token])) as post, patch.object(
+            rt, "get_async", AsyncMock(return_value=user)
+        ), patch.object(rt, "get_oauth_proxy_url", AsyncMock(return_value="https://oauth.invalid")), patch.object(
+            rt, "get_googleapis_proxy_url", AsyncMock(return_value="https://google.invalid")
+        ):
+            response = await self.post({"refresh_tokens": ["replacement-token"]})
+        self.assertEqual(response.json()["results"][0]["error_code"], "email_already_exists")
+        self.assertEqual(post.await_count, 1)
+        self.assertEqual((await self.db.get_credential("existing@example.invalid"))["refresh_token"], "synthetic-new-token")
+
     async def test_oauth_pipeline_resolves_identity_project_and_tier(self):
         await self._assert_oauth_pipeline("g1-ultra-tier", "ultra")
+
+    async def test_rt_import_disables_only_confirmed_free(self):
+        await self._assert_oauth_pipeline("free-tier", "free")
+        async with self.db.session() as session:
+            row = await session.get(AntigravityCredential, 1)
+            self.assertTrue(row.disabled)
+
+    async def test_rt_import_unknown_tier_is_not_labelled_free(self):
+        await self._assert_oauth_pipeline("future-tier", "unknown")
 
     async def test_oauth_pipeline_preserves_ultra_lite(self):
         await self._assert_oauth_pipeline("g1-ultra-lite-tier", "ultra_lite")

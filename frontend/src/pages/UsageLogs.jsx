@@ -11,10 +11,11 @@ import {
   Trash2,
   XCircle,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
+import { applyLogPage } from "../utils/logPagination";
 import CredentialUsageStats from "../components/CredentialUsageStats";
 import RequestLookup from "../components/RequestLookup";
 import { formatMillions } from "../utils/tokens";
@@ -84,55 +85,55 @@ function UsageLogDetails() {
   // 时间范围（小时）
   const [rangeHours, setRangeHours] = useState(24);
 
-  const fetchLogs = useCallback(async () => {
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const refresh = () => setRefreshVersion(version => version + 1);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const { signal } = controller;
     setLoading(true);
-    try {
-      const params = {
-        offset: (page - 1) * pageSize,
-        limit: pageSize,
-        status: statusFilter,
-      };
-      if (formatFilter) params.api_format = formatFilter;
-      if (modelFilter.trim()) params.model_name = modelFilter.trim();
-      const code = parseInt(statusCodeFilter, 10);
-      if (statusCodeFilter.trim() !== "" && Number.isInteger(code)) params.status_code = code;
-      if (rangeHours > 0) params.start_timestamp = Math.floor(Date.now() / 1000) - rangeHours * 3600;
+    const params = {
+      offset: (page - 1) * pageSize,
+      limit: pageSize,
+      status: statusFilter,
+    };
+    if (formatFilter) params.api_format = formatFilter;
+    if (modelFilter.trim()) params.model_name = modelFilter.trim();
+    const code = parseInt(statusCodeFilter, 10);
+    if (statusCodeFilter.trim() !== "" && Number.isInteger(code)) params.status_code = code;
+    if (rangeHours > 0) params.start_timestamp = Math.floor(Date.now() / 1000) - rangeHours * 3600;
 
-      const res = await api.get("/usage-logs/list", { params });
-      setItems(res.data.items);
-      setTotal(res.data.total);
-    } catch (err) {
-      setMessage({ type: "error", text: err.response?.data?.detail || "加载日志失败" });
-    } finally {
-      setLoading(false);
-    }
-  }, [page, pageSize, statusFilter, formatFilter, modelFilter, statusCodeFilter, rangeHours]);
-
-  const fetchStats = useCallback(async () => {
-    try {
-      const params = {};
-      if (rangeHours > 0) params.start_timestamp = Math.floor(Date.now() / 1000) - rangeHours * 3600;
-      if (formatFilter) params.api_format = formatFilter;
-      if (modelFilter.trim()) params.model_name = modelFilter.trim();
-      const res = await api.get("/usage-logs/stats", { params });
-      setStats(res.data);
-    } catch (err) {
-      /* 统计失败不阻塞 */
-    }
-  }, [rangeHours, formatFilter, modelFilter]);
+    api.get("/usage-logs/list", { params, signal })
+      .then(({ data }) => {
+        if (signal.aborted) return;
+        applyLogPage(data, page, pageSize, setPage, result => {
+          setItems(result.items);
+          setTotal(result.total);
+        });
+      })
+      .catch(err => {
+        if (signal.aborted) return;
+        setItems([]);
+        setTotal(0);
+        setMessage({ type: "error", text: err.response?.data?.detail || "加载日志失败" });
+      })
+      .finally(() => { if (!signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [page, pageSize, statusFilter, formatFilter, modelFilter, statusCodeFilter, rangeHours, refreshVersion]);
 
   useEffect(() => {
-    fetchLogs();
-  }, [fetchLogs]);
-
-  useEffect(() => {
-    fetchStats();
-  }, [fetchStats]);
-
-  const refresh = () => {
-    fetchLogs();
-    fetchStats();
-  };
+    const controller = new AbortController();
+    const { signal } = controller;
+    const params = {};
+    if (rangeHours > 0) params.start_timestamp = Math.floor(Date.now() / 1000) - rangeHours * 3600;
+    if (formatFilter) params.api_format = formatFilter;
+    if (modelFilter.trim()) params.model_name = modelFilter.trim();
+    setStats(null);
+    api.get("/usage-logs/stats", { params, signal })
+      .then(({ data }) => { if (!signal.aborted) setStats(data); })
+      .catch(() => { /* 列表可独立于统计使用 */ });
+    return () => controller.abort();
+  }, [rangeHours, formatFilter, modelFilter, refreshVersion]);
 
   const clearLogs = async () => {
     if (!window.confirm("确定要清理 3 天前的日志吗？此操作不可恢复。")) return;
@@ -165,18 +166,35 @@ function UsageLogDetails() {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   // 请求体详细日志：按索引从磁盘读取
-  const openRequestBody = async (row = detail) => {
-    if (!row?.request_log_file) return;
+  const bodyRequest = useRef(null);
+  useEffect(() => () => bodyRequest.current?.abort(), []);
+
+  const selectDetail = (row) => {
+    bodyRequest.current?.abort();
+    setDetail(row);
+    setDetailBody(null);
+    setDetailBodyLoading(false);
+    setDetailCopyState("");
+  };
+
+  const openRequestBody = async () => {
+    if (!detail?.request_log_file) return;
+    bodyRequest.current?.abort();
+    const controller = new AbortController();
+    bodyRequest.current = controller;
     setDetailCopyState("");
     setDetailBodyLoading(true);
     try {
-      const res = await api.get("/usage-logs/request-body", { params: { path: row.request_log_file } });
-      setDetailBody(res.data);
+      const res = await api.get("/usage-logs/request-body", {
+        params: { path: detail.request_log_file }, signal: controller.signal,
+      });
+      if (!controller.signal.aborted) setDetailBody(res.data);
     } catch (err) {
-      // 文件可能已被清理或手动删除，仅在详情弹窗内提示，不弹全局错误
-      setDetailBody({ __missing: true, __message: err.response?.data?.detail || "详细日志文件不存在或已清理" });
+      if (!controller.signal.aborted) {
+        setDetailBody({ __missing: true, __message: err.response?.data?.detail || "详细日志文件不存在或已清理" });
+      }
     } finally {
-      setDetailBodyLoading(false);
+      if (!controller.signal.aborted) setDetailBodyLoading(false);
     }
   };
 
@@ -242,7 +260,7 @@ function UsageLogDetails() {
         <div className="card p-4"><div className="text-xl font-bold text-blue-700" title={`${stats.prompt_tokens || 0} Tokens`}>{formatMillions(stats.prompt_tokens)}</div><div className="text-xs text-slate-500">输入 Tokens（含缓存）</div></div>
         <div className="card p-4"><div className="text-xl font-bold text-purple-700" title={`${stats.completion_tokens || 0} Tokens`}>{formatMillions(stats.completion_tokens)}</div><div className="text-xs text-slate-500">输出 Tokens（含思考）</div></div>
       </div>}
-      <RequestLookup onOpen={row => { setDetail(row); setDetailBody(null); }} />
+      <RequestLookup onOpen={selectDetail} />
       {/* 操作栏 */}
       <div className="flex flex-wrap items-center gap-2">
         <button onClick={refresh} disabled={loading} className="btn btn-secondary text-xs sm:text-sm px-3 py-1.5 sm:px-4 sm:py-2 flex items-center gap-1.5">
@@ -335,7 +353,7 @@ function UsageLogDetails() {
           {items.map((item) => (
             <button
               key={item.id}
-              onClick={() => { setDetail(item); setDetailBody(null); }}
+              onClick={() => selectDetail(item)}
               className="card p-3 sm:p-4 w-full text-left hover:border-purple-500/40 transition-colors cursor-pointer"
             >
               <div className="flex items-start justify-between gap-2">
@@ -403,11 +421,11 @@ function UsageLogDetails() {
 
       {/* 详情弹窗 */}
       {detail && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/30" onClick={() => setDetail(null)}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/30" onClick={() => selectDetail(null)}>
           <div className="card max-w-lg w-full max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-base font-semibold text-purple-700">请求详情</h3>
-              <button onClick={() => setDetail(null)} className="text-slate-600 hover:text-slate-900">✕</button>
+              <button onClick={() => selectDetail(null)} className="text-slate-600 hover:text-slate-900">✕</button>
             </div>
             <div className="space-y-2 text-sm">
               {[

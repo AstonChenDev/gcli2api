@@ -340,6 +340,7 @@ Import/export uses a standardized JSON format: `{"refresh_token": "...", "access
 
 **Response Behavior Configuration**
 - `RETURN_THOUGHTS_TO_FRONTEND`: Return thinking chain to the frontend (default: true)
+- `SYSTEM_INSTRUCTION_AS_USER_MESSAGE`: Convert the system instruction into the first user message (default: false). When enabled, the systemInstruction field is no longer used during conversion; instead the system instruction is wrapped in a `<system-instructions>` tag (XML format) and inserted as the first user message at the beginning of the conversation. Effective immediately after panel save
 
 **Sensitive Word Filtering**
 - `SENSITIVE_WORDS_ENABLED`: Enable sensitive word filtering (default: false)
@@ -355,7 +356,7 @@ Import/export uses a standardized JSON format: `{"refresh_token": "...", "access
 **Credential Select Mode**
 - `CREDENTIAL_SELECT_MODE`: Credential selection mode (default: cache)
   - `random` — Fully random load balancing, each request picks a random credential
-  - `cache` — Cache affinity (recommended): hashes "model + system instruction (or first user message)" into a session key; the same session reuses the same credential, hitting Google's upstream prompt cache; automatically switches and rebinds after credential cooldown
+  - `cache` — Cache affinity (recommended): hashes "model + system instruction + first two messages' features" into a session key; the same session reuses the same credential, hitting Google's upstream prompt cache; automatically switches and rebinds after credential cooldown
   - `sticky` — Sticky: all requests lock onto one credential until it enters cooldown or gets disabled
 - `REDIS_URL`: Redis connection string (optional). When set, cache-mode session bindings are stored in Redis for multi-instance sharing; otherwise an in-process memory backend is used
 

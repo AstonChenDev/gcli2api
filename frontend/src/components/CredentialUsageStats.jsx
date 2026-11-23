@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 import api from "../api";
+import { applyLogPage } from "../utils/logPagination";
 import Modal from "./Modal";
 import OverallUsageStats, { successRate } from "./OverallUsageStats";
 import { formatMillions } from "../utils/tokens";
@@ -35,7 +36,9 @@ export default function CredentialUsageStats() {
     const controller = new AbortController();
     setLoading(true); setError("");
     api.get("/usage-logs/credential-stats", { params: { ...filters, offset: (page - 1) * 50, limit: 50 }, signal: controller.signal })
-      .then(res => { if (!controller.signal.aborted) setData(res.data); })
+      .then(({ data }) => {
+        if (!controller.signal.aborted) applyLogPage(data, page, 50, setPage, setData);
+      })
       .catch(err => { if (!controller.signal.aborted) { setData(null); setError(err.response?.data?.detail || "加载凭证统计失败"); } })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
@@ -48,7 +51,9 @@ export default function CredentialUsageStats() {
     api.get("/usage-logs/credential-errors", { params: {
       ...filters, credential_email: detail.credential_email, model_name: detail.model_name,
       offset: (errorPage - 1) * 20, limit: 20,
-    }, signal: controller.signal }).then(res => { if (!controller.signal.aborted) setErrors(res.data); })
+    }, signal: controller.signal }).then(({ data }) => {
+        if (!controller.signal.aborted) applyLogPage(data, errorPage, 20, setErrorPage, setErrors);
+      })
       .catch(err => { if (!controller.signal.aborted) setDetailError(err.response?.data?.detail || "加载错误详情失败"); })
       .finally(() => { if (!controller.signal.aborted) setDetailLoading(false); });
     return () => controller.abort();

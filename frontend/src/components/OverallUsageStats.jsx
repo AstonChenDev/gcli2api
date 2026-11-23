@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Loader2 } from "lucide-react";
 import api from "../api";
+import { applyLogPage } from "../utils/logPagination";
 import Modal from "./Modal";
 
 export const successRate = (success, total) => total ? `${(success / total * 100).toFixed(2)}%` : "—";
@@ -51,7 +52,9 @@ export default function OverallUsageStats({ filters }) {
     setDetails(null); setDetailError(""); setDetailLoading(true);
     api.get("/usage-logs/overall-errors", { params: { ...params, scope,
       ...(detail.code !== null ? { status_code: detail.code } : {}), offset: (page - 1) * 20, limit: 20 }, signal: controller.signal })
-      .then(res => { if (!controller.signal.aborted) setDetails(res.data); })
+      .then(({ data }) => {
+        if (!controller.signal.aborted) applyLogPage(data, page, 20, setPage, setDetails);
+      })
       .catch(err => { if (!controller.signal.aborted) setDetailError(err.response?.data?.detail || "加载整体错误详情失败"); })
       .finally(() => { if (!controller.signal.aborted) setDetailLoading(false); });
     return () => controller.abort();

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import api from "../api";
+import { applyLogPage } from "../utils/logPagination";
 
 export default function RequestLookup({ onOpen }) {
   const [identifier, setIdentifier] = useState("");
@@ -14,7 +15,9 @@ export default function RequestLookup({ onOpen }) {
     const controller = new AbortController();
     setLoading(true); setError(""); setResult(null);
     api.get("/usage-logs/lookup", { params: { ...query, offset: (page - 1) * 20, limit: 20 }, signal: controller.signal })
-      .then(res => { if (!controller.signal.aborted) setResult(res.data); })
+      .then(({ data }) => {
+        if (!controller.signal.aborted) applyLogPage(data, page, 20, setPage, setResult);
+      })
       .catch(err => { if (!controller.signal.aborted) setError(err.response?.data?.detail || "查询失败"); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();

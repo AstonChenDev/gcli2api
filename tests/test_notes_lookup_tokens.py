@@ -17,6 +17,8 @@ from src.api import antigravity as api
 from src import request_body_log
 from src.usage_log import extract_response_id
 
+real_wrap_cli_request = api.wrap_cli_request
+
 
 class FeaturesTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -196,6 +198,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     yield 'data: {"response":{"responseId":"retry-success","candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"ok"}]}}]}}\n\n'
             with ExitStack() as stack:
+                stack.enter_context(patch.object(api, "wrap_cli_request", real_wrap_cli_request))
                 stack.enter_context(patch.object(api, "get_valid_credential", AsyncMock(side_effect=credentials)))
                 stack.enter_context(patch.object(api, "get_retry_config", AsyncMock(return_value={"max_retries": 1, "retry_interval": 0, "retry_enabled": True})))
                 stack.enter_context(patch.object(api, "handle_error_with_retry", AsyncMock(return_value=True)))
@@ -212,6 +215,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([d["credential_email"] for d in details], [c[0] for c in credentials])
             self.assertEqual(details[1]["response_body"], "")
             self.assertEqual(details[1]["response_id"], "retry-success")
+            self.assertNotEqual(details[0]["request_body"]["requestId"], details[1]["request_body"]["requestId"])
             self.assertIn("synthetic retry", details[0]["response_body"])
 
     async def test_error_only_and_disabled_capture_modes(self):

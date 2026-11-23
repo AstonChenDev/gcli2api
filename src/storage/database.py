@@ -6,11 +6,14 @@
 
 import asyncio
 import json
+import math
 import os
 import random
+import ssl
 import time
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import (
@@ -36,10 +39,37 @@ from sqlalchemy import (
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from log import log
+from src.credential_expiry import expiry_allows_dispatch
+from src.credential_tier import DEFAULT_PROJECT_ID
+
+
+def _asyncpg_ssl_from_sslmode(sslmode: str, sslrootcert: Optional[str] = None):
+    """将 libpq 风格的 sslmode 值转换为 asyncpg 的 ssl 连接参数。
+
+    asyncpg 的 connect() 不接受 libpq/psycopg2 的 sslmode 关键字；URI 中携带
+    ?sslmode=... 时 SQLAlchemy 会将其原样透传，导致报错：
+    "connect() got an unexpected keyword argument 'sslmode'"。
+    因此必须把 sslmode 从查询串中摘出，转换成 ssl 参数传入。
+    """
+    if sslmode == "disable":
+        return False
+    ctx = ssl.create_default_context()
+    if sslmode in ("require", "prefer", "allow"):
+        # libpq 语义：加密传输但不校验服务端证书
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    elif sslmode == "verify-ca":
+        # 校验证书链但不校验主机名
+        ctx.check_hostname = False
+    # verify-full：保持默认 context（校验证书链 + 主机名）
+    if sslrootcert:
+        ctx.load_verify_locations(cafile=sslrootcert)
+    return ctx
 
 
 # ====================== ORM 模型 ======================
@@ -63,6 +93,12 @@ class AntigravityCredential(Base):
     project_id: Mapped[str] = mapped_column(Text, default="")
     expiry: Mapped[str] = mapped_column(Text, default="")
 
+    # Existing rows start at the legacy revision; new or replaced identities get a unique value.
+    credential_revision: Mapped[str] = mapped_column(String(32), default=lambda: uuid.uuid4().hex,
+                                                     server_default=text("''"))
+    refresh_owner: Mapped[str] = mapped_column(String(32), default="")
+    refresh_until: Mapped[float] = mapped_column(Float, default=0.0)
+
     # 状态字段
     disabled: Mapped[bool] = mapped_column(Boolean, default=False)
     error_codes: Mapped[str] = mapped_column(Text, default="[]")
@@ -76,6 +112,11 @@ class AntigravityCredential(Base):
     tier: Mapped[Optional[str]] = mapped_column(String(32), default="pro")
     note: Mapped[str] = mapped_column(Text, default="")
 
+    # Per-credential egress; null preserves the existing global proxy policy.
+    proxy_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    concurrency_limit: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    rpm_limit: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
     # 时间戳
     created_at: Mapped[float] = mapped_column(Float, default=time.time)
     updated_at: Mapped[float] = mapped_column(Float, default=time.time, onupdate=time.time)
@@ -83,6 +124,15 @@ class AntigravityCredential(Base):
     __table_args__ = (
         Index("idx_ag_disabled", "disabled"),
     )
+
+
+class ProxyEndpoint(Base):
+    """User-managed outbound proxies; URLs may contain authentication secrets."""
+    __tablename__ = "proxy_endpoints"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(Float, default=time.time)
 
 
 class ConfigItem(Base):
@@ -171,18 +221,69 @@ def _load_json(raw: Optional[str], default: Any) -> Any:
         return default
 
 
-def catalog_supports_model(snapshot, model):
-    """None means unknown; failed refreshes never become an empty catalog."""
-    data = _load_json(snapshot, {})
-    models = data.get("models")
-    if not model or not isinstance(models, list):
+MODEL_NOT_FOUND_TTL = 300
+_MODEL_CATALOG_ALIASES = {
+    "claude-sonnet-4-6-thinking": "claude-sonnet-4-6",
+    "claude-opus-4-6": "claude-opus-4-6-thinking",
+}
+
+
+def catalog_model_key(model: str) -> str:
+    name = model.strip().lower()
+    return _MODEL_CATALOG_ALIASES.get(name, name)
+
+
+def _catalog_model_rejected(snapshot, model, now):
+    rejected = snapshot.get("model_not_found")
+    since = rejected.get(catalog_model_key(model)) if isinstance(rejected, dict) else None
+    return isinstance(since, (int, float)) and now - MODEL_NOT_FOUND_TTL < since <= now
+
+
+def catalog_models(snapshot):
+    """Return the last verified catalog minus recent model-specific 404s."""
+    snapshot = _load_json(snapshot, {})
+    if not isinstance(snapshot, dict):
         return None
-    return model in models
+    models = snapshot.get("models")
+    if not isinstance(models, list) or not all(isinstance(model, str) for model in models):
+        return None
+    now = time.time()
+    return [model for model in models if model and not _catalog_model_rejected(snapshot, model, now)]
+
+
+def catalog_supports_model(snapshot, model, *, now=None):
+    """None means unknown; failed refreshes never become an empty catalog."""
+    if not model:
+        return None
+    data = _load_json(snapshot, {})
+    if not isinstance(data, dict):
+        return None
+    if _catalog_model_rejected(data, model, time.time() if now is None else now):
+        return False
+    models = data.get("models")
+    if not isinstance(models, list) or not all(isinstance(name, str) for name in models):
+        return None
+    key = catalog_model_key(model)
+    return any(catalog_model_key(name) == key for name in models)
+
+
+class UnsupportedCredentialModel(Exception):
+    def __init__(self, model):
+        super().__init__(f"该凭证的模型目录显示 {model} 当前不可用")
+
+
+class PoolModelUnavailable(Exception):
+    status_code = 404
+
+    def __init__(self, model):
+        super().__init__(f"当前所有已启用凭证的模型目录均显示 {model} 不可用")
 
 
 def _row_to_credential_dict(row: AntigravityCredential) -> Dict[str, Any]:
     """ORM 行 -> 凭证字典"""
     return {
+        "email": row.email,
+        "credential_revision": row.credential_revision,
         "access_token": row.access_token or "",
         "refresh_token": row.refresh_token or "",
         "client_id": row.client_id or "",
@@ -194,15 +295,28 @@ def _row_to_credential_dict(row: AntigravityCredential) -> Dict[str, Any]:
     }
 
 
+def dispatch_limit_wait(concurrency_limit, rpm_limit, state, now):
+    if rpm_limit:
+        starts = [t for t in state.get("dispatch_starts", ()) if t > now - 60]
+        if len(starts) >= rpm_limit:
+            return max(1, math.ceil(sorted(starts)[-rpm_limit] + 60 - now))
+    if concurrency_limit and sum(lease["expires"] > now for lease in state.get("leases", {}).values()) >= concurrency_limit:
+        return 1
+    return 0
+
+
 def get_cooldown_group(model_name: str) -> str:
     """
     模型 CD 分组：同家族模型共享一个冷却键
+    - 名字带 image -> "image"
     - 名字带 argon -> "argon"
     - 名字带 gemini -> "gemini"
     - 名字带 claude 或 gpt -> "claude_gpt"
     - 其他 -> 原始模型名
     """
     lowered = (model_name or "").lower()
+    if "image" in lowered:
+        return "image"
     if "argon" in lowered:
         return "argon"
     if "gemini" in lowered:
@@ -226,7 +340,9 @@ class Database:
 
         # 内存配置缓存
         self._config_cache: Dict[str, Any] = {}
+        self._config_versions: Dict[str, float] = {}
         self._config_loaded = False
+        self._config_lock = asyncio.Lock()
 
     # ---------- 初始化 ----------
 
@@ -251,7 +367,29 @@ class Database:
                     dsn = "postgresql+asyncpg://" + dsn[len("postgres://"):]
                 elif not dsn.startswith("postgresql+"):
                     dsn = "postgresql+asyncpg://" + dsn
-                self._engine = create_async_engine(dsn, pool_size=5, max_overflow=5, pool_pre_ping=True)
+                engine_kwargs: Dict[str, Any] = {
+                    "pool_size": 5,
+                    "max_overflow": 5,
+                    "pool_pre_ping": True,
+                }
+
+                # asyncpg 不支持 libpq 的 sslmode 查询参数（Aiven/Neon/Supabase
+                # 等云端 PostgreSQL 的 URI 普遍带 ?sslmode=require），需从 URL
+                # 中摘出并转换为 connect_args 的 ssl 参数，否则会抛出
+                # TypeError: connect() got an unexpected keyword argument 'sslmode'
+                url = make_url(dsn)
+                sslmode = url.query.get("sslmode")
+                if sslmode:
+                    query = dict(url.query)
+                    del query["sslmode"]
+                    sslrootcert = query.pop("sslrootcert", None)
+                    url = url.set(query=query)
+                    engine_kwargs["connect_args"] = {
+                        "ssl": _asyncpg_ssl_from_sslmode(sslmode, sslrootcert)
+                    }
+                    log.info(f"POSTGRESQL_URI 的 sslmode={sslmode} 已转换为 asyncpg 的 ssl 连接参数")
+
+                self._engine = create_async_engine(url, **engine_kwargs)
                 self._backend_type = "postgresql"
             else:
                 # SQLite 默认
@@ -284,6 +422,14 @@ class Database:
 
             # 建表（不兼容旧结构：旧的 filename 键结构表会被重建为 email 键结构）
             async with self._engine.begin() as conn:
+                # Serialize schema inspection and changes across workers starting together.
+                if self.backend_type == "sqlite":
+                    await conn.execute(text("BEGIN IMMEDIATE"))
+                else:
+                    await conn.execute(text(
+                        "SELECT pg_advisory_xact_lock(hashtext(current_database()), "
+                        "hashtext(current_schema() || '.agy2api_schema'))"
+                    ))
                 await conn.run_sync(self._create_tables)
 
             # 标记初始化完成（供 session() 使用），再加载配置缓存
@@ -395,7 +541,8 @@ class Database:
         values = {k: credential_data[k] for k in (
             "access_token", "refresh_token", "client_id", "client_secret", "project_id", "expiry", "tier"
         )}
-        stmt = insert(AntigravityCredential).values(email=email, last_success=time.time(), **values)
+        stmt = insert(AntigravityCredential).values(email=email, disabled=values["tier"] == "free",
+                                                   last_success=time.time(), **values)
         stmt = stmt.on_conflict_do_nothing(index_elements=["email"]).returning(AntigravityCredential.id)
         async with self.session() as s:
             return (await s.scalar(stmt)) is not None
@@ -414,15 +561,17 @@ class Database:
             refresh_token = credential_data.get("refresh_token") or ""
             client_id = credential_data.get("client_id") or ""
             client_secret = credential_data.get("client_secret") or ""
-            project_id = credential_data.get("project_id") or ""
+            project_id = credential_data.get("project_id") or (row.project_id if row else None)
+            if not project_id:
+                project_id = DEFAULT_PROJECT_ID if "project_id" in credential_data else ""
             expiry_val = credential_data.get("expiry") or ""
             expiry = expiry_val.isoformat() if hasattr(expiry_val, "isoformat") else str(expiry_val)
             tier = credential_data.get("tier")
+            disable = tier == "free" and credential_data.get("verified_free") is True
 
             if row:
-                if (row.refresh_token, row.client_id, row.project_id) != (refresh_token, client_id, project_id):
-                    # Fence in-flight results when an account is reimported/replaced.
-                    await s.execute(delete(CredentialEntitlement).where(CredentialEntitlement.email == email))
+                if (row.refresh_token, row.client_id, row.client_secret, row.project_id) != (refresh_token, client_id, client_secret, project_id):
+                    await self._invalidate_credential_identity(s, row)
                 row.access_token = access_token
                 row.refresh_token = refresh_token
                 row.client_id = client_id
@@ -433,6 +582,8 @@ class Database:
                     row.note = credential_data["note"]
                 if tier:
                     row.tier = tier
+                if disable:
+                    row.disabled = True
                 row.updated_at = time.time()
             else:
                 s.add(AntigravityCredential(
@@ -443,7 +594,8 @@ class Database:
                     client_secret=client_secret,
                     project_id=project_id,
                     expiry=expiry,
-                    tier=tier or "pro",
+                    tier=tier or ("unknown" if "tier" in credential_data else "pro"),
+                    disabled=disable,
                     note=credential_data.get("note", ""),
                     last_success=time.time(),
                 ))
@@ -468,6 +620,28 @@ class Database:
                 AntigravityCredential.refresh_token == expected_refresh_token,
             ).values(access_token=access_token, expiry=expiry, updated_at=time.time()))
             return result.rowcount == 1
+
+    async def get_credential_exports(self, emails: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+        """Read portable credential fields and their model catalogs in one database snapshot."""
+        cred = AntigravityCredential
+        query = (select(cred.email, cred.refresh_token, cred.access_token, cred.expiry,
+                        cred.tier, cred.project_id, cred.note, CredentialEntitlement.snapshot)
+                 .outerjoin(CredentialEntitlement, CredentialEntitlement.email == cred.email)
+                 .order_by(cred.id))
+        if emails is not None:
+            query = query.where(cred.email.in_(emails))
+        async with self.session() as session:
+            rows = (await session.execute(query)).all()
+        return {
+            row.email: {
+                "email": row.email, "refresh_token": row.refresh_token or "",
+                "access_token": row.access_token or "", "expiry": row.expiry or "",
+                "tier": row.tier or "pro", "project_id": row.project_id or "",
+                "supported_models": catalog_models(row.snapshot) or [],
+                **({"note": row.note} if row.note else {}),
+            }
+            for row in rows
+        }
 
     async def list_credentials(self) -> List[str]:
         """列出所有凭证 email（创建顺序）"""
@@ -497,8 +671,58 @@ class Database:
                 return True
             return False
 
+    async def get_enabled_model_catalog(self) -> Optional[List[str]]:
+        """Union of verified model catalogs belonging to enabled credentials."""
+        async with self.session() as session:
+            snapshots = await session.scalars(
+                select(CredentialEntitlement.snapshot)
+                .join(AntigravityCredential, AntigravityCredential.email == CredentialEntitlement.email)
+                .where(AntigravityCredential.disabled.is_(False))
+            )
+            catalogs = [models for snapshot in snapshots if (models := catalog_models(snapshot)) is not None]
+            if not catalogs:
+                return None
+            return sorted({model for models in catalogs for model in models})
+
+    async def all_enabled_credentials_lack_model(self, model):
+        async with self.session() as session:
+            snapshots = (await session.scalars(
+                select(CredentialEntitlement.snapshot).select_from(AntigravityCredential)
+                .outerjoin(CredentialEntitlement, CredentialEntitlement.email == AntigravityCredential.email)
+                .where(AntigravityCredential.disabled.is_(False))
+            )).all()
+        return bool(snapshots) and all(catalog_supports_model(snapshot, model) is False for snapshot in snapshots)
+
+    async def get_dispatch_limit_waits(self, model, *, manual_email=None):
+        """Read admission metadata only; never fetch tokens or reserve a slot."""
+        cred = AntigravityCredential
+        query = (select(cred.email, cred.concurrency_limit, cred.rpm_limit, cred.model_cooldowns,
+                        Credential499State.state, CredentialEntitlement.snapshot)
+                 .outerjoin(CredentialEntitlement, CredentialEntitlement.email == cred.email)
+                 .join(Credential499State, Credential499State.email == cred.email, isouter=manual_email is not None))
+        if manual_email is not None:
+            query = query.where(cred.email == manual_email)
+        else:
+            query = query.where(cred.disabled.is_(False), or_(cred.concurrency_limit > 0, cred.rpm_limit > 0))
+        async with self.session() as session:
+            rows = (await session.execute(query)).all()
+        now = time.time()
+        waits = {}
+        for email, concurrency, rpm, cooldowns, state, catalog in rows:
+            if catalog_supports_model(catalog, model) is False:
+                if manual_email is not None:
+                    raise UnsupportedCredentialModel(model)
+                continue
+            if not manual_email and _load_json(cooldowns, {}).get(get_cooldown_group(model), 0) > now:
+                continue
+            wait = dispatch_limit_wait(concurrency, rpm, json.loads(state or "{}"), now)
+            if wait:
+                waits[email] = wait
+        return waits
+
     async def get_next_available_credential(
-        self, model_name: Optional[str] = None, exclude_emails=None
+        self, model_name: Optional[str] = None, exclude_emails=None, *, require_ready_token=False,
+        report_missing_model=False,
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
         """随机获取一个可用凭证（负载均衡 + 模型家族级冷却过滤），返回 (email, credential)"""
         current_time = time.time()
@@ -506,47 +730,67 @@ class Database:
         async with self.session() as s:
             # 轻量查询：只取必要的小字段（email/冷却/禁用），避免全表加载
             # access_token/refresh_token 等大字段（凭证明文可达数 KB）
-            rows = (
-                await s.execute(
-                    select(
-                        AntigravityCredential.email,
-                        AntigravityCredential.model_cooldowns,
-                        CredentialEntitlement.snapshot,
-                    )
-                    .outerjoin(CredentialEntitlement, CredentialEntitlement.email == AntigravityCredential.email)
-                    .where(AntigravityCredential.disabled == False)  # noqa: E712
-                    .where(AntigravityCredential.email.not_in(exclude_emails or []))
-                    .order_by(AntigravityCredential.id)
-                )
-            ).all()
+            stmt = (
+                select(AntigravityCredential.email, AntigravityCredential.model_cooldowns, CredentialEntitlement.snapshot)
+                .outerjoin(CredentialEntitlement, CredentialEntitlement.email == AntigravityCredential.email)
+                .where(AntigravityCredential.disabled == False)  # noqa: E712
+                .order_by(AntigravityCredential.id)
+            )
+            excluded = set(exclude_emails or ())
+            if excluded and not report_missing_model:
+                stmt = stmt.where(AntigravityCredential.email.not_in(excluded))
+            if require_ready_token:
+                has_token = func.trim(AntigravityCredential.access_token) != ""
+                stmt = stmt.add_columns(AntigravityCredential.expiry, has_token.label("has_token"))
+                if not report_missing_model:
+                    stmt = stmt.where(has_token)
+            rows = (await s.execute(stmt)).all()
             if not rows:
                 return None
             # Python 侧随机负载均衡（过滤模型家族冷却）
-            candidates, confirmed = [], []
-            for email, model_cooldowns, snapshot in rows:
-                supported = catalog_supports_model(snapshot, model_name)
+            confirmed, unknown = [], []
+            # For an initial generation request, classify this same set of
+            # enabled rows, including accounts excluded by quota or token state.
+            all_missing = report_missing_model and bool(model_name)
+            now = datetime.fromtimestamp(current_time, timezone.utc)
+            for candidate in rows:
+                supported = catalog_supports_model(candidate.snapshot, model_name, now=current_time)
                 if supported is False:
+                    continue
+                all_missing = False
+                email, model_cooldowns = candidate.email, candidate.model_cooldowns
+                if email in excluded:
+                    continue
+                if require_ready_token and (not candidate.has_token or not expiry_allows_dispatch(candidate.expiry, now)):
                     continue
                 cooldowns = _load_json(model_cooldowns, {})
                 cd = cooldowns.get(cd_group) if cd_group else None
                 if cd is not None and current_time < cd:
                     continue
-                candidates.append((email, model_cooldowns))
                 if supported is True:
-                    confirmed.append((email, model_cooldowns))
-            candidates = confirmed or candidates
-            if not candidates:
+                    confirmed.append(email)
+                else:
+                    unknown.append(email)
+            if not confirmed and not unknown:
+                if all_missing:
+                    raise PoolModelUnavailable(model_name)
                 return None
-            picked_email = random.choice(candidates)[0]
-            # 只取被选中凭证的完整数据
-            row = await s.scalar(
-                select(AntigravityCredential).where(
-                    AntigravityCredential.email == picked_email
-                )
-            )
-            if not row or row.disabled:
-                return None
-            return row.email, _row_to_credential_dict(row)
+
+            # A panel action or entitlement refresh can remove a shortlisted
+            # account before its token is read. Try each eligible email at most once.
+            for pool in (confirmed, unknown):
+                while pool:
+                    email = random.choice(pool)
+                    row = await s.scalar(select(AntigravityCredential).where(
+                        AntigravityCredential.email == email, AntigravityCredential.disabled.is_(False)
+                    ))
+                    if row is not None:
+                        return row.email, _row_to_credential_dict(row)
+                    pool.remove(email)
+
+        if report_missing_model and model_name and await self.all_enabled_credentials_lack_model(model_name):
+            raise PoolModelUnavailable(model_name)
+        return None
 
     async def get_available_credential_by_email(
         self, email: str, model_name: Optional[str] = None
@@ -577,8 +821,15 @@ class Database:
 
     # ---------- 状态管理 ----------
 
+    @staticmethod
+    async def _invalidate_credential_identity(session, row):
+        row.credential_revision = uuid.uuid4().hex
+        row.refresh_owner, row.refresh_until = "", 0
+        await session.execute(delete(CredentialEntitlement).where(CredentialEntitlement.email == row.email))
+
     async def update_credential_state(
-        self, email: str, state_updates: Dict[str, Any]
+        self, email: str, state_updates: Dict[str, Any], *, expected_refresh_token: Optional[str] = None,
+        expected_revision: Optional[str] = None, verified_tier_sequence: Optional[int] = None,
     ) -> bool:
         """更新凭证状态字段"""
         json_fields = {"error_codes", "error_messages", "model_cooldowns"}
@@ -596,14 +847,38 @@ class Database:
                     values[key] = value
                 elif key in bool_fields:
                     values[key] = bool(value)
+                elif key in {"concurrency_limit", "rpm_limit"}:
+                    values[key] = value
             if not values:
                 return True
             values["updated_at"] = time.time()
-            result = await s.execute(
-                AntigravityCredential.__table__.update()
-                .where(AntigravityCredential.email == email)
-                .values(**values)
-            )
+            conditions = [AntigravityCredential.email == email]
+            if expected_revision is not None:
+                conditions.append(AntigravityCredential.credential_revision == expected_revision)
+            if expected_refresh_token is not None:
+                conditions.append(AntigravityCredential.refresh_token == expected_refresh_token)
+            if "project_id" in values:
+                if self.backend_type == "sqlite":
+                    await s.execute(text("BEGIN IMMEDIATE"))
+                row = await s.scalar(select(AntigravityCredential).where(*conditions).with_for_update())
+                if row is None:
+                    return False
+                if verified_tier_sequence is not None:
+                    entitlement = await s.get(CredentialEntitlement, email, with_for_update=True)
+                    if entitlement is None:
+                        return False
+                    snapshot = json.loads(entitlement.snapshot)
+                    if verified_tier_sequence < snapshot.get("applied_tier_check", 0):
+                        return False
+                    snapshot.update(applied_tier_check=verified_tier_sequence, tier=values["tier"],
+                                    tier_checked_at=values["updated_at"])
+                    entitlement.snapshot = _dump_json(snapshot)
+                if row.project_id != values["project_id"]:
+                    await self._invalidate_credential_identity(s, row)
+                for key, value in values.items():
+                    setattr(row, key, value)
+                return True
+            result = await s.execute(update(AntigravityCredential).where(*conditions).values(**values))
             return result.rowcount > 0
 
     async def get_credential_state(
@@ -611,12 +886,16 @@ class Database:
     ) -> Dict[str, Any]:
         """获取凭证状态（不含 error_messages）"""
         async with self.session() as s:
-            row = await s.scalar(
-                select(AntigravityCredential).where(AntigravityCredential.email == email)
-            )
-            if not row:
+            match = (await s.execute(
+                select(AntigravityCredential, CredentialEntitlement.snapshot)
+                .outerjoin(CredentialEntitlement, CredentialEntitlement.email == AntigravityCredential.email)
+                .where(AntigravityCredential.email == email)
+            )).one_or_none()
+            if match is None:
                 return {}
+            row, snapshot = match
             return {
+                "supported_models": catalog_models(snapshot) or [],
                 "disabled": bool(row.disabled),
                 "error_codes": _load_json(row.error_codes, []),
                 "last_success": row.last_success or time.time(),
@@ -645,6 +924,9 @@ class Database:
                     "tier": row.tier or "pro",
                     "note": row.note or "",
                     "project_id": row.project_id or "",
+                    "proxy_id": row.proxy_id,
+                    "concurrency_limit": row.concurrency_limit,
+                    "rpm_limit": row.rpm_limit,
                 }
             return states
 
@@ -719,6 +1001,9 @@ class Database:
                     "tier": row.tier or "pro",
                     "note": row.note or "",
                     "project_id": row.project_id or "",
+                    "proxy_id": row.proxy_id,
+                    "concurrency_limit": row.concurrency_limit,
+                    "rpm_limit": row.rpm_limit,
                 }
                 if tier_filter and tier_filter in ("free", "pro", "ultra", "ultra_lite"):
                     allowed_tiers = {"ultra", "ultra_lite"} if tier_filter == "ultra" else {tier_filter}
@@ -776,13 +1061,15 @@ class Database:
     # ---------- 模型级冷却 ----------
 
     @asynccontextmanager
-    async def _locked_credential_update(self, email):
+    async def _locked_credential_update(self, email, expected_revision=None):
         """Serialize quota read/modify/write with manual cooldown resets."""
         async with self.session() as session:
             if self.backend_type == "sqlite":
                 await session.execute(text("BEGIN IMMEDIATE"))
             row = await session.scalar(select(AntigravityCredential).where(
                 AntigravityCredential.email == email).with_for_update())
+            if row and expected_revision is not None and row.credential_revision != expected_revision:
+                row = None
             yield row
 
     async def set_model_cooldown(
@@ -790,17 +1077,19 @@ class Database:
         email: str,
         model_name: str,
         cooldown_until: Optional[float],
+        *, expected_revision=None,
     ) -> bool:
-        """设置/清除模型的冷却时间（按家族分组：argon / gemini / claude_gpt / 其他原名）"""
+        """设置/清除模型的冷却时间（按家族分组：image / argon / gemini / claude_gpt / 其他原名）"""
         cd_group = get_cooldown_group(model_name)
-        async with self._locked_credential_update(email) as row:
+        async with self._locked_credential_update(email, expected_revision) as row:
             if not row:
                 return False
             cooldowns = _load_json(row.model_cooldowns, {})
             if cooldown_until is None:
                 cooldowns.pop(cd_group, None)
             else:
-                cooldowns[cd_group] = cooldown_until
+                # Concurrent upstream requests can report different reset windows.
+                cooldowns[cd_group] = max(cooldowns.get(cd_group, 0), cooldown_until)
             row.model_cooldowns = _dump_json(cooldowns)
             row.updated_at = time.time()
             return True
@@ -815,61 +1104,84 @@ class Database:
             return True
 
     async def record_success(
-        self, email: str, model_name: Optional[str] = None
+        self, email: str, model_name: Optional[str] = None, *, expected_revision=None
     ) -> None:
-        """成功调用后的条件写入（清除错误 + 该模型家族的CD）"""
-        async with self._locked_credential_update(email) as row:
-            if not row:
+        """Clear resolved errors and expired quota state after a generation succeeds."""
+        async with self._locked_credential_update(email, expected_revision) as row:
+            if not row or row.disabled:
                 return
-            changed = False
+            now = time.time()
+            cd_group = get_cooldown_group(model_name) if model_name else None
+            cooldowns = _load_json(row.model_cooldowns, {})
+            # A request admitted before another request's 429 may finish later.
+            if cooldowns.get(cd_group, 0) > now:
+                return
             if _load_json(row.error_codes, []):
                 row.error_codes = "[]"
                 row.error_messages = "{}"
-                row.last_success = time.time()
-                row.updated_at = time.time()
-                changed = True
-            if model_name:
-                cd_group = get_cooldown_group(model_name)
-                cooldowns = _load_json(row.model_cooldowns, {})
-                if cd_group in cooldowns:
-                    cooldowns.pop(cd_group)
-                    row.model_cooldowns = _dump_json(cooldowns)
-                    row.updated_at = time.time()
-                    changed = True
-            if changed:
-                log.debug(f"Recorded success for {email} (model={model_name})")
+                row.last_success = now
+                row.updated_at = now
+            if cd_group in cooldowns:
+                del cooldowns[cd_group]
+                row.model_cooldowns = _dump_json(cooldowns)
+                row.updated_at = now
 
     # ---------- 配置管理（内存缓存） ----------
 
-    async def _load_config_cache(self) -> None:
-        async with self.session() as s:
-            rows = (await s.scalars(select(ConfigItem))).all()
-            for item in rows:
-                try:
-                    self._config_cache[item.key] = json.loads(item.value)
-                except (json.JSONDecodeError, TypeError):
-                    self._config_cache[item.key] = item.value
+    @staticmethod
+    async def _config_snapshot(session):
+        rows = await session.execute(select(ConfigItem.key, ConfigItem.value, ConfigItem.updated_at))
+        values, versions = {}, {}
+        for key, value, updated_at in rows:
+            values[key] = _load_json(value, value)
+            versions[key] = updated_at
+        return values, versions
+
+    async def _load_config_cache(self, *, only_if_changed=False) -> None:
+        async with self._config_lock:
+            async with self.session() as session:
+                if only_if_changed and self._config_loaded:
+                    rows = await session.execute(select(ConfigItem.key, ConfigItem.updated_at))
+                    if dict(rows.all()) == self._config_versions:
+                        return
+                values, versions = await self._config_snapshot(session)
+            self._config_cache, self._config_versions = values, versions
             self._config_loaded = True
             log.debug(f"Loaded {len(self._config_cache)} config items")
 
-    async def reload_config_cache(self) -> None:
+    async def reload_config_cache(self, *, only_if_changed=False) -> None:
         self._ensure_initialized()
-        self._config_cache.clear()
-        await self._load_config_cache()
-        log.info("Config cache reloaded from database")
+        await self._load_config_cache(only_if_changed=only_if_changed)
+
+    @asynccontextmanager
+    async def config_write_session(self):
+        """Serialize configuration edits and publish their snapshot only after commit."""
+        async with self._config_lock:
+            async with self.session() as session:
+                if self.backend_type == "sqlite":
+                    await session.execute(text("BEGIN IMMEDIATE"))
+                else:
+                    await session.execute(text("SELECT pg_advisory_xact_lock(4997861)"))
+                yield session
+                await session.flush()
+                values, versions = await self._config_snapshot(session)
+            self._config_cache, self._config_versions = values, versions
+
+    @staticmethod
+    async def write_config_values(session, values: Dict[str, Any]) -> None:
+        for key, value in values.items():
+            row = await session.get(ConfigItem, key)
+            if row is None:
+                session.add(ConfigItem(key=key, value=_dump_json(value)))
+            else:
+                row.value = _dump_json(value)
+                # Peer workers also use this timestamp as the row's change marker.
+                row.updated_at = max(time.time(), math.nextafter(row.updated_at, math.inf))
 
     async def set_config(self, key: str, value: Any) -> bool:
-        """设置配置（写库 + 更新缓存）"""
-        async with self.session() as s:
-            item = await s.get(ConfigItem, key)
-            serialized = _dump_json(value)
-            if item:
-                item.value = serialized
-                item.updated_at = time.time()
-            else:
-                s.add(ConfigItem(key=key, value=serialized))
-            self._config_cache[key] = value
-            return True
+        async with self.config_write_session() as session:
+            await self.write_config_values(session, {key: value})
+        return True
 
     async def get_config(self, key: str, default: Any = None) -> Any:
         self._ensure_initialized()
@@ -880,11 +1192,10 @@ class Database:
         return self._config_cache.copy()
 
     async def delete_config(self, key: str) -> bool:
-        async with self.session() as s:
+        async with self.config_write_session() as s:
             item = await s.get(ConfigItem, key)
             if item:
                 await s.delete(item)
-                self._config_cache.pop(key, None)
                 return True
             return False
 

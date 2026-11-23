@@ -19,6 +19,17 @@ def synthetic(text, finish):
 
 
 class SyntheticTruncationFinishTests(unittest.IsolatedAsyncioTestCase):
+    async def test_two_answer_parts_in_one_event_are_delivered_once_in_order(self):
+        answer = chunk([
+            {"functionCall": {"name": SYNTHETIC_TOOL_NAME, "args": {"content": "first"}}},
+            {"functionCall": {"name": SYNTHETIC_TOOL_NAME, "args": '{"content":"second"}'}},
+        ], "STOP")
+        async def request(_):
+            return StreamingResponse(source([answer]))
+
+        out = [part async for part in AntiTruncationStreamProcessor(request, {"request": {}}).process_stream()]
+        self.assertEqual([part["text"] for part in parts_from(out) if "text" in part], ["first", "second"])
+
     async def test_exhausted_limit_at_eof_and_done_keeps_original_reason(self):
         for terminal in ('EOF', 'DONE'):
             for attempts in (1, 2):

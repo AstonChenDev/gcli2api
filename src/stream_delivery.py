@@ -36,6 +36,7 @@ class StreamDelivery:
         self.openai_candidates = set()
         self.openai_finished = set()
         self.gemini_completion = StreamCompletion()
+        self.completed_lease = None
         self.callbacks = []
         self.closers = []
         self.closed = False
@@ -49,10 +50,10 @@ class StreamDelivery:
         self.bytes_sent += len(body)
         self.last_send_at = time.time()
         # Application converters emit whole SSE records, not arbitrary sockets.
-        for line in body.decode('utf-8', errors='replace').splitlines():
-            if not line.startswith('data:'):
+        for line in body.splitlines():
+            if not line.startswith(b'data:'):
                 continue
-            payload = line[5:].strip()
+            payload = line[5:].decode('utf-8', errors='replace').strip()
             if payload == '[DONE]':
                 self.terminal_sent = True
                 continue
@@ -94,6 +95,16 @@ class StreamDelivery:
                     disconnect_source=self.disconnect_source,
                     downstream_exception_type=self.exception_type)
 
+    async def release_delivered_lease(self):
+        # The generator has finished and ASGI already sent the protocol terminal.
+        # Free its slot before the client can observe HTTP EOF and send the next request.
+        if self.completed_lease is not None and self.complete:
+            lease, self.completed_lease = self.completed_lease, None
+            try:
+                await lease.result(success=True)
+            except Exception as exc:
+                log.warning(f"Failed to release delivered stream lease: {type(exc).__name__}")
+
     async def begin_segment(self):
         # A continuation starts only after the preceding segment was consumed.
         # Settle that completed API call before the next call can fail; leaving
@@ -102,6 +113,7 @@ class StreamDelivery:
             for callback in self.callbacks:
                 await callback(continuing=True)
             self.callbacks.clear()
+        self.completed_lease = None
         self.terminal_sent = False
         self.openai_candidates.clear()
         self.openai_finished.clear()

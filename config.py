@@ -13,6 +13,7 @@ import re
 from typing import Any, Optional
 
 from log import log
+from src.storage import database as storage
 
 # 全局配置缓存
 _config_cache: dict[str, Any] = {}
@@ -39,6 +40,7 @@ ENV_MAPPINGS = {
     "RETRY_429_INTERVAL": "retry_429_interval",
     "ANTI_TRUNCATION_MAX_ATTEMPTS": "anti_truncation_max_attempts",
     "RETURN_THOUGHTS_TO_FRONTEND": "return_thoughts_to_frontend",
+    "SYSTEM_INSTRUCTION_AS_USER_MESSAGE": "system_instruction_as_user_message",
     "SENSITIVE_WORDS": "sensitive_words",
     "SENSITIVE_WORDS_ENABLED": "sensitive_words_enabled",
     "IP_WHITELIST": "ip_whitelist",
@@ -61,40 +63,38 @@ ENV_MAPPINGS = {
 
 # ====================== 配置系统 ======================
 
+def apply_config_snapshot(values: dict):
+    global _config_cache, _config_initialized
+    _config_cache = values
+    _config_initialized = True
+
+
 async def init_config():
     """初始化配置缓存（启动时调用一次）"""
-    global _config_cache, _config_initialized
-
     if _config_initialized:
         return
 
     try:
-        from src.storage.database import get_database
-        database = await get_database()
-        _config_cache = await database.get_all_config()
-        _config_initialized = True
+        database = await storage.get_database()
+        apply_config_snapshot(await database.get_all_config())
     except Exception:
         # 初始化失败时使用空缓存
-        _config_cache = {}
-        _config_initialized = True
+        apply_config_snapshot({})
 
 
-async def reload_config():
+async def reload_config(*, only_if_changed=False) -> bool:
     """重新加载配置（修改配置后调用）"""
-    global _config_cache, _config_initialized
-
     try:
-        from src.storage.database import get_database
-        database = await get_database()
+        database = await storage.get_database()
 
         # 重新加载数据库配置缓存
-        await database.reload_config_cache()
+        await database.reload_config_cache(only_if_changed=only_if_changed)
 
         # 重新加载配置缓存
-        _config_cache = await database.get_all_config()
-        _config_initialized = True
+        apply_config_snapshot(await database.get_all_config())
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _get_cached_config(key: str, default: Any = None) -> Any:
@@ -150,13 +150,34 @@ async def get_auto_ban_enabled() -> bool:
     return bool(await get_config_value("auto_ban_enabled", False))
 
 
+def parse_auto_ban_error_codes(value: Any) -> list[int]:
+    """Accept the panel's text field and the config API's integer array."""
+    error = "自动封禁错误码必须是 100–599 的整数列表，如 [400, 403] 或 400,403"
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                value = json.loads(text)
+            except (ValueError, RecursionError):
+                raise ValueError(error) from None
+        elif not text:
+            value = []
+        elif re.fullmatch(r"[0-9]{3}(?:\s*,\s*[0-9]{3})*", text):
+            value = [int(code) for code in text.split(",")]
+        else:
+            raise ValueError(error)
+    if not isinstance(value, list) or any(type(code) is not int or not 100 <= code <= 599 for code in value):
+        raise ValueError(error)
+    return list(dict.fromkeys(value or AUTO_BAN_ERROR_CODES))
+
+
 async def get_auto_ban_error_codes() -> list:
     """
     Get auto ban error codes.
 
     Environment variable: AUTO_BAN_ERROR_CODES (comma-separated, e.g., "400,403")
     Database config key: auto_ban_error_codes
-    Default: [400, 403]
+    Default: [403]
     """
     env_value = os.getenv("AUTO_BAN_ERROR_CODES")
     if env_value:
@@ -168,6 +189,12 @@ async def get_auto_ban_error_codes() -> list:
     codes = await get_config_value("auto_ban_error_codes")
     if codes and isinstance(codes, list):
         return codes
+    if isinstance(codes, str):
+        # Earlier panel versions stored the text field verbatim.
+        try:
+            return parse_auto_ban_error_codes(codes)
+        except ValueError:
+            pass
     return AUTO_BAN_ERROR_CODES
 
 
@@ -302,6 +329,25 @@ async def get_return_thoughts_to_frontend() -> bool:
     return bool(await get_config_value("return_thoughts_to_frontend", True))
 
 
+async def get_system_instruction_as_user_message() -> bool:
+    """
+    Get system instruction as user message setting.
+
+    启用后，Antigravity 转换时不再使用 systemInstruction 字段，
+    而是将系统指令用 <system-instructions> 标签（XML 格式）包裹后
+    作为第一条 user 消息插入 contents 开头。
+
+    Environment variable: SYSTEM_INSTRUCTION_AS_USER_MESSAGE
+    Database config key: system_instruction_as_user_message
+    Default: False
+    """
+    env_value = os.getenv("SYSTEM_INSTRUCTION_AS_USER_MESSAGE")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+
+    return bool(await get_config_value("system_instruction_as_user_message", False))
+
+
 # ====================== 敏感词过滤 ======================
 
 # 敏感词正则编译缓存: (原始词表指纹, 编译后的 pattern 列表)
@@ -346,7 +392,7 @@ async def get_sensitive_words() -> list:
 
 def compile_sensitive_words(words: list):
     """
-    编译敏感词为大小写不敏感的正则列表（带缓存）。
+    编译敏感词为大小写敏感的正则列表（带缓存）。
 
     每个词按字面量转义后编译（用户输入的是词/短语而非正则语法），
     触发后整词替换为空。支持中文（re.UNICODE 默认开启）。
@@ -364,7 +410,7 @@ def compile_sensitive_words(words: list):
         if not word:
             continue
         try:
-            patterns.append(re.compile(re.escape(word), re.IGNORECASE | re.UNICODE))
+            patterns.append(re.compile(re.escape(word), re.UNICODE))
         except re.error as e:
             log.warning(f"敏感词编译失败，已跳过: {word!r} ({e})")
 
@@ -374,7 +420,7 @@ def compile_sensitive_words(words: list):
 
 
 def apply_sensitive_word_filter(text: str, patterns) -> str:
-    """将文本中命中的敏感词（大小写不敏感）替换为空"""
+    """将文本中命中的敏感词（大小写敏感）替换为空"""
     if not text or not patterns:
         return text
     for pattern in patterns:
@@ -605,6 +651,19 @@ def _parse_model_rewrite_rules_value(value: Any) -> Optional[list]:
     return None
 
 
+def compile_model_rewrite_rule(pattern: str, replacement: str):
+    try:
+        regex = re.compile(pattern)
+    except (re.error, OverflowError, RecursionError) as exc:
+        raise ValueError(f"无效的匹配正则：{exc}") from exc
+    # sub validates the replacement's group references even without a match.
+    try:
+        regex.sub(replacement, "")
+    except (re.error, IndexError, ValueError, OverflowError) as exc:
+        raise ValueError(f"无效的替换模板：{exc}") from exc
+    return regex, replacement
+
+
 def compile_model_rewrite_rules(rules: list):
     """
     编译复写规则为 (pattern, replacement) 元组列表（带缓存）。
@@ -623,10 +682,12 @@ def compile_model_rewrite_rules(rules: list):
             continue
         pattern, replacement = rule[0], rule[1]
         try:
-            compiled.append((re.compile(str(pattern)), str(replacement)))
-        except re.error:
+            compiled.append(compile_model_rewrite_rule(str(pattern), str(replacement)))
+        except ValueError:
             invalid.append(rule)
 
+    if invalid:
+        log.warning(f"已跳过 {len(invalid)} 条无效的模型名复写规则，请检查匹配正则与替换模板")
     result = (compiled, invalid)
     _model_rewrite_cache["fingerprint"] = fingerprint
     _model_rewrite_cache["result"] = result
@@ -657,9 +718,7 @@ async def get_model_rewrite_filter():
     rules = await get_model_rewrite_rules_config()
     if not rules:
         return False, []
-    compiled, invalid = compile_model_rewrite_rules(rules)
-    if invalid:
-        log.warning(f"模型名复写规则中存在无效正则（已跳过）: {invalid}")
+    compiled, _ = compile_model_rewrite_rules(rules)
     return bool(compiled), compiled
 
 

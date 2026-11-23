@@ -1,6 +1,6 @@
 import { FileJson, Loader2, Upload, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { uploadCredentialFiles } from "../utils/credentialUpload";
+import { appendCredentialFiles, uploadCredentialFiles } from "../utils/credentialUpload";
 
 export default function UploadPage() {
   const [files, setFiles] = useState([]);
@@ -8,6 +8,8 @@ export default function UploadPage() {
   const [results, setResults] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef(null);
+  const nextFileId = useRef(0);
+  const selection = useRef(Promise.resolve([]));
   const controllerRef = useRef(null);
   const mounted = useRef(true);
   useEffect(() => {
@@ -15,20 +17,27 @@ export default function UploadPage() {
     return () => { mounted.current = false; controllerRef.current?.abort(); };
   }, []);
 
+  // Apply picks, drops, and removals in order while same-name files are compared.
+  const updateSelection = (update) => {
+    const pending = selection.current.then(update);
+    selection.current = pending;
+    pending.then(entries => {
+      if (mounted.current && selection.current === pending) setFiles(entries);
+    });
+  };
+
   const addFiles = (fileList) => {
     if (uploading) return;
     const valid = Array.from(fileList).filter(
       (f) => f.name.toLowerCase().endsWith(".json") || f.name.toLowerCase().endsWith(".zip")
     );
-    setFiles((prev) => {
-      const names = new Set(prev.map((f) => f.name));
-      return [...prev, ...valid.filter((f) => !names.has(f.name))];
-    });
+    const additions = valid.map(file => ({ id: nextFileId.current++, file }));
+    updateSelection(previous => appendCredentialFiles(previous, additions));
     setResults(null);
   };
 
-  const removeFile = (name) => {
-    setFiles((prev) => prev.filter((f) => f.name !== name));
+  const removeFile = (id) => {
+    updateSelection(previous => previous.filter(entry => entry.id !== id));
   };
 
   const upload = async () => {
@@ -39,7 +48,9 @@ export default function UploadPage() {
     setResults(null);
     try {
       const formData = new FormData();
-      files.forEach(f => formData.append("files", f));
+      const entries = await selection.current;
+      if (controller.signal.aborted || !entries.length) return;
+      entries.forEach(({ file }) => formData.append("files", file));
       await uploadCredentialFiles(formData, {
         signal: controller.signal,
         onEvent: event => {
@@ -139,7 +150,7 @@ export default function UploadPage() {
                 {uploading ? "上传中..." : "上传文件"}
               </button>
               <button
-                onClick={() => setFiles([])}
+                onClick={() => updateSelection(() => [])}
                 disabled={uploading}
                 className="btn btn-secondary text-sm"
               >
@@ -148,9 +159,9 @@ export default function UploadPage() {
             </div>
           </div>
           <div className="space-y-1.5 max-h-64 overflow-y-auto">
-            {files.map((f) => (
+            {files.map(({ id, file: f }) => (
               <div
-                key={f.name}
+                key={id}
                 className="flex items-center justify-between bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-sm"
               >
                 <div className="flex items-center gap-2 text-slate-700 min-w-0">
@@ -163,7 +174,7 @@ export default function UploadPage() {
                   </span>
                   <button
                     disabled={uploading}
-                    onClick={() => removeFile(f.name)}
+                    onClick={() => removeFile(id)}
                     className="text-slate-500 hover:text-red-700"
                   >
                     <X size={14} />

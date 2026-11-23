@@ -6,9 +6,11 @@ import {
     Upload,
     Info,
     BarChart3,
+    Network,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import api from "./api";
+import { getPanelToken, panelTokenKey } from "./panelSession.js";
 import Login from "./pages/Login";
 import OAuth from "./pages/OAuth";
 import Credentials from "./pages/Credentials";
@@ -17,9 +19,10 @@ import RefreshTokenImport from "./pages/RefreshTokenImport";
 import Config from "./pages/Config";
 import About from "./pages/About";
 import UsageLogs from "./pages/UsageLogs";
+import ProxyIPs from "./pages/ProxyIPs";
 
 export default function App() {
-  const [loggedIn, setLoggedIn] = useState(() => !!localStorage.getItem("agy2apiPreviewPanelToken"));
+  const [loggedIn, setLoggedIn] = useState(() => !!getPanelToken());
   const [activeTab, setActiveTab] = useState("oauth");
   const [version, setVersion] = useState(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -41,9 +44,19 @@ export default function App() {
   }, []);
 
   const logout = () => {
-    localStorage.removeItem("agy2apiPreviewPanelToken");
+    localStorage.removeItem(panelTokenKey);
     setLoggedIn(false);
   };
+
+  useEffect(() => {
+    const syncSession = event => {
+      if (event.storageArea === localStorage && (event.key === panelTokenKey || event.key === null)) {
+        setLoggedIn(!!getPanelToken());
+      }
+    };
+    window.addEventListener("storage", syncSession);
+    return () => window.removeEventListener("storage", syncSession);
+  }, []);
 
   if (!loggedIn) {
     return <Login onSuccess={() => setLoggedIn(true)} />;
@@ -52,6 +65,7 @@ export default function App() {
   const tabs = [
     { id: "oauth", label: "OAuth 认证", icon: Rocket },
     { id: "credentials", label: "凭证管理", icon: KeyRound },
+    { id: "proxy-ips", label: "IP 管理", icon: Network },
     { id: "rt-import", label: "RT 导入", icon: KeyRound },
     { id: "upload", label: "批量导入", icon: Upload },
     { id: "usage-logs", label: "请求日志", icon: BarChart3 },
@@ -108,6 +122,7 @@ export default function App() {
       <div className="max-w-6xl mx-auto px-4 py-6">
         {activeTab === "oauth" && <OAuth />}
         {activeTab === "credentials" && <Credentials />}
+        {activeTab === "proxy-ips" && <ProxyIPs />}
         {activeTab === "rt-import" && <RefreshTokenImport />}
         {activeTab === "upload" && <UploadPage />}
         {activeTab === "usage-logs" && <UsageLogs />}

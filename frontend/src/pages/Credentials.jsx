@@ -14,19 +14,37 @@ import {
   Trash2,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
 import QuotaSummary, { quotaGroups } from "../components/QuotaSummary";
 import CredentialQuota from "../components/CredentialQuota";
 import CredentialModels from "../components/CredentialModels";
+import CredentialProxy from "../components/CredentialProxy";
+import CredentialLimits from "../components/CredentialLimits";
 
 const hasActiveCooldown = (item, now) =>
   Object.values(item.model_cooldowns || {}).some(until => until > now);
 
 export default function Credentials() {
   const [items, setItems] = useState([]);
+  const [proxyItems, setProxyItems] = useState(null);
+  const [proxyLoadFailed, setProxyLoadFailed] = useState(false);
+  const [proxyReload, setProxyReload] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    setProxyLoadFailed(false);
+    api.get("/proxies", { signal: controller.signal })
+      .then(res => setProxyItems(res.data.items))
+      .catch(() => { if (!controller.signal.aborted) setProxyLoadFailed(true); });
+    return () => controller.abort();
+  }, [proxyReload]);
+  const savedEditVersion = useRef(0);
+  const applyCredentialEdit = ({ email, ...fields }) => {
+    savedEditVersion.current += 1;
+    setItems(rows => rows.map(row => row.email === email ? { ...row, ...fields } : row));
+  };
   const [modelsCredential, setModelsCredential] = useState(null);
   const [noteCredential, setNoteCredential] = useState(null);
   const [noteDraft, setNoteDraft] = useState("");
@@ -36,7 +54,7 @@ export default function Credentials() {
     event.preventDefault(); setNoteSaving(true); setNoteError("");
     try {
       const { data } = await api.patch(`/creds/note/${encodeURIComponent(noteCredential.email)}`, { note: noteDraft });
-      setItems(rows => rows.map(row => row.email === data.email ? { ...row, note: data.note } : row));
+      applyCredentialEdit(data);
       setNoteCredential(null);
     } catch (err) { setNoteError(err.response?.data?.detail || "保存备注失败"); }
     finally { setNoteSaving(false); }
@@ -50,9 +68,14 @@ export default function Credentials() {
   const [cooldownFilter, setCooldownFilter] = useState("all");
   const [tierFilter, setTierFilter] = useState("all");
   const [loading, setLoading] = useState(true);
+  const [listError, setListError] = useState("");
+  const reloadList = useRef(null);
+  const fetchCreds = useCallback(() => reloadList.current?.(), []);
   const [selected, setSelected] = useState(new Set());
   const [message, setMessage] = useState(null);
   const [errorModal, setErrorModal] = useState(null);
+  const errorRequest = useRef(null);
+  useEffect(() => () => errorRequest.current?.abort(), []);
   const [clearTargets, setClearTargets] = useState(null);
   const [clearScope, setClearScope] = useState("all");
   const [clearing, setClearing] = useState(false);
@@ -98,38 +121,50 @@ export default function Credentials() {
     return () => clearInterval(t);
   }, []);
 
-  const fetchCreds = useCallback(async () => {
-    setLoading(true);
-    try {
-      const offset = (page - 1) * pageSize;
-      const res = await api.get("/creds/status", {
-        params: {
-          offset,
-          limit: pageSize,
-          status_filter: statusFilter,
-          error_code_filter: errorCodeFilter,
-          cooldown_filter: cooldownFilter,
-          tier_filter: tierFilter,
-        },
-      });
-      setItems(res.data.items);
-      setTotal(res.data.total);
-      setStats(res.data.stats || { total: 0, normal: 0, disabled: 0 });
+  useLayoutEffect(() => {
+    let activeRequest;
+    const load = async () => {
+      activeRequest?.abort();
+      const controller = new AbortController();
+      activeRequest = controller;
+      const versionAtStart = savedEditVersion.current;
+      setLoading(true);
+      setListError("");
       setSelected(new Set());
-      // Clearing CD can remove the last page from the filtered result.
-      // Clamp the page so the effect reloads the remaining credentials.
-      const lastPage = Math.max(1, Math.ceil(res.data.total / pageSize));
-      if (page > lastPage) setPage(lastPage);
-    } catch (err) {
-      showMessage("error", err.response?.data?.detail || "加载凭证失败");
-    } finally {
-      setLoading(false);
-    }
+      try {
+        const { data } = await api.get("/creds/status", {
+          signal: controller.signal,
+          params: {
+            offset: (page - 1) * pageSize, limit: pageSize,
+            status_filter: statusFilter, error_code_filter: errorCodeFilter,
+            cooldown_filter: cooldownFilter, tier_filter: tierFilter,
+          },
+        });
+        if (controller.signal.aborted) return;
+        // The server may have read these rows before an overlapping PATCH committed.
+        if (versionAtStart !== savedEditVersion.current) return load();
+        setItems(data.items);
+        setTotal(data.total);
+        setStats(data.stats || { total: 0, normal: 0, disabled: 0 });
+        const lastPage = Math.max(1, Math.ceil(data.total / pageSize));
+        if (page > lastPage) setPage(lastPage);
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        setItems([]);
+        setTotal(0);
+        setListError(err.response?.data?.detail || "加载凭证失败");
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    };
+    // A mutation started on an earlier page may finish after the filters change.
+    reloadList.current = load;
+    load();
+    return () => {
+      activeRequest.abort();
+      reloadList.current = null;
+    };
   }, [page, pageSize, statusFilter, errorCodeFilter, cooldownFilter, tierFilter]);
-
-  useEffect(() => {
-    fetchCreds();
-  }, [fetchCreds]);
 
   const showMessage = useCallback((type, text, title) => {
     setMessage({ type, text, title: title || (type === "success" ? "操作成功" : type === "error" ? "操作失败" : "提示") });
@@ -366,11 +401,14 @@ export default function Credentials() {
   };
 
   const openErrors = async (email) => {
+    errorRequest.current?.abort();
+    const request = new AbortController();
+    errorRequest.current = request;
     try {
-      const res = await api.get(`/creds/errors/${encodeURIComponent(email)}`);
-      setErrorModal(res.data);
+      const res = await api.get(`/creds/errors/${encodeURIComponent(email)}`, { signal: request.signal });
+      if (!request.signal.aborted) setErrorModal(res.data);
     } catch (err) {
-      showMessage("error", err.response?.data?.detail || "获取错误信息失败");
+      if (!request.signal.aborted) showMessage("error", err.response?.data?.detail || "获取错误信息失败");
     }
   };
 
@@ -549,6 +587,7 @@ export default function Credentials() {
             <input
               type="checkbox"
               checked={selected.size === items.length && items.length > 0}
+              disabled={loading || !items.length}
               onChange={toggleSelectAll}
               className="accent-purple-600 w-4 h-4"
             />
@@ -561,6 +600,7 @@ export default function Credentials() {
           </label>
           <div className="flex flex-wrap gap-2">
             <button onClick={batchTest} disabled={!selected.size || !testModel.trim() || busyFiles.has("__batch__")} className="btn btn-primary text-xs px-3 py-1.5 disabled:opacity-40">批量测试</button>
+            <button onClick={() => doBatchAction("refresh_models")} disabled={!selected.size || busyFiles.has("__batch__")} className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">批量刷新模型</button>
             <button onClick={downloadSelected} disabled={!selected.size || busyFiles.has("__batch__")} className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">导出选中</button>
             <button onClick={() => openClearCooldown([...selected])} disabled={!selected.size || busyFiles.has("__batch__")} className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">批量清除 CD</button>
             <button
@@ -602,10 +642,18 @@ export default function Credentials() {
       </div>}
 
       {/* 凭证卡片列表 */}
+      {proxyLoadFailed && <p role="alert" className="text-sm text-red-700">
+        代理列表加载失败。<button className="underline" onClick={() => setProxyReload(n => n + 1)}>重试</button>
+      </p>}
+      {proxyItems?.length === 0 && items.length > 0 && <p className="text-sm text-slate-600">
+        要为凭证指定代理，请先在“IP 管理”中添加代理 IP。
+      </p>}
       {loading ? (
         <div className="flex items-center justify-center py-12">
           <Loader2 className="animate-spin text-purple-500" size={28} />
         </div>
+      ) : listError ? (
+        <p role="alert" className="card text-center py-12 text-red-700 text-sm">{listError}</p>
       ) : items.length === 0 ? (
         <div className="card text-center py-12 text-slate-500 text-sm">
           {stats.total > 0 ? "没有符合当前筛选条件的凭证。" : "没有凭证。请先通过 OAuth 认证或批量导入添加凭证。"}
@@ -657,6 +705,8 @@ export default function Credentials() {
                   <div className="whitespace-pre-wrap break-words">备注：{cred.note || "未设置"}</div>
                   <button className="text-purple-700 underline" onClick={() => { setNoteCredential(cred); setNoteDraft(cred.note || ""); setNoteError(""); }}>{cred.note ? "编辑备注" : "添加备注"}</button>
                 </div>
+                <CredentialProxy credential={cred} proxies={proxyItems} onSaved={applyCredentialEdit} />
+                <CredentialLimits credential={cred} onSaved={applyCredentialEdit} />
                 {/* 信息区 */}
                 <div className="space-y-1 text-xs">
                   <div className="flex items-center justify-between gap-2">

@@ -23,6 +23,17 @@ class ObservedStreamingResponse(StreamingResponse):
             return message
 
         async def observed_send(message):
+            # Some SSE clients use Unicode splitlines(). Escape those three
+            # characters in serialized JSON so readers reconstruct the original text.
+            body = message.get('body', b'')
+            if self.media_type == 'text/event-stream' and body.startswith((b'data:', b'event:')):
+                body = (body.replace(b'\xc2\x85', b'\\u0085')
+                            .replace(b'\xe2\x80\xa8', b'\\u2028')
+                            .replace(b'\xe2\x80\xa9', b'\\u2029'))
+                if body is not message['body']:
+                    message = {**message, 'body': body}
+            if message["type"] == "http.response.body" and state.completed_lease is not None:
+                await state.release_delivered_lease()
             try:
                 await send(message)
             except OSError as exc:
@@ -71,9 +82,15 @@ async def prepend_async_item(first_item: Any, iterator: AsyncIterator[Any]):
         yield item
 
 
-async def read_first_async_item(iterator: AsyncIterator[Any]) -> Any:
-    """Python 3.9-compatible async equivalent of built-in anext()."""
-    return await iterator.__anext__()
+async def read_first_async_item(iterator: AsyncIterator[Any], *, skip_sse_comments: bool = False) -> Any:
+    """Adapters that discard SSE comments wait for the first data frame or HTTP error."""
+    while True:
+        item = await iterator.__anext__()
+        if skip_sse_comments and (
+            isinstance(item, str) and item.startswith(":") or isinstance(item, bytes) and item.startswith(b":")
+        ):
+            continue
+        return item
 
 
 async def build_streaming_response_or_error(

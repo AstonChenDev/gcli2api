@@ -2,6 +2,7 @@ import { Check, ChevronDown, Copy, ExternalLink, Loader2, Rocket } from "lucide-
 import { useState } from "react";
 import Modal from "../components/Modal";
 import api from "../api";
+import { copyText } from "../utils/clipboard";
 
 export default function OAuth() {
   const [loading, setLoading] = useState(false);
@@ -17,6 +18,7 @@ export default function OAuth() {
     setLoading(true);
     setMessage(null);
     setAuthUrl("");
+    setCopied(false);
     setCredsContent("");
 
     try {
@@ -77,10 +79,15 @@ export default function OAuth() {
     }
   };
 
-  const copyUrl = () => {
-    navigator.clipboard.writeText(authUrl);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+  const copyUrl = async () => {
+    try {
+      await copyText(authUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+      setMessage({ type: "error", text: "浏览器未允许自动复制。请右键或长按认证链接，选择复制链接地址以手动复制。" });
+    }
   };
 
   const downloadCreds = () => {

@@ -7,18 +7,20 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from sqlalchemy import or_, select, text
+from anyio import CancelScope
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from config import get_antigravity_api_url
 from log import log
-from src.credential_tier import normalize_credential_tier
+from src.credential_refresh import refresh_stored
+from src.credential_tier import parse_tier
 from src.google_oauth_api import Credentials
 from src.httpx_client import post_async
 from src.storage.database import (
     AntigravityCredential, CredentialEntitlement, get_database, get_cooldown_group,
-    _row_to_credential_dict,
+    MODEL_NOT_FOUND_TTL, catalog_model_key, catalog_models, _row_to_credential_dict,
 )
 from src.utils import ANTIGRAVITY_USER_AGENT
 
@@ -27,33 +29,20 @@ RETRY_SECONDS = 60
 LEASE_SECONDS = 180
 
 
-def parse_tier(data):
-    # currentTier is often free-tier even for paying Ultra customers.
-    if not isinstance(data, dict):
-        raise ValueError("Malformed entitlement response")
-    paid = data.get("paidTier")
-    if paid is not None and not isinstance(paid, dict):
-        raise ValueError("Malformed paid tier")
-    tier = paid if paid else data.get("currentTier")
-    raw = tier.get("id") if isinstance(tier, dict) else None
-    if not isinstance(raw, str):
-        raise ValueError("Unrecognized entitlement tier")
-    raw = raw.strip().lower()
-    # Disabling an account requires an explicit known Free identifier. Do not
-    # guess from missing IDs, display names, or future IDs containing "free".
-    if raw in ("free", "free-tier"):
-        return "free"
-    if not any(k in raw for k in ("pro", "ultra")):
-        raise ValueError("Unrecognized entitlement tier")
-    return normalize_credential_tier(raw)
-
-
 def parse_catalog(data):
     models = data.get("models")
-    if not isinstance(models, dict) or not models or any(not isinstance(v, dict) for v in models.values()):
+    if not isinstance(models, dict) or not models:
         raise ValueError("Missing or malformed model catalog")
-    return sorted(name for name, spec in models.items()
-                  if not spec.get("disabled") and "disabled" not in name.lower())
+    available = []
+    for name, spec in models.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(spec, dict):
+            raise ValueError("Malformed model entry")
+        disabled = spec.get("disabled")
+        if disabled is not None and not isinstance(disabled, bool):
+            raise ValueError("Malformed model disabled flag")
+        if not disabled and "disabled" not in name.lower():
+            available.append(name)
+    return sorted(available)
 
 
 def _timestamp(value):
@@ -86,7 +75,7 @@ async def get_model_view(email, database=None):
     except (TypeError, ValueError):
         cooldowns = {}
     now = time.time()
-    raw_models = snapshot.get('models')
+    raw_models = catalog_models(row['snapshot'])
     known = isinstance(raw_models, list) and all(isinstance(m, str) for m in raw_models)
     models = sorted(set(m for m in raw_models if m and 'disabled' not in m.lower())) if known else []
     checked_at = _timestamp(snapshot.get('models_checked_at'))
@@ -130,28 +119,83 @@ async def locked(db, email):
         yield cred, state
 
 
-async def queue_refresh(email, database=None):
+def _next_tier_check(snapshot):
+    # Both verification paths reserve their order under the same credential lock.
+    sequence = snapshot.get("tier_check_sequence", 0) + 1
+    snapshot["tier_check_sequence"] = sequence
+    return sequence
+
+
+async def begin_manual_tier_check(email, database):
+    async with locked(database, email) as (cred, state):
+        if cred is None:
+            return None
+        snapshot = json.loads(state.snapshot)
+        sequence = _next_tier_check(snapshot)
+        state.snapshot = json.dumps(snapshot)
+        return sequence
+
+
+async def queue_refresh(email, database=None, *, expected_revision=None):
     """404 is a refresh hint, never proof that the whole account is invalid."""
     db = database or await get_database()
     async with locked(db, email) as (cred, state):
-        if cred is not None:
-            snapshot = json.loads(state.snapshot)
-            earliest = max(time.time(), snapshot.get("attempted_at", 0) + RETRY_SECONDS)
-            state.next_refresh = min(state.next_refresh, earliest)
+        if cred is None or (expected_revision is not None and cred.credential_revision != expected_revision):
+            return False
+        snapshot = json.loads(state.snapshot)
+        earliest = max(time.time(), snapshot.get("attempted_at", 0) + RETRY_SECONDS)
+        state.next_refresh = min(state.next_refresh, earliest)
+    return True
+
+
+async def mark_model_unavailable(email, model, access_token, database=None, *, expected_revision=None):
+    """Quarantine a model, without disabling the credential or clearing its catalog."""
+    db = database or await get_database()
+    now = time.time()
+    async with locked(db, email) as (cred, state):
+        if cred is None:
+            return
+        if expected_revision is not None:
+            if cred.credential_revision != expected_revision:
+                return
+        elif cred.access_token != access_token:
+            return
+        snapshot = json.loads(state.snapshot)
+        rejected = snapshot.get("model_not_found") or {}
+        rejected = {name: seen for name, seen in rejected.items()
+                    if isinstance(seen, (int, float)) and now - MODEL_NOT_FOUND_TTL < seen <= now}
+        rejected[catalog_model_key(model)] = now
+        snapshot["model_not_found"] = dict(list(rejected.items())[-128:])
+        state.snapshot = json.dumps(snapshot)
+        earliest = max(now, snapshot.get("attempted_at", 0) + RETRY_SECONDS)
+        state.next_refresh = min(state.next_refresh, earliest)
 
 
 async def refresh_one(email, database=None):
     db = database or await get_database()
     now, token = time.time(), uuid.uuid4().hex
+    try:
+        return await _refresh_one(db, email, now, token)
+    except asyncio.CancelledError:
+        # Release only our lease, even if the caller has already disconnected.
+        with CancelScope(shield=True):
+            async with db.session() as session:
+                await session.execute(update(CredentialEntitlement).where(
+                    CredentialEntitlement.email == email, CredentialEntitlement.lease_token == token
+                ).values(lease_token="", lease_until=0, next_refresh=now + RETRY_SECONDS))
+        raise
+
+
+async def _refresh_one(db, email, now, token):
     async with locked(db, email) as (cred, state):
         if cred is None:
             return False
         snapshot = json.loads(state.snapshot)
         if state.lease_until > now or state.next_refresh > now or snapshot.get("attempted_at", 0) + RETRY_SECONDS > now:
             return False
-        identity = (cred.id, cred.refresh_token, cred.client_id, cred.project_id)
         credentials = Credentials.from_dict(_row_to_credential_dict(cred))
         state.lease_token, state.lease_until = token, now + LEASE_SECONDS
+        sequence = _next_tier_check(snapshot)
         snapshot["attempted_at"] = now
         state.snapshot = json.dumps(snapshot)
 
@@ -159,7 +203,7 @@ async def refresh_one(email, database=None):
     try:
         # No database transaction or global lock is held across network IO.
         if not credentials.access_token or credentials.is_expired():
-            await credentials.refresh()
+            credentials = await refresh_stored(db, email, credentials)
             refreshed = True
         base = await get_antigravity_api_url()
         for endpoint, body, parser, field in (
@@ -169,13 +213,14 @@ async def refresh_one(email, database=None):
             try:
                 for attempt in range(2):
                     response = await post_async(
+                        credential_email=email, credential_revision=credentials.credential_revision,
                         url=f"{base.rstrip('/')}/v1internal:{endpoint}", json=body, timeout=20,
                         headers={"Authorization": f"Bearer {credentials.access_token}",
                                  "User-Agent": ANTIGRAVITY_USER_AGENT,
                                  "Content-Type": "application/json", "requestType": "agent"},
                     )
                     if response.status_code == 401 and not refreshed and attempt == 0:
-                        await credentials.refresh()
+                        credentials = await refresh_stored(db, email, credentials)
                         refreshed = True
                         continue
                     response.raise_for_status()
@@ -190,25 +235,33 @@ async def refresh_one(email, database=None):
 
     auto_disabled_id = None
     async with locked(db, email) as (cred, state):
-        if cred is None or state.lease_token != token or identity != (
-            cred.id, cred.refresh_token, cred.client_id, cred.project_id
-        ):
+        if cred is None or state.lease_token != token or cred.credential_revision != credentials.credential_revision:
             return False
         current = json.loads(state.snapshot)
+        if "models" in changes and "model_not_found" in current:
+            # A refresh only supersedes failures seen before it started.
+            current["model_not_found"] = {
+                name: seen for name, seen in current["model_not_found"].items() if seen > now
+            }
+        if "tier" in changes:
+            if sequence < current.get("applied_tier_check", 0):
+                # A later check already verified the tier. The catalog is independent.
+                del changes["tier"], changes["tier_checked_at"]
+            else:
+                current["applied_tier_check"] = sequence
         current.update(changes, errors=errors)
         state.snapshot = json.dumps(current)
         state.lease_token, state.lease_until = "", 0
-        state.next_refresh = time.time() + (RETRY_SECONDS if errors else REFRESH_SECONDS)
+        finished_at = time.time()
+        state.next_refresh = finished_at + (RETRY_SECONDS if errors else REFRESH_SECONDS)
+        if any(seen > now for seen in current.get("model_not_found", {}).values()):
+            state.next_refresh = min(state.next_refresh, max(finished_at, now + RETRY_SECONDS))
         if "tier" in changes:
             cred.tier = changes["tier"]
             if changes["tier"] == "free":
                 if not cred.disabled:
                     auto_disabled_id = cred.id
                 cred.disabled = True
-        if refreshed:
-            cred.access_token = credentials.access_token
-            if credentials.expires_at:
-                cred.expiry = credentials.expires_at.isoformat()
         # A later upgrade updates membership but never silently re-enables an
         # account. Notes, project IDs and existing cooldowns stay untouched.
         if changes or refreshed:

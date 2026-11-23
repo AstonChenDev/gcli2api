@@ -31,6 +31,17 @@ from src.router.antigravity.model_list import router as antigravity_model_list_r
 from src.panel import router as panel_router
 
 
+async def sync_worker_config():
+    """Refresh shared settings in the background; requests use the last committed snapshot."""
+    healthy = True
+    while True:
+        await asyncio.sleep(2)
+        refreshed = await config.reload_config(only_if_changed=True)
+        if healthy and not refreshed:
+            log.warning("配置同步暂时失败，继续使用上次成功读取的配置")
+        healthy = refreshed
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
@@ -64,11 +75,13 @@ async def lifespan(app: FastAPI):
     # OAuth回调服务器将在需要时按需启动
 
     entitlement_task = asyncio.create_task(refresh_loop())
+    config_task = asyncio.create_task(sync_worker_config())
     try:
         yield
     finally:
         entitlement_task.cancel()
-        await asyncio.gather(entitlement_task, return_exceptions=True)
+        config_task.cancel()
+        await asyncio.gather(entitlement_task, config_task, return_exceptions=True)
 
     # 清理资源
     log.info("开始关闭 AGY2API 主服务")

@@ -29,7 +29,7 @@ from src.utils import (
 )
 
 # 本地模块 - 基础路由工具
-from src.router.hi_check import is_health_check_request, create_health_check_response
+from src.router.hi_check import is_health_check_request, greeting_probe_response
 from src.router.stream_passthrough import (
     build_streaming_response_or_error,
     prepend_async_item,
@@ -88,8 +88,7 @@ async def messages(
 
     # 健康检查
     if is_health_check_request(normalized_dict, format="anthropic"):
-        response = create_health_check_response(format="anthropic")
-        return JSONResponse(content=response)
+        return greeting_probe_response("anthropic", claude_request.stream)
 
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(claude_request.model)
@@ -170,11 +169,11 @@ async def messages(
         max_attempts = await get_anti_truncation_max_attempts()
 
         # 首先对payload应用反截断指令
-        anti_truncation_payload = apply_anti_truncation(api_request)
+        anti_truncation_payload = await apply_anti_truncation(api_request)
 
         first_attempt_stream = antigravity_api.stream_request(body=anti_truncation_payload, native=False, log_ctx=log_ctx)
         try:
-            first_chunk = await read_first_async_item(first_attempt_stream)
+            first_chunk = await read_first_async_item(first_attempt_stream, skip_sse_comments=True)
         except StopAsyncIteration:
             return
 
@@ -223,7 +222,7 @@ async def messages(
         # 调用 API 层的流式请求（不使用 native 模式）
         stream_gen = antigravity_api.stream_request(body=api_request, native=False, log_ctx=log_ctx)
         try:
-            first_chunk = await read_first_async_item(stream_gen)
+            first_chunk = await read_first_async_item(stream_gen, skip_sse_comments=True)
         except StopAsyncIteration:
             return
 

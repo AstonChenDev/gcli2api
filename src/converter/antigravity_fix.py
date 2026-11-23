@@ -9,10 +9,10 @@ Antigravity Format Utilities - 独立的 Antigravity 请求处理和转换工具
 按项目要求:
 - 使用 print 输出 warning/error，去掉 debug 日志
 """
+import hashlib
 import json
 import re
 from fastapi import HTTPException
-import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -21,6 +21,7 @@ from config import (
     apply_sensitive_word_filter,
     get_model_rewrite_filter,
     get_sensitive_word_filter,
+    get_system_instruction_as_user_message,
     rewrite_model_name,
 )
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
@@ -52,8 +53,11 @@ DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_JAILBREAK", "threshold": "OFF"},
 ]
 
-MAX_OUTPUT_TOKENS = 64000
-TOP_K = 64
+# 官方模型目录权威 maxOutputTokens：Claude 严禁超 64k；Gemini 家族 65536
+CLAUDE_MAX_OUTPUT_TOKENS = 64000
+GEMINI_MAX_OUTPUT_TOKENS = 65536
+# Anthropic 规范: Claude thinkingBudget 下限 1024
+CLAUDE_MIN_THINKING_BUDGET = 1024
 _CLAUDE_THINKING_SIGNATURE = "skip_thought_signature_validator"  # 官方文档推荐的虚拟签名
 
 
@@ -227,26 +231,19 @@ def _clean_parameters_json_schema(
         if key in unsupported_keys or key.startswith("x-"):
             del result[key]
 
-    nullable_props = set()
     if isinstance(result.get("properties"), dict):
-        cleaned_props = {}
-        for prop_name, prop_schema in result["properties"].items():
-            if isinstance(prop_schema, dict):
-                prop_type = prop_schema.get("type")
-                if (
-                    prop_schema.get("nullable") is True
-                    or (
-                        isinstance(prop_type, list)
-                        and any(str(t).lower() == "null" for t in prop_type)
-                    )
-                ):
-                    nullable_props.add(prop_name)
-            cleaned_props[prop_name] = _clean_parameters_json_schema(prop_schema, root_schema, visited)
-        result["properties"] = cleaned_props
+        result["properties"] = {
+            prop_name: _clean_parameters_json_schema(prop_schema, root_schema, visited)
+            for prop_name, prop_schema in result["properties"].items()
+        }
 
     if "properties" in result and "type" not in result:
         result["type"] = "object"
 
+    # required 仅约束字段必须出现，null 也是合法取值；nullable 不等于可选。
+    # 若把 nullable 属性（如 Pydantic v2 的 type: ["string", "null"]）从 required
+    # 中剔除，上游 Gemini 会认为所有参数都非必填，频繁生成空参数 {} 的工具调用，
+    # 因此保留原始接口契约中的 required 约束。
     if isinstance(result.get("required"), list):
         prop_names = set(result.get("properties", {}).keys()) if isinstance(result.get("properties"), dict) else None
         required = []
@@ -254,8 +251,6 @@ def _clean_parameters_json_schema(
             if not isinstance(item, str):
                 continue
             if prop_names is not None and item not in prop_names:
-                continue
-            if item in nullable_props:
                 continue
             if item not in required:
                 required.append(item)
@@ -446,6 +441,25 @@ def _normalize_part_thought_signature(part: Dict[str, Any], model_name: str) -> 
     return normalized
 
 
+def _stable_json(value: Any) -> Optional[str]:
+    """稳定序列化（排序键），失败返回 None"""
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def _deterministic_tool_id(material: str) -> str:
+    """基于稳定材料确定性派生 toolu_ 前缀 ID（截断 32 hex）。
+
+    同一段历史在多轮往返中补全出的 ID 恒定不变，保证 Claude 路径下
+    KV 缓存依赖的前缀 token 序列字节级一致（随机 ID 会使前缀哈希
+    从缺失处开始全部改变，导致上游缓存彻底失效）。
+    """
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"toolu_{digest[:32]}"
+
+
 def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
     """
     确保 functionCall/functionResponse 携带 id 字段 (仅 Claude)。
@@ -455,6 +469,10 @@ def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
     tool_use/tool_result，而后者的 id 是必填字段。原生 Gemini 请求
     可能不带 id，因此这里按 name 补全缺失的 id，保证同一次调用的
     functionCall 与 functionResponse 使用相同 id。不修改入参。
+
+    缺失的 id 按「消息序号 + part 序号 + 函数名 + 载荷 JSON」确定性
+    派生：历史前缀索引跨轮次稳定（append-only），因此同一历史补全出的
+    ID 恒定，不会破坏多轮历史的字节级前缀一致性。
     """
     if "claude" not in (model_name or "").lower():
         return contents
@@ -464,19 +482,21 @@ def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
     pending_ids_by_name: Dict[str, list] = {}
     result = []
 
-    for content in contents:
+    for content_index, content in enumerate(contents):
         if not isinstance(content, dict) or not isinstance(content.get("parts"), list):
             result.append(content)
             continue
 
         new_parts = []
-        for part in content["parts"]:
+        for part_index, part in enumerate(content["parts"]):
             if isinstance(part, dict):
                 fc = part.get("functionCall")
                 fr = part.get("functionResponse")
                 if isinstance(fc, dict):
                     if not fc.get("id"):
-                        fc = {**fc, "id": f"toolu_{uuid.uuid4().hex}"}
+                        args_json = _stable_json(fc.get("args"))
+                        material = f"{content_index}:{part_index}:{fc.get('name')}:{args_json}"
+                        fc = {**fc, "id": _deterministic_tool_id(material)}
                         part = {**part, "functionCall": fc}
                     pending_ids_by_name.setdefault(fc.get("name"), []).append(fc["id"])
                 elif isinstance(fr, dict):
@@ -485,7 +505,12 @@ def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
                         if fr["id"] in queue:
                             queue.remove(fr["id"])
                     else:
-                        new_id = queue.pop(0) if queue else f"toolu_{uuid.uuid4().hex}"
+                        if queue:
+                            new_id = queue.pop(0)
+                        else:
+                            response_json = _stable_json(fr.get("response"))
+                            material = f"{content_index}:{part_index}:{fr.get('name')}:{response_json}"
+                            new_id = _deterministic_tool_id(material)
                         part = {**part, "functionResponse": {**fr, "id": new_id}}
             new_parts.append(part)
 
@@ -579,7 +604,7 @@ def prepare_image_generation_request(
 
     request_body["model"] = IMAGE_BASE_MODEL  # 统一使用基础模型名
     request_body["generationConfig"] = {
-        "candidateCount": 1,
+        "candidateCount": (request_body.get("generationConfig") or {}).get("candidateCount", 1),
         "imageConfig": image_config
     }
 
@@ -687,7 +712,7 @@ async def _get_sensitive_word_patterns():
 
 
 def _filter_text(text: str, patterns) -> str:
-    """对文本应用敏感词过滤（大小写不敏感，命中替换为空）"""
+    """对文本应用敏感词过滤（大小写敏感，命中替换为空）"""
     return apply_sensitive_word_filter(text, patterns)
 
 
@@ -844,6 +869,232 @@ def _prepare_claude_history(contents: List[Any], generation_config: Dict[str, An
     return contents
 
 
+# ==================== 官方报文结构规范化 ====================
+
+def _split_tools_single_function(tools: Any) -> Any:
+    """将 tools 拆解为官方单函数独立切片形态，保持客户端声明顺序。
+
+    官方 HAR 抓包铁律：原生 329 次带工具报文中，独立切片占比 100%：
+        "tools": [
+            { "functionDeclarations": [ { "name": "tool1", ... } ] },
+            { "functionDeclarations": [ { "name": "tool2", ... } ] }
+        ]
+    - 每个对象仅包含一个 functionDeclarations，且其中只有一个声明；
+    - 参数 schema 的 type 字段统一转大写（官方全工具采用 OBJECT/STRING/INTEGER/BOOLEAN/ARRAY）；
+    - 非 functionDeclarations 工具（googleSearch / codeExecution 等）严格保持就地位置。
+    """
+    if not isinstance(tools, list):
+        return tools
+
+    expanded_tools: List[Any] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            expanded_tools.append(tool)
+            continue
+
+        declarations = tool.get("functionDeclarations") or tool.get("function_declarations")
+        if isinstance(declarations, list):
+            for declaration in declarations:
+                if isinstance(declaration, dict):
+                    decl_copy = dict(declaration)
+                    parameters = decl_copy.get("parameters")
+                    if isinstance(parameters, (dict, list)):
+                        _enforce_uppercase_schema_types(parameters)
+                    expanded_tools.append({"functionDeclarations": [decl_copy]})
+                else:
+                    expanded_tools.append({"functionDeclarations": [declaration]})
+            continue
+
+        # 非 functionDeclarations 工具（googleSearch / codeExecution）严格保持就地位置
+        expanded_tools.append(tool)
+
+    return expanded_tools
+
+
+def _canonicalize_system_instruction(system_instruction: Dict[str, Any]) -> Dict[str, Any]:
+    """规范化 systemInstruction 为官方形态 {role: "user", parts: [...]}，统一键序 role -> parts -> 其余。
+
+    官方报文 systemInstruction 恒为:
+        { "role": "user", "parts": [ { "text": ... }, ... ] }
+    """
+    if not isinstance(system_instruction, dict):
+        return system_instruction
+
+    canonical: Dict[str, Any] = {}
+    role = system_instruction.get("role")
+    if not isinstance(role, str) or not role:
+        role = "user"
+    canonical["role"] = role
+    if "parts" in system_instruction:
+        canonical["parts"] = system_instruction["parts"]
+    for key, value in system_instruction.items():
+        if key not in ("role", "parts"):
+            canonical[key] = value
+    return canonical
+
+
+# systemInstruction 转首条 user 消息时的 XML 包裹标签
+SYSTEM_INSTRUCTIONS_TAG = "system-instructions"
+
+
+def _merge_system_instruction_text(system_instruction: Any) -> str:
+    """提取 systemInstruction 全部 text part，按 part 顺序以换行拼接"""
+    if not isinstance(system_instruction, dict):
+        return ""
+    parts = system_instruction.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    texts = [
+        str(part.get("text"))
+        for part in parts
+        if isinstance(part, dict) and isinstance(part.get("text"), str) and part.get("text").strip()
+    ]
+    return "\n".join(texts)
+
+
+def _convert_system_instruction_to_user_message(
+    result: Dict[str, Any],
+) -> None:
+    """将 systemInstruction 转换为 contents 开头的首条 user 消息（就地修改 result）。
+
+    文本内容用 <system-instructions> 标签（XML 格式）包裹后作为
+    role=user 的 content 插入 contents 最前面，并移除 systemInstruction 字段；
+    非文本 part（如 inlineData）按原顺序保留，不丢弃。
+
+    - 与已有首条 user 消息合并（系统指令 parts 前置），保证 Antigravity
+      上游对相邻同角色消息的兼容性；
+    - contents 缺失时创建仅含该消息的列表；
+    - 系统指令无有效内容时不做任何修改。
+    """
+    system_instruction = result.get("systemInstruction")
+    if not isinstance(system_instruction, dict):
+        return
+    parts = system_instruction.get("parts")
+    if not isinstance(parts, list):
+        return
+
+    system_text = _merge_system_instruction_text(system_instruction)
+    if not system_text:
+        return
+
+    wrapped = f"<{SYSTEM_INSTRUCTIONS_TAG}>\n{system_text}\n</{SYSTEM_INSTRUCTIONS_TAG}>"
+
+    # 文本 part 合并为单个包裹 part，非文本 part（inlineData 等）原样保留
+    system_parts: List[Dict[str, Any]] = [{"text": wrapped}]
+    for part in parts:
+        if isinstance(part, dict) and "text" not in part:
+            system_parts.append(part)
+
+    contents = result.get("contents")
+    if not isinstance(contents, list):
+        contents = []
+    contents = list(contents)
+
+    if (
+        contents
+        and isinstance(contents[0], dict)
+        and contents[0].get("role") == "user"
+        and isinstance(contents[0].get("parts"), list)
+    ):
+        # 与首条 user 消息合并：系统指令 parts 前置
+        first = contents[0]
+        contents[0] = {**first, "parts": system_parts + list(first["parts"])}
+    else:
+        contents.insert(0, {"role": "user", "parts": system_parts})
+
+    result["contents"] = contents
+    result.pop("systemInstruction", None)
+    print("[ANTIGRAVITY] systemInstruction 转换为首条 user 消息（<system-instructions> 包裹）", flush=True)
+
+
+def _enforce_uppercase_schema_types(schema: Any) -> None:
+    """递归将 schema 的 type 字段值转为大写（官方 HAR 全工具采用大写类型标记 OBJECT/STRING/...）。
+
+    注意：仅转换 type 键的值，其他字段（如 enum 值、format）保持原样。
+    """
+    if isinstance(schema, dict):
+        type_value = schema.get("type")
+        if isinstance(type_value, str):
+            schema["type"] = type_value.upper()
+        for key in ("properties",):
+            if isinstance(schema.get(key), dict):
+                for prop_schema in schema[key].values():
+                    _enforce_uppercase_schema_types(prop_schema)
+        if isinstance(schema.get("items"), (dict, list)):
+            _enforce_uppercase_schema_types(schema["items"])
+    elif isinstance(schema, list):
+        for item in schema:
+            _enforce_uppercase_schema_types(item)
+
+
+def _normalize_generation_config(
+    result: Dict[str, Any],
+    generation_config: Dict[str, Any],
+    profile: "ModelProfile",
+    upstream: str,
+) -> Dict[str, Any]:
+    """thinkingConfig / generationConfig 归一（对齐官方拓扑）。
+
+    - Claude + 强制工具调用（toolConfig mode=ANY）时剔除 thinkingConfig，
+      杜绝 Anthropic "Thinking may not be enabled when tool_choice forces tool use" 400；
+    - Claude thinkingBudget 下限保护（Anthropic 规范 >= 1024）；
+    - 不伪造 topK / topP（官方报文不携带，保留客户端显式值）。
+    """
+    is_claude = profile.family == "claude"
+
+    if is_claude:
+        tool_config = result.get("toolConfig")
+        forced_tool_choice = (
+            isinstance(tool_config, dict)
+            and str(
+                (tool_config.get("functionCallingConfig") or {}).get("mode", "")
+            ).upper() == "ANY"
+        )
+        if forced_tool_choice:
+            if generation_config.pop("thinkingConfig", None) is not None:
+                print(
+                    "[ANTIGRAVITY] Claude 目标带强制工具调用 (mode=ANY)，剔除 thinkingConfig "
+                    "防止上游 400 (thinking 与 tool_choice 冲突)",
+                    flush=True,
+                )
+
+        thinking_config = generation_config.get("thinkingConfig")
+        if isinstance(thinking_config, dict):
+            budget = thinking_config.get("thinkingBudget")
+            if isinstance(budget, int) and not isinstance(budget, bool) and 0 < budget < CLAUDE_MIN_THINKING_BUDGET:
+                print(
+                    f"[ANTIGRAVITY] Claude thinkingBudget {budget} 低于 Anthropic 规范下限，"
+                    f"钳制为 {CLAUDE_MIN_THINKING_BUDGET}",
+                    flush=True,
+                )
+                thinking_config["thinkingBudget"] = CLAUDE_MIN_THINKING_BUDGET
+
+    # 官方标配 maxOutputTokens（在 thinkingConfig 剔除/钳制之后补齐）：
+    # Claude 64000（严禁超 64k），Gemini 家族 65536
+    is_claude_model = is_claude or "claude" in (upstream or "").lower()
+    default_max_output = CLAUDE_MAX_OUTPUT_TOKENS if is_claude_model else GEMINI_MAX_OUTPUT_TOKENS
+    if generation_config.get("maxOutputTokens") in (None, 65536, 64000):
+        generation_config["maxOutputTokens"] = default_max_output
+
+    # generationConfig 内部键序: candidateCount -> maxOutputTokens -> thinkingConfig -> temperature -> topP -> topK -> 其余
+    ordered_keys = [
+        "candidateCount",
+        "maxOutputTokens",
+        "thinkingConfig",
+        "temperature",
+        "topP",
+        "topK",
+    ]
+    reordered: Dict[str, Any] = {}
+    for key in ordered_keys:
+        if key in generation_config:
+            reordered[key] = generation_config.pop(key)
+    for key, value in generation_config.items():
+        if key not in reordered:
+            reordered[key] = value
+    return reordered
+
+
 # ==================== 统一的 Antigravity 请求后处理 ====================
 
 async def normalize_antigravity_request(
@@ -860,7 +1111,8 @@ async def normalize_antigravity_request(
     3. 模型映射 + thinkingConfig (按 profile.thinking)
     4. contents 清理 -> 预填充处理 -> Claude 专属处理 -> 工具调用 id
     5. 工具 schema 规范化
-    6. 公共参数 (safetySettings / maxOutputTokens / topK)
+    6. systemInstruction 规范化（或转首条 user 消息，面板可配，热更新）
+    7. 公共参数 (safetySettings / maxOutputTokens / topK)
 
     Args:
         request: 原始请求字典 (不会被修改)
@@ -876,6 +1128,7 @@ async def normalize_antigravity_request(
     requested_thinking = generation_config.get("thinkingConfig") or {}
     if requested_thinking.get("includeThoughts") is False:
         return_thoughts = False
+    system_instruction_as_user = await get_system_instruction_as_user_message()
 
     # ========== 0.5 模型名复写（面板可配，热更新） ==========
     # 在抗截断前缀剥离之后、profile 解析之前应用：
@@ -891,7 +1144,7 @@ async def normalize_antigravity_request(
     profile = resolve_profile(model)
 
     # ========== 0. 敏感词过滤 ==========
-    # 在所有内容处理之前应用：命中面板配置的敏感词（大小写不敏感）直接替换为空，
+    # 在所有内容处理之前应用：命中面板配置的敏感词（大小写敏感）直接替换为空，
     # 避免触发 Google API 端点的敏感词拦截
     sensitive_patterns = await _get_sensitive_word_patterns()
     if sensitive_patterns:
@@ -930,11 +1183,42 @@ async def normalize_antigravity_request(
 
         result["contents"] = _ensure_tool_call_ids(contents, upstream)
 
-    # ========== 3. 工具 ==========
+    # ========== 3. 工具 (单函数独立包装形态) ==========
     if "tools" in result:
         tools = _normalize_tools_for_internal_api(result.get("tools"))
         # Claude: functionDeclarations + parameters；Gemini: 只保留 parameters，避免与 parametersJsonSchema 冲突
-        result["tools"] = _ensure_empty_tool_schema_for_claude(tools, upstream)
+        tools = _ensure_empty_tool_schema_for_claude(tools, upstream)
+        # 拆解为官方单函数独立切片 [{"functionDeclarations": [single_decl]}]，保持客户端声明原序
+        result["tools"] = _split_tools_single_function(tools)
+
+    # ========== 4. systemInstruction 规范化 ==========
+    if not isinstance(result.get("systemInstruction"), dict) and isinstance(result.get("system_instruction"), dict):
+        # snake_case 键归一化为官方 camelCase
+        result["systemInstruction"] = result.pop("system_instruction")
+    # 双写时 camelCase 优先，清除残留的 snake_case 键
+    result.pop("system_instruction", None)
+
+    # ========== 4.5 systemInstruction 规范化 / 转首条 user 消息（面板可配，热更新） ==========
+    # 开启转换后：系统指令以 <system-instructions> 标签包裹，作为第一条 user 消息
+    # 插入 contents 开头，systemInstruction 字段不再发往上游；
+    # 转换未生效（无有效文本）或转换关闭时，规范化为官方形态
+    if isinstance(result.get("systemInstruction"), dict):
+        if system_instruction_as_user:
+            _convert_system_instruction_to_user_message(result)
+        if isinstance(result.get("systemInstruction"), dict):
+            result["systemInstruction"] = _canonicalize_system_instruction(result["systemInstruction"])
+
+    explicit_limit = None
+    if profile.family in ("gemini3", "gemini4") and "maxOutputTokens" in generation_config:
+        limit = generation_config["maxOutputTokens"]
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise HTTPException(400, "maxOutputTokens 必须是正整数")
+        explicit_limit = min(limit, GEMINI_MAX_OUTPUT_TOKENS)
+
+    # ========== 5. thinkingConfig / generationConfig 归一 ==========
+    generation_config = _normalize_generation_config(result, generation_config, profile, upstream)
+    if explicit_limit is not None:
+        generation_config["maxOutputTokens"] = explicit_limit
 
     # ========== 公共处理 ==========
     generation_config.pop("presencePenalty", None)
@@ -943,14 +1227,9 @@ async def normalize_antigravity_request(
 
     result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
 
+    # 显式覆盖（result 与入参共享 generationConfig 引用，必须切断）
+    result.pop("generationConfig", None)
     if generation_config:
-        # Gemini callers may deliberately limit long responses. Keep the
-        # established default when absent and leave Claude budgeting unchanged.
-        limit = generation_config.get("maxOutputTokens") if profile.family in ("gemini3", "gemini4") else None
-        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
-            raise HTTPException(400, "maxOutputTokens 必须是正整数")
-        generation_config["maxOutputTokens"] = min(limit, MAX_OUTPUT_TOKENS) if limit is not None else MAX_OUTPUT_TOKENS
-        generation_config["topK"] = TOP_K
         result["generationConfig"] = generation_config
 
     return result

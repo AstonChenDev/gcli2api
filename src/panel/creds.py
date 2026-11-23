@@ -7,6 +7,7 @@
 import asyncio
 import io
 import json
+import math
 import time
 import zipfile
 from contextlib import aclosing
@@ -21,6 +22,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from log import log
+from src.credential_proxy import registered_email_for_import
+from src.credential_refresh import refresh_stored
 from src.credential_manager import (
     add_credential,
     remove_credential,
@@ -38,8 +41,8 @@ from src.antigravity_import import (
     import_antigravity_refresh_tokens,
     parse_import_request_payload,
 )
-from src.storage.database import get_database
-from src.credential_entitlements import get_model_view, queue_refresh, refresh_one
+from src.storage.database import UnsupportedCredentialModel, get_database
+from src.credential_entitlements import begin_manual_tier_check, get_model_view, mark_model_unavailable, queue_refresh, refresh_one
 from src.utils import (
     verify_panel_token,
     ANTIGRAVITY_USER_AGENT,
@@ -47,7 +50,9 @@ from src.utils import (
     ANTIGRAVITY_CLIENT_SECRET,
 )
 from src.api.antigravity import fetch_quota_info, build_antigravity_headers
-from src.credential_cooldown import acquire_test_dispatch, CooldownStore, PoolCooling
+from src.api.utils import is_model_not_found, parse_and_log_cooldown
+from src.credential_tier import DEFAULT_PROJECT_ID, generation_project_id
+from src.credential_cooldown import acquire_test_dispatch, CredentialReplaced, CooldownStore, PoolCooling, DispatchLimited
 from src import httpx_client
 from src.google_oauth_api import (
     Credentials,
@@ -63,6 +68,20 @@ router = APIRouter(prefix="/creds", tags=["credentials"])
 
 class CredentialNoteRequest(BaseModel):
     note: str = Field(max_length=1000, strict=True)
+
+
+class CredentialLimits(BaseModel):
+    concurrency_limit: int = Field(ge=0, le=2147483647, strict=True)
+    rpm_limit: int = Field(ge=0, le=2147483647, strict=True)
+
+
+@router.patch("/limits/{email}")
+async def set_credential_limits(email: str, limits: CredentialLimits, token: str = Depends(verify_panel_token)):
+    database = await get_database()
+    values = limits.model_dump()
+    if not await database.update_credential_state(email, values):
+        raise HTTPException(404, "凭证不存在")
+    return {"email": email, **values}
 
 
 class ClearCooldownRequest(BaseModel):
@@ -176,6 +195,7 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
                 client_id=ANTIGRAVITY_CLIENT_ID,
                 client_secret=ANTIGRAVITY_CLIENT_SECRET,
             )
+            creds.credential_email = await registered_email_for_import(email)
             for attempt in range(2):
                 try:
                     await asyncio.wait_for(creds.refresh(), timeout=IMPORT_REFRESH_TIMEOUT)
@@ -204,7 +224,10 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
         if not email:
             return {"status": "error", "message": "无法获取邮箱（JSON 中未提供且自动获取失败）"}
 
-        # 自动获取缺失的 project_id / tier
+        stored_email = creds.credential_email or await registered_email_for_import(email)
+        email = stored_email or email.strip().lower()
+        verified_free = False
+        # 查询实际权益时，以可确认的上游等级为准。
         if not project_id or not tier:
             try:
                 api_base_url = await get_antigravity_api_url()
@@ -212,27 +235,26 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
                     access_token=creds.access_token,
                     user_agent=ANTIGRAVITY_USER_AGENT,
                     api_base_url=api_base_url,
+                    credential_email=stored_email,
+                    require_verified_tier=True,
                 ), timeout=20.0)
                 if not project_id:
                     project_id = fetched_project
-                if not tier:
+                if fetched_tier:
                     tier = fetched_tier
+                    verified_free = fetched_tier == "free"
             except Exception as e:
                 log.warning(f"自动获取 project_id/tier 失败: {e}")
 
-        # project_id 获取失败时回退为 aicode-consumers，避免空值入库
-        if not project_id:
-            log.warning(f"导入凭证 {email}: project_id 获取失败，使用回退值 aicode-consumers")
-            project_id = "aicode-consumers"
-
         credential_data = {
             "access_token": creds.access_token,
-            "refresh_token": refresh_token,
+            "refresh_token": creds.refresh_token or refresh_token,
             "client_id": ANTIGRAVITY_CLIENT_ID,
             "client_secret": ANTIGRAVITY_CLIENT_SECRET,
             "project_id": project_id,
             "expiry": creds.expires_at.isoformat() if creds.expires_at else "",
             "tier": tier,
+            "verified_free": verified_free,
         }
 
         if "note" in data:
@@ -481,55 +503,33 @@ async def get_creds_status_common(
     })
 
 
-async def download_all_creds_common() -> Response:
-    """打包导出所有凭证（规范格式，文件名=邮箱.json）"""
-    zip_filename = "antigravity_credentials.zip"
-
+async def _read_export_records(emails=None):
     database = await get_database()
-    emails = await database.list_credentials()
+    try:
+        records = await database.get_credential_exports(emails)
+    except Exception as exc:
+        log.error(f"读取导出凭证失败 ({type(exc).__name__})")
+        raise HTTPException(500, "读取凭证失败，请重试导出") from None
+    if emails is None:
+        if not records:
+            raise HTTPException(404, "没有找到凭证")
+        return list(records.values())
+    for email in emails:
+        if email not in records:
+            raise HTTPException(404, f"凭证不存在，请刷新列表后重试：{email}")
+    return [records[email] for email in emails]
 
-    if not emails:
-        raise HTTPException(status_code=404, detail="没有找到凭证")
 
-    log.info(f"开始打包 {len(emails)} 个凭证...")
-
-    zip_buffer = io.BytesIO()
-
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        success_count = 0
-        for email in emails:
-            try:
-                state = await database.get_credential_state(email)
-                # 从凭证数据中取 refresh_token / access_token / expiry
-                cred = await database.get_credential(email)
-                if not cred:
-                    continue
-
-                export_data = {
-                    "refresh_token": cred.get("refresh_token", ""),
-                    "access_token": cred.get("access_token", ""),
-                    "expiry": cred.get("expiry", ""),
-                    "email": email,
-                    "tier": state.get("tier", "pro"),
-                    "project_id": state.get("project_id", ""),
-                }
-
-                if cred.get("note"):
-                    export_data["note"] = cred["note"]
-                content = json.dumps(export_data, ensure_ascii=False, indent=2)
-                zip_file.writestr(f"{email}.json", content)
-                success_count += 1
-            except Exception as e:
-                log.warning(f"导出凭证 {email} 时出错: {e}")
-                continue
-
-    log.info(f"打包完成: 成功 {success_count}/{len(emails)} 个凭证")
-
-    zip_buffer.seek(0)
+def _credential_archive(records, filename):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for record in records:
+            member = quote(record["email"], safe="@._+-") + ".json"
+            archive.writestr(member, json.dumps(record, ensure_ascii=False, indent=2))
     return Response(
-        content=zip_buffer.getvalue(),
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename={zip_filename}"},
+        content=buffer.getvalue(), media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"',
+                 "Cache-Control": "no-store", "X-Credential-Count": str(len(records))},
     )
 
 
@@ -544,44 +544,33 @@ async def verify_credential_project_common(email: str) -> JSONResponse:
 
     credentials = Credentials.from_dict(credential_data)
 
-    token_refreshed = await credentials.refresh_if_needed()
-
-    if token_refreshed:
-        log.info(f"Token已自动刷新: {email}")
-        credential_data = credentials.to_dict()
-        await database.store_credential(email, credential_data)
+    if credentials.is_expired():
+        credentials = await refresh_stored(database, email, credentials)
 
     # 重新获取 project id / tier
     api_base_url = await get_antigravity_api_url()
+    sequence = await begin_manual_tier_check(email, database)
+    if sequence is None:
+        raise HTTPException(404, "凭证不存在")
     project_id, subscription_tier = await fetch_project_id_and_tier(
         access_token=credentials.access_token,
         user_agent=ANTIGRAVITY_USER_AGENT,
         api_base_url=api_base_url,
+        credential_email=email, credential_revision=credential_data.get("credential_revision"),
+        require_verified_tier=True,
     )
-
-    # project_id 获取失败时回退，避免空值入库
-    if not project_id:
-        log.warning(f"校验凭证 {email}: project_id 获取失败，使用回退值 aicode-consumers")
-        project_id = "aicode-consumers"
-
-    # tier 获取失败时保留数据库原值，不覆盖为 None
-    if not subscription_tier:
-        old_state = await database.get_credential_state(email)
-        subscription_tier = old_state.get("tier") or "pro"
-        log.warning(f"校验凭证 {email}: tier 获取失败，保留原值 {subscription_tier}")
-
-    credential_data["project_id"] = project_id
-
-    await database.store_credential(email, credential_data)
-
-    state_update = {
-        "disabled": False,
-        "error_codes": [],
-        "tier": subscription_tier,
-        "project_id": project_id,
-    }
-
-    await database.update_credential_state(email, state_update)
+    if subscription_tier is None:
+        raise HTTPException(502, "上游未返回可确认的订阅等级，未修改凭证状态")
+    project_id = project_id or credentials.project_id or DEFAULT_PROJECT_ID
+    disabled = subscription_tier == "free"
+    updates = {"disabled": disabled, "tier": subscription_tier, "project_id": project_id}
+    if not disabled:
+        updates.update(error_codes=[], error_messages={})
+    if not await database.update_credential_state(email, updates, verified_tier_sequence=sequence,
+            expected_revision=credentials.credential_revision,
+            expected_refresh_token=credentials.refresh_token if credentials.credential_revision is None else None):
+        raise HTTPException(409, "检验期间凭证或订阅状态已更新，请重新检验")
+    await queue_refresh(email, database)
 
     log.info(f"检验凭证成功: {email} - Project ID: {project_id}, Tier: {subscription_tier}")
 
@@ -590,7 +579,7 @@ async def verify_credential_project_common(email: str) -> JSONResponse:
         "email": email,
         "project_id": project_id,
         "subscription_tier": subscription_tier,
-        "message": "检验成功！已解除禁用状态并清除错误码",
+        "message": "已确认 Free，凭证已禁用" if disabled else "检验成功，凭证已启用",
     })
 
 
@@ -699,8 +688,6 @@ async def creds_action(
 
         log.info(f"Performing action '{action}' on credential: {email}")
 
-        database = await get_database()
-
         if action == "enable":
             result = await set_cred_disabled(email, False)
             if result:
@@ -717,7 +704,7 @@ async def creds_action(
             success = await remove_credential(email)
             if success:
                 return JSONResponse(content={"message": f"已删除凭证 {email}"})
-            raise HTTPException(status_code=500, detail="删除凭证失败")
+            raise HTTPException(status_code=404, detail="凭证不存在")
 
         else:
             raise HTTPException(status_code=400, detail="无效的操作类型")
@@ -733,11 +720,11 @@ async def creds_action(
 async def creds_batch_action(
     request: CredFileBatchActionRequest,
     token: str = Depends(verify_panel_token)):
-    """批量对凭证执行操作（启用/禁用/删除）"""
+    """批量启用、禁用、删除，或安排模型清单刷新。"""
     try:
 
         action = request.action
-        emails = request.emails
+        emails = list(dict.fromkeys(request.emails))
 
         if not emails:
             raise HTTPException(status_code=400, detail="凭证列表不能为空")
@@ -747,14 +734,19 @@ async def creds_batch_action(
         success_count = 0
         errors = []
 
+        database = await get_database() if action == "refresh_models" else None
         for email in emails:
             try:
-                if action == "enable":
-                    await set_cred_disabled(email, False)
-                    success_count += 1
-                elif action == "disable":
-                    await set_cred_disabled(email, True)
-                    success_count += 1
+                if action == "refresh_models":
+                    if await queue_refresh(email, database):
+                        success_count += 1
+                    else:
+                        errors.append(f"{email}: 凭证不存在")
+                elif action in ("enable", "disable"):
+                    if await set_cred_disabled(email, action == "disable"):
+                        success_count += 1
+                    else:
+                        errors.append(f"{email}: 更新失败或凭证不存在")
                 elif action == "delete":
                     if await remove_credential(email):
                         success_count += 1
@@ -769,7 +761,10 @@ async def creds_batch_action(
                 errors.append(f"{email}: 处理失败 - {str(e)}")
                 continue
 
-        result_message = f"批量操作完成：成功处理 {success_count}/{len(emails)} 个凭证"
+        if action == "refresh_models":
+            result_message = f"已安排 {success_count}/{len(emails)} 个凭证刷新模型，结果可在可用模型面板查看"
+        else:
+            result_message = f"批量操作完成：成功处理 {success_count}/{len(emails)} 个凭证"
         if errors:
             result_message += "\n错误详情:\n" + "\n".join(errors)
 
@@ -792,52 +787,23 @@ async def export_credential(
     email: str,
     token: str = Depends(verify_panel_token)):
     """导出单个凭证（规范格式，文件名=邮箱.json）"""
-    try:
-        database = await get_database()
-
-        cred = await database.get_credential(email)
-        if not cred:
-            raise HTTPException(status_code=404, detail="凭证不存在")
-
-        state = await database.get_credential_state(email)
-
-        export_data = {
-            "refresh_token": cred.get("refresh_token", ""),
-            "access_token": cred.get("access_token", ""),
-            "expiry": cred.get("expiry", ""),
-            "email": email,
-            "tier": state.get("tier", "pro"),
-            "project_id": cred.get("project_id", ""),
-        }
-
-        if cred.get("note"):
-            export_data["note"] = cred["note"]
-        content = json.dumps(export_data, ensure_ascii=False, indent=2)
-
-        return Response(
-            content=content,
-            media_type="application/json",
-            headers={"Content-Disposition": f'attachment; filename="{email}.json"'},
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"导出凭证失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    [record] = await _read_export_records([email])
+    filename = quote(email, safe="@._+-") + ".json"
+    disposition = f'attachment; filename="{filename}"'
+    if not email.isascii():
+        disposition += "; filename*=UTF-8''" + quote(email + ".json", safe="")
+    return Response(
+        content=json.dumps(record, ensure_ascii=False, indent=2), media_type="application/json",
+        headers={"Content-Disposition": disposition, "Cache-Control": "no-store"},
+    )
 
 
 @router.get("/download-all")
 async def download_all_creds(
     token: str = Depends(verify_panel_token)):
     """打包导出所有凭证（每个文件为 邮箱.json）"""
-    try:
-        return await download_all_creds_common()
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"打包导出失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    records = await _read_export_records()
+    return _credential_archive(records, "antigravity_credentials.zip")
 
 
 @router.post("/download-selected")
@@ -846,34 +812,8 @@ async def download_selected_credentials(
     token: str = Depends(verify_panel_token),
 ):
     """Export exactly the selected credentials; fail instead of silently omitting missing rows."""
-    database = await get_database()
-    selected = list(dict.fromkeys(request.emails))
-    entries = []
-    for email in selected:
-        cred = await database.get_credential(email)
-        if not cred:
-            raise HTTPException(status_code=404, detail=f"凭证不存在，请刷新列表后重试：{email}")
-        entries.append((email, {
-            "email": email,
-            "access_token": cred.get("access_token", ""),
-            "expiry": cred.get("expiry", ""),
-            "refresh_token": cred.get("refresh_token", ""),
-            "project_id": cred.get("project_id", ""),
-            "tier": cred.get("tier", "pro"),
-            **({"note": cred["note"]} if cred.get("note") else {}),
-        }))
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for email, data in entries:
-            archive.writestr(f"{quote(email, safe='@._+-')}.json", json.dumps(data, ensure_ascii=False, indent=2))
-    return Response(
-        content=buffer.getvalue(), media_type="application/zip",
-        headers={
-            "Content-Disposition": 'attachment; filename="antigravity_selected_credentials.zip"',
-            "Cache-Control": "no-store",
-            "X-Credential-Count": str(len(entries)),
-        },
-    )
+    records = await _read_export_records(list(dict.fromkeys(request.emails)))
+    return _credential_archive(records, "antigravity_selected_credentials.zip")
 
 
 @router.post("/verify-project/{email}")
@@ -922,17 +862,15 @@ async def get_credential_quota(
         creds = Credentials.from_dict(credential_data)
 
         if creds.is_expired():
-            await asyncio.wait_for(creds.refresh(), timeout=30.0)
-            updated_data = creds.to_dict()
-            log.info(f"Token已自动刷新: {email}")
-            await database.store_credential(email, updated_data)
-            credential_data = updated_data
-
+            creds = await refresh_stored(database, email, creds)
+            credential_data.update(creds.to_dict())
         access_token = credential_data.get("access_token") or credential_data.get("token")
         if not access_token:
             raise HTTPException(status_code=400, detail="凭证中没有访问令牌")
 
-        quota_info = await fetch_quota_info(access_token, credential_data.get("project_id", ""))
+        quota_info = await fetch_quota_info(access_token, credential_data.get("project_id", ""), credential_email=email,
+                                           credential_revision=credential_data.get("credential_revision"),
+                                           account_tier=credential_data.get("tier") or "unknown")
 
         if quota_info.get("success"):
             result = {
@@ -945,8 +883,11 @@ async def get_credential_quota(
                     result[extra_key] = quota_info[extra_key]
             return JSONResponse(content=result)
         else:
+            status = quota_info.get("status_code", 502)
+            wait = quota_info.get("retry_after")
             return JSONResponse(
-                status_code=400,
+                status_code=status,
+                headers={"Retry-After": wait} if status in (429, 503) and wait else None,
                 content={
                     "success": False,
                     "email": email,
@@ -978,41 +919,38 @@ async def test_credential(
     lease = None
     try:
         database = await get_database()
+        test_model = model.strip()
+        if not test_model:
+            raise HTTPException(status_code=422, detail="测试模型不能为空")
+        waits = await database.get_dispatch_limit_waits(test_model, manual_email=email)
+        if email in waits:
+            exc = DispatchLimited(waits[email])
+            raise HTTPException(status_code=exc.status_code, detail=str(exc), headers={"Retry-After": str(exc.retry_after)})
 
         credential_data = await database.get_credential(email)
         if not credential_data:
             raise HTTPException(status_code=404, detail="凭证不存在")
 
         credentials = Credentials.from_dict(credential_data)
-        token_refreshed = credentials.is_expired()
-        if token_refreshed:
-            await asyncio.wait_for(credentials.refresh(), timeout=30.0)
-
-        if token_refreshed:
-            log.info(f"Token已自动刷新: {email}")
-            credential_data = credentials.to_dict()
-            await database.store_credential(email, credential_data)
+        if credentials.is_expired():
+            credentials = await refresh_stored(database, email, credentials)
+            credential_data.update(credentials.to_dict())
 
         access_token = credential_data.get("access_token") or credential_data.get("token")
         if not access_token:
             raise HTTPException(status_code=400, detail="凭证中没有访问令牌")
 
-        project_id = credential_data.get("project_id", "")
-        if not project_id:
-            raise HTTPException(status_code=400, detail="凭证中没有项目ID")
-
-        test_model = model.strip()
-        if not test_model:
-            raise HTTPException(status_code=422, detail="测试模型不能为空")
+        project_id = generation_project_id(credential_data)
 
         api_base_url = await get_antigravity_api_url()
         headers = build_antigravity_headers(access_token)
 
         try:
-            lease = await acquire_test_dispatch(email, test_model)
+            lease = await acquire_test_dispatch(email, test_model, credential_data.get("credential_revision"))
         except PoolCooling as exc:
-            raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": str(exc.retry_after)})
+            raise HTTPException(status_code=exc.status_code, detail=str(exc), headers={"Retry-After": str(exc.retry_after)})
         response = await httpx_client.post_async(
+            credential_email=email, credential_revision=credential_data.get("credential_revision"),
             url=f"{api_base_url}/v1internal:generateContent",
             json={
                 "model": test_model,
@@ -1026,28 +964,42 @@ async def test_credential(
             timeout=30.0
         )
 
+        retry_after = response.headers.get("retry-after")
         status_code = response.status_code
+        partial_answer = False
         if status_code == 200:
             # The batch tester must apply the same response semantics as the
             # model API, rather than clearing errors on an HTTP-200 rejection.
+            response = httpx_client.strip_json_bom(response)
             kind, classified = inspect_line("data: " + response.text, allow_text_notice=True) if response.content else ("metadata", None)
             if kind != "content":
                 if kind not in ("blocked", "error", "invalid"):
                     classified = stream_error(502, "UPSTREAM_EMPTY_RESPONSE", "上游未返回有效内容")
                 status_code = classified.status_code
+                partial_answer = bool(getattr(classified, "upstream_content", None))
                 response = httpx.Response(status_code, content=classified.body)
 
         await lease.result(success=status_code == 200)
+        result_headers = {}
+        revision = credential_data.get("credential_revision")
+        if status_code == 404 and is_model_not_found(response.content, generated_content=partial_answer):
+            await mark_model_unavailable(email, test_model, access_token, database, expected_revision=revision)
+        elif status_code in (429, 503):
+            deadline = await parse_and_log_cooldown(response.text, retry_after)
+            if deadline and deadline > time.time():
+                await database.set_model_cooldown(email, test_model, deadline, expected_revision=revision)
+                result_headers["Retry-After"] = str(max(1, math.ceil(deadline - time.time())))
         if status_code == 200 or status_code == 429:
             log.info(f"凭证测试成功: {email} (status={status_code})")
             if status_code == 200:
                 await database.update_credential_state(email, {
                     "error_codes": [],
                     "error_messages": {}
-                })
+                }, expected_revision=credential_data.get("credential_revision"))
 
             return JSONResponse(
                 status_code=status_code,
+                headers=result_headers,
                 content={
                     "success": True,
                     "status_code": status_code,
@@ -1065,7 +1017,7 @@ async def test_credential(
                 await database.update_credential_state(email, {
                     "error_codes": error_codes,
                     "error_messages": error_messages
-                })
+                }, expected_revision=credential_data.get("credential_revision"))
             except Exception as e:
                 log.error(f"保存测试错误信息失败: {e}")
 
@@ -1073,6 +1025,7 @@ async def test_credential(
 
         return JSONResponse(
             status_code=status_code,
+            headers=result_headers,
             content={
                 "success": False,
                 "status_code": status_code,
@@ -1082,6 +1035,10 @@ async def test_credential(
             }
         )
 
+    except UnsupportedCredentialModel as exc:
+        raise HTTPException(404, str(exc)) from None
+    except CredentialReplaced as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
     except HTTPException:
         raise
     except Exception as e:

@@ -18,6 +18,7 @@ import oauthlib.oauth2.rfc6749.parameters
 from config import get_config_value, get_antigravity_api_url, get_panel_password
 from log import log
 
+from .credential_proxy import registered_email_for_import
 from .google_oauth_api import (
     Credentials,
     Flow,
@@ -40,7 +41,7 @@ async def get_callback_port():
     return int(await get_config_value("oauth_callback_port", "11451", "OAUTH_CALLBACK_PORT"))
 
 
-def _prepare_credentials_data(credentials: Credentials, project_id: str, subscription_tier: str = None) -> Dict[str, Any]:
+def _prepare_credentials_data(credentials: Credentials, project_id: Optional[str], subscription_tier: Optional[str]) -> Dict[str, Any]:
     """准备凭证数据字典（Antigravity模式）"""
     creds_data = {
         "client_id": ANTIGRAVITY_CLIENT_ID,
@@ -48,6 +49,7 @@ def _prepare_credentials_data(credentials: Credentials, project_id: str, subscri
         "token": credentials.access_token,
         "refresh_token": credentials.refresh_token,
         "project_id": project_id,
+        "tier": subscription_tier,
     }
 
     if credentials.expires_at:
@@ -96,7 +98,6 @@ def _patch_oauthlib_validation():
 # 全局状态管理 - 严格限制大小
 auth_flows = {}  # 存储进行中的认证流程
 MAX_AUTH_FLOWS = 20  # 严格限制最大认证流程数
-DEFAULT_PROJECT_ID = "aicode-consumers"  # 获取不到 project_id 时的回退值
 
 
 def cleanup_auth_flows_for_memory():
@@ -366,55 +367,30 @@ async def _save_antigravity_credential(
 
     # 自动获取 project_id / tier
     log.info("Antigravity模式：从API获取project_id/tier...")
+    stored_email = await registered_email_for_import(email)
+    email = stored_email or email.strip().lower()
     antigravity_url = await get_antigravity_api_url()
     project_id, subscription_tier = await fetch_project_id_and_tier(
-        credentials.access_token,
-        ANTIGRAVITY_USER_AGENT,
-        antigravity_url
+        credentials.access_token, ANTIGRAVITY_USER_AGENT, antigravity_url,
+        credential_email=stored_email, require_verified_tier=True,
     )
-    if project_id:
-        log.info(f"成功从API获取project_id: {project_id}, tier: {subscription_tier}")
-    else:
-        project_id = DEFAULT_PROJECT_ID
-        log.warning(f"无法从API获取project_id，使用默认project_id: {project_id}")
-
-    # tier 获取失败时兜底为 free（避免 None 入库）
-    if not subscription_tier:
-        subscription_tier = "free"
-        log.warning("无法从API获取订阅等级，tier 兜底为 free")
-
-    # 保存凭证（email 为唯一键，同邮箱自动覆盖去重）
     database = await get_database()
-    creds_data = _prepare_credentials_data(
-        credentials, project_id, subscription_tier=subscription_tier
-    )
-    creds_data["tier"] = subscription_tier
-    await database.store_credential(email, creds_data)
+    creds_data = _prepare_credentials_data(credentials, project_id, subscription_tier)
+    await database.store_credential(email, {**creds_data, "verified_free": subscription_tier == "free"})
+    if not project_id or not subscription_tier:
+        saved = await database.get_credential(email)
+        if saved:
+            creds_data.update(project_id=saved["project_id"], tier=saved["tier"])
 
-    # 创建默认状态记录
-    try:
-        default_state = {
-            "error_codes": [],
-            "disabled": False,
-            "last_success": time.time(),
-            "tier": subscription_tier,
-            "project_id": project_id,
-        }
-        await database.update_credential_state(email, default_state)
-        log.info(f"凭证已保存: {email} (tier={subscription_tier})")
-    except Exception as e:
-        log.warning(f"创建默认状态记录失败 {email}: {e}")
-
-    # 清理使用过的流程
     _cleanup_auth_flow_server(state)
-
-    log.info("Antigravity OAuth认证成功，凭证已保存")
+    log.info(f"Antigravity OAuth认证成功，凭证已保存: {email}")
     return {
         "success": True,
         "credentials": creds_data,
         "email": email,
-        "tier": subscription_tier,
-        "auto_detected_project": bool(project_id),    }
+        "tier": creds_data["tier"],
+        "auto_detected_project": bool(project_id),
+    }
 
 
 def wait_for_callback_sync(state: str, timeout: int = 300) -> Optional[str]:

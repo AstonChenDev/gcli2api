@@ -7,8 +7,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from config import get_antigravity_api_url, get_googleapis_proxy_url, get_oauth_proxy_url
 from log import log
+from src.google_oauth_api import TokenError, read_oauth_tokens
 from src.httpx_client import get_async, post_async
-from src.credential_tier import normalize_credential_tier
+from src.credential_tier import parse_project_id, parse_tier
 from src.storage.database import get_database
 from src.utils import ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET, ANTIGRAVITY_USER_AGENT
 
@@ -162,7 +163,7 @@ class ImportFailure(Exception):
         super().__init__(message)
 
 
-async def prepare_credential(refresh_token):
+async def prepare_credential(refresh_token, *, existing_emails):
     """Use existing configured OAuth/Google proxies, without logging upstream bodies."""
     oauth_url = await get_oauth_proxy_url()
     response = await post_async(
@@ -178,9 +179,10 @@ async def prepare_credential(refresh_token):
             raise ImportFailure("oauth_unavailable", "Google OAuth 暂时不可用，请稍后重试")
         raise ImportFailure("oauth_rejected", "RT 已失效、被撤销或 OAuth Client 不匹配")
     data = response.json()
-    access_token = data.get("access_token")
-    if not isinstance(access_token, str) or not access_token:
-        raise ImportFailure("oauth_invalid_response", "Google 未返回有效的访问令牌")
+    try:
+        access_token, refresh_token = read_oauth_tokens(data, refresh_token)
+    except TokenError:
+        raise ImportFailure("oauth_invalid_response", "Google 未返回有效的令牌数据") from None
     headers = {"Authorization": f"Bearer {access_token}", "User-Agent": ANTIGRAVITY_USER_AGENT}
     google_url = await get_googleapis_proxy_url()
     response = await get_async(f"{google_url.rstrip('/')}/oauth2/v2/userinfo", headers=headers, timeout=30.0)
@@ -191,6 +193,9 @@ async def prepare_credential(refresh_token):
     if not email or user.get("verified_email") is False:
         raise ImportFailure("email_not_found", "无法确认 Google 账号邮箱，未保存凭证")
 
+    if email in existing_emails:
+        return email, None
+
     api_url = await get_antigravity_api_url()
     response = await post_async(
         f"{api_url.rstrip('/')}/v1internal:loadCodeAssist", headers=headers,
@@ -199,18 +204,17 @@ async def prepare_credential(refresh_token):
     if response.status_code != 200:
         raise ImportFailure("project_lookup_failed", f"获取 Antigravity 项目失败（HTTP {response.status_code}）")
     account = response.json()
-    project = account.get("cloudaicompanionProject")
-    if isinstance(project, dict):
-        project = project.get("id")
-    if not isinstance(project, str) or not project.strip():
+    project = parse_project_id(account)
+    if not project:
         raise ImportFailure("project_not_found", "RT 有效，但没有获取到 Antigravity Project ID；请先在官方应用激活账号")
-    tier_data = account.get("paidTier") or account.get("currentTier") or {}
-    raw_tier = str(tier_data.get("id", "") if isinstance(tier_data, dict) else "").lower()
-    tier = normalize_credential_tier(raw_tier) or "free"
+    try:
+        tier = parse_tier(account)
+    except ValueError:
+        tier = "unknown"
     credential = {
-        "access_token": access_token, "refresh_token": data.get("refresh_token") or refresh_token,
+        "access_token": access_token, "refresh_token": refresh_token,
         "client_id": ANTIGRAVITY_CLIENT_ID, "client_secret": ANTIGRAVITY_CLIENT_SECRET,
-        "project_id": project.strip(), "tier": tier,
+        "project_id": project, "tier": tier,
         "expiry": (datetime.now(timezone.utc) + timedelta(seconds=int(data.get("expires_in", 3600)))).isoformat(),
     }
     return email, credential
@@ -246,7 +250,7 @@ async def import_antigravity_refresh_tokens(candidates, *, database=None):
         async with semaphore:
             try:
                 async with asyncio.timeout(IMPORT_ITEM_TIMEOUT_SECONDS):
-                    return candidate, await prepare_credential(candidate.refresh_token), None
+                    return candidate, await prepare_credential(candidate.refresh_token, existing_emails=existing_emails), None
             except ImportFailure as error:
                 return candidate, None, _failure(candidate.item, error.code, error.message)
             except TimeoutError:

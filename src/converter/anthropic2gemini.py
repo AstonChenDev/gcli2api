@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from fastapi import Response
 from log import log
 from src.converter.utils import merge_system_messages
+from src.stream_metadata import token_counters
 
 from src.converter.thoughtSignature_fix import (
     decode_tool_id_and_signature,
@@ -196,23 +197,7 @@ def _anthropic_debug_enabled() -> bool:
     return str(os.getenv("ANTHROPIC_DEBUG", "true")).strip().lower() in _DEBUG_TRUE
 
 
-def _token_count(usage_metadata: Any, key: str) -> int:
-    if not isinstance(usage_metadata, dict):
-        return 0
-    value = usage_metadata.get(key)
-    if value is None or isinstance(value, bool):
-        return 0
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError, OverflowError):
-        return 0
-
-
-def _cached_content_token_count(usage_metadata: Any) -> int:
-    return _token_count(usage_metadata, "cachedContentTokenCount")
-
-
-def _anthropic_usage_from_metadata(usage_metadata: Any) -> Dict[str, Any]:
+def _anthropic_usage_from_counts(counts: Dict[str, int]) -> Dict[str, Any]:
     """
     将 Gemini usageMetadata 转换为 Claude usage 字段
 
@@ -223,18 +208,11 @@ def _anthropic_usage_from_metadata(usage_metadata: Any) -> Dict[str, Any]:
       （output_tokens = candidatesTokenCount + thoughtsTokenCount）
     - 明细: cache_read_input_tokens / output_tokens_details.thinking_tokens
     """
-    if not isinstance(usage_metadata, dict):
-        return {"input_tokens": 0, "output_tokens": 0}
-
-    prompt_tokens_total = _token_count(usage_metadata, "promptTokenCount")
-    cached_tokens = _cached_content_token_count(usage_metadata)
-    reasoning_tokens = _token_count(usage_metadata, "thoughtsTokenCount")
+    cached_tokens = counts.get("cachedContentTokenCount", 0)
+    reasoning_tokens = counts.get("thoughtsTokenCount", 0)
     usage: Dict[str, Any] = {
-        "input_tokens": max(prompt_tokens_total - cached_tokens, 0),
-        "output_tokens": (
-            _token_count(usage_metadata, "candidatesTokenCount")
-            + reasoning_tokens
-        ),
+        "input_tokens": max(counts.get("promptTokenCount", 0) - cached_tokens, 0),
+        "output_tokens": counts.get("candidatesTokenCount", 0) + reasoning_tokens,
     }
 
     if cached_tokens > 0:
@@ -358,24 +336,27 @@ def clean_json_schema(schema: Any) -> Any:
     if "properties" in cleaned and "type" not in cleaned:
         cleaned["type"] = "object"
 
+    # required 与 nullable 正交：null 也是合法取值，nullable 不等于可选。
+    # 保留原始接口契约中的 required 约束，避免上游把必填参数当作可选，
+    # 进而在工具调用时生成空参数 {}。
     if (
         isinstance(schema.get("properties"), dict)
         and isinstance(cleaned.get("required"), list)
     ):
-        nullable_fields = {
-            name
-            for name, prop in schema["properties"].items()
-            if isinstance(prop, dict)
-            and isinstance(prop.get("type"), list)
-            and any(str(t).lower() == "null" for t in prop["type"])
-        }
-        if nullable_fields:
-            cleaned["required"] = [
-                item for item in cleaned["required"]
-                if item not in nullable_fields
-            ]
-            if not cleaned["required"]:
-                cleaned.pop("required", None)
+        prop_names = set(cleaned.get("properties", {}).keys()) \
+            if isinstance(cleaned.get("properties"), dict) else None
+        required = []
+        for item in cleaned["required"]:
+            if not isinstance(item, str):
+                continue
+            if prop_names is not None and item not in prop_names:
+                continue
+            if item not in required:
+                required.append(item)
+        if required:
+            cleaned["required"] = required
+        else:
+            cleaned.pop("required", None)
 
     return cleaned
 
@@ -931,7 +912,7 @@ def gemini_to_anthropic_response(
         stop_reason = "end_turn"
 
     # 提取 token 使用情况
-    usage = _anthropic_usage_from_metadata(usage_metadata)
+    usage = _anthropic_usage_from_counts(token_counters(usage_metadata))
 
     # 构建 Anthropic 响应
     message_id = f"msg_{uuid.uuid4().hex}"
@@ -979,13 +960,9 @@ async def gemini_stream_to_anthropic_stream(
     current_block_index = -1
     current_thinking_signature: Optional[str] = None
     has_tool_use = False
-    input_tokens = 0
-    prompt_tokens_total = 0
-    output_tokens = 0
-    cached_input_tokens = 0
-    reasoning_tokens = 0
+    counts: Dict[str, int] = {}
     finish_reason: Optional[str] = None
-    stream_finished = False  # finishReason 收尾块之后只消费不转换（保持上游流走完以记录请求日志）
+    done_seen = False
 
     def _sse_event(event: str, data: Dict[str, Any]) -> bytes:
         """生成 SSE 事件"""
@@ -1004,17 +981,6 @@ async def gemini_stream_to_anthropic_stream(
         current_block_type = None
         return event
 
-    def _usage_payload() -> Dict[str, Any]:
-        usage: Dict[str, Any] = {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens + reasoning_tokens,
-        }
-        if cached_input_tokens > 0:
-            usage["cache_read_input_tokens"] = cached_input_tokens
-        if reasoning_tokens > 0:
-            usage["output_tokens_details"] = {"thinking_tokens": reasoning_tokens}
-        return usage
-
     # 处理流式数据
     try:
         async for chunk in gemini_stream:
@@ -1031,21 +997,15 @@ async def gemini_stream_to_anthropic_stream(
                 }})
                 return
 
-            # finishReason 之后的残余块只消费不转换：
-            # 提前 break 会沿生成器链下发 GeneratorExit，导致底层
-            # stream_request 的成功日志记录代码永远不执行（issue #438）
-            if stream_finished:
-                continue
-
             # 解析 Gemini 流式块
-            if not chunk or not chunk.startswith(b"data: "):
+            if done_seen or not chunk or not chunk.startswith(b"data: "):
                 continue
 
             raw = chunk[6:].strip()
             if raw == b"[DONE]":
                 # 同 finishReason：不 break，改为消费剩余块直到流自然结束，
                 # 避免向底层 stream_request 下发 GeneratorExit 导致日志丢失
-                stream_finished = True
+                done_seen = True
                 continue
 
             try:
@@ -1070,28 +1030,14 @@ async def gemini_stream_to_anthropic_stream(
                 }})
                 return
 
-            candidate = (response.get("candidates", []) or [{}])[0] or {}
-            parts = (candidate.get("content", {}) or {}).get("parts", []) or []
+            counts.update(token_counters(response.get("usageMetadata")))
+            # A finish reason ends the content, but cumulative usage can arrive later.
+            if finish_reason:
+                continue
 
-            # 更新 usage metadata
-            if "usageMetadata" in response:
-                usage = response["usageMetadata"]
-                if isinstance(usage, dict):
-                    if "promptTokenCount" in usage:
-                        prompt_tokens_total = _token_count(usage, "promptTokenCount")
-                        input_tokens = max(prompt_tokens_total - cached_input_tokens, 0)
-                    if "candidatesTokenCount" in usage:
-                        output_tokens = _token_count(usage, "candidatesTokenCount")
-                    if "thoughtsTokenCount" in usage:
-                        reasoning_tokens = _token_count(usage, "thoughtsTokenCount")
-                    if "cachedContentTokenCount" in usage:
-                        cached_input_tokens = _token_count(usage, "cachedContentTokenCount")
-                        input_tokens = max(
-                            prompt_tokens_total - cached_input_tokens,
-                            0,
-                        )
+            candidate = (response.get("candidates") or [{}])[0] or {}
+            parts = (candidate.get("content") or {}).get("parts") or []
 
-            # 发送 message_start（仅一次）
             if not message_start_sent:
                 message_start_sent = True
                 yield _sse_event(
@@ -1106,7 +1052,7 @@ async def gemini_stream_to_anthropic_stream(
                             "content": [],
                             "stop_reason": None,
                             "stop_sequence": None,
-                            "usage": _usage_payload(),
+                            "usage": _anthropic_usage_from_counts(counts),
                         },
                     },
                 )
@@ -1274,12 +1220,9 @@ async def gemini_stream_to_anthropic_stream(
                     
                     continue
 
-            # 检查是否结束
-            if candidate.get("finishReason"):
-                finish_reason = candidate.get("finishReason")
-                # 不 break：继续消费上游残余块（如 [DONE]），保证底层
-                # stream_request 走正常收尾路径记录请求日志（issue #438）
-                stream_finished = True
+            reason = candidate.get("finishReason")
+            if isinstance(reason, str) and reason and reason != "FINISH_REASON_UNSPECIFIED":
+                finish_reason = reason
 
         # 关闭最后的内容块
         close_evt = _close_block()
@@ -1301,7 +1244,7 @@ async def gemini_stream_to_anthropic_stream(
             log.info(
                 f"[ANTHROPIC][stream_end] 流式结束: stop_reason={stop_reason}, "
                 f"has_tool_use={has_tool_use}, finish_reason={finish_reason}, "
-                f"input_tokens={input_tokens}, output_tokens={output_tokens}"
+                f"usage={_anthropic_usage_from_counts(counts)}"
             )
 
         # 发送 message_delta 和 message_stop
@@ -1310,7 +1253,7 @@ async def gemini_stream_to_anthropic_stream(
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": _usage_payload(),
+                "usage": _anthropic_usage_from_counts(counts),
             },
         )
 
@@ -1339,7 +1282,7 @@ async def gemini_stream_to_anthropic_stream(
                         "content": [],
                         "stop_reason": None,
                         "stop_sequence": None,
-                        "usage": _usage_payload(),
+                        "usage": _anthropic_usage_from_counts(counts),
                     },
                 },
             )

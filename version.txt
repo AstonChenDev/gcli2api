@@ -1,4 +1,4 @@
-full_hash=dfcfb52b1d167020adf5307a794c2b3234043325
-short_hash=dfcfb52
-message=Update utils.py
-date=2026-11-10 12:29:05 +0800
+full_hash=60979cdb36fee7e63769a8b0c062f2f15d6bedbd
+short_hash=60979cd
+message=新增配置项 system_instruction_as_user_message：系统指令转首条 user 消息
+date=2026-11-18 17:54:33 +0800

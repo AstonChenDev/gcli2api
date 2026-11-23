@@ -54,6 +54,50 @@ export function estimateCalibratedQuota(rows, calibration = quotaCalibration) {
     calibration: calibration.rules[row.model_name] || null }));
 }
 
+const THINKING_LEVELS = ['none', 'minimal', 'extra-low', 'low', 'medium', 'high', 'xhigh', 'thinking', 'tiered'];
+const SUM_FIELDS = ['attempts', 'success_count', 'prompt_tokens', 'completion_tokens',
+  'cached_tokens', 'total_tokens', 'total_difference_tokens', 'failed_tokens', 'positive_usage_attempts'];
+
+export function modelVariant(model) {
+  // Strip only a terminal thinking/routing level; keep lite, image and version names intact.
+  const match = model.match(/^(.*?)-(extra-low|xhigh|high|medium|low|minimal|none|thinking|tiered)$/);
+  return { base: match ? match[1] : model, level: match ? match[2] : null };
+}
+
+export function groupModelUsage(rows, sort = 'total_tokens') {
+  const groups = new Map();
+  for (const row of rows) {
+    const { base, level } = modelVariant(row.model_name);
+    if (!groups.has(base)) groups.set(base, []);
+    groups.get(base).push({ ...row, thinking_level: level });
+  }
+  return [...groups].map(([model_name, variants]) => {
+    // Estimate each actual model first, then sum its contribution. Never average
+    // percentages or apply one level's quota weight to the entire model family.
+    const sumKnown = (key, allowEmpty = false) => {
+      const known = variants.filter(row => Number.isFinite(row[key]));
+      return known.length && variants.every(row => Number.isFinite(row[key]) || (allowEmpty && row.total_tokens === 0))
+        ? known.reduce((sum, row) => sum + row[key], 0) : null;
+    };
+    const pools = new Set(variants.map(row => row.quota_pool));
+    const result = {
+      model_name, variants: variants.sort((a, b) =>
+        THINKING_LEVELS.indexOf(a.thinking_level) - THINKING_LEVELS.indexOf(b.thinking_level)
+        || a.model_name.localeCompare(b.model_name)),
+      quota_pool: pools.size === 1 ? variants[0].quota_pool : null,
+      estimate_missing_models: Math.max(...variants.map(row => row.estimate_missing_models || 0)),
+      estimated_units: sumKnown('estimated_units', true),
+      estimated_quota_percentage: sumKnown('estimated_quota_percentage', true),
+      calibration: variants.every(row => row.calibration || row.total_tokens === 0),
+    };
+    for (const key of SUM_FIELDS) result[key] = variants.reduce((sum, row) => sum + (row[key] || 0), 0);
+    for (const key of ['prompt_tokens', 'completion_tokens', 'total_tokens']) {
+      result[key + '_percentage'] = sumKnown(key + '_percentage');
+    }
+    return result;
+  }).sort((a, b) => (b[sort] || 0) - (a[sort] || 0) || a.model_name.localeCompare(b.model_name));
+}
+
 export function statsRange(range, startText = '', endText = '', now = Date.now()) {
   if (range === 'custom') {
     const start = new Date(startText).getTime(), end = new Date(endText).getTime();

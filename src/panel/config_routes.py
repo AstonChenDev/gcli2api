@@ -55,6 +55,9 @@ async def get_config(token: str = Depends(verify_panel_token)):
         # 思维链返回配置
         current_config["return_thoughts_to_frontend"] = await config.get_return_thoughts_to_frontend()
 
+        # systemInstruction 转首条 user 消息配置
+        current_config["system_instruction_as_user_message"] = await config.get_system_instruction_as_user_message()
+
         # 敏感词过滤配置
         current_config["sensitive_words_enabled"] = await config.get_sensitive_words_enabled()
         current_config["sensitive_words"] = await config.get_sensitive_words()
@@ -95,7 +98,7 @@ async def get_config(token: str = Depends(verify_panel_token)):
 
         # 合并存储系统配置（不覆盖环境变量）
         for key, value in storage_config.items():
-            if key not in env_locked_keys:
+            if key not in env_locked_keys and key != "auto_ban_error_codes":
                 current_config[key] = value
 
         current_config.pop(COOLDOWN_PREFIX + "revision", None)
@@ -119,6 +122,8 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         # 验证配置项
         try:
             validate_settings(new_config)
+            if "auto_ban_error_codes" in new_config:
+                new_config["auto_ban_error_codes"] = config.parse_auto_ban_error_codes(new_config["auto_ban_error_codes"])
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         if "retry_429_max_retries" in new_config:
@@ -155,6 +160,11 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
             if not isinstance(new_config["return_thoughts_to_frontend"], bool):
                 raise HTTPException(status_code=400, detail="思维链返回开关必须是布尔值")
 
+        # 验证 systemInstruction 转首条 user 消息配置
+        if "system_instruction_as_user_message" in new_config:
+            if not isinstance(new_config["system_instruction_as_user_message"], bool):
+                raise HTTPException(status_code=400, detail="systemInstruction 转首条 user 消息开关必须是布尔值")
+
         # 验证敏感词过滤配置
         if "sensitive_words_enabled" in new_config:
             if not isinstance(new_config["sensitive_words_enabled"], bool):
@@ -173,7 +183,7 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                 if not word:
                     continue
                 try:
-                    re.compile(re.escape(word), re.IGNORECASE | re.UNICODE)
+                    re.compile(re.escape(word), re.UNICODE)
                 except re.error:
                     raise HTTPException(status_code=400, detail=f"无效的敏感词: {word!r}")
                 cleaned_words.append(word)
@@ -224,7 +234,7 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
             if not isinstance(rules, list):
                 raise HTTPException(status_code=400, detail="模型名复写规则必须是数组（每条 [匹配正则, 替换模型名]）")
             cleaned_rules = []
-            for rule in rules:
+            for index, rule in enumerate(rules, start=1):
                 if not (isinstance(rule, (list, tuple)) and len(rule) == 2 and all(isinstance(x, str) for x in rule)):
                     raise HTTPException(
                         status_code=400,
@@ -234,9 +244,9 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                 if not pattern or not replacement:
                     raise HTTPException(status_code=400, detail=f"规则的正则和替换模型名均不能为空: {rule!r}")
                 try:
-                    re.compile(pattern)
-                except re.error:
-                    raise HTTPException(status_code=400, detail=f"无效的正则表达式: {pattern!r}")
+                    config.compile_model_rewrite_rule(pattern, replacement)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=f"模型名复写第 {index} 条规则：{exc}") from exc
                 cleaned_rules.append([pattern, replacement])
             new_config["model_rewrite_rules"] = cleaned_rules
 
@@ -298,26 +308,17 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
 
         # 直接写入数据库
         database = await get_database()
-        await save_settings(database, {k: v for k, v in new_config.items() if k.startswith(COOLDOWN_PREFIX)})
-        for key, value in new_config.items():
-            if key not in env_locked_keys and not key.startswith(COOLDOWN_PREFIX):
-                await database.set_config(key, value)
-                if key in ("api_password", "panel_password"):
-                    log.debug(f"设置{key}字段为: {value}")
-
-        # 重新加载配置缓存（关键！）
-        await config.reload_config()
-
-        # 验证保存后的结果
-        test_api_password = await config.get_api_password()
-        test_panel_password = await config.get_panel_password()
-        log.debug(f"保存后立即读取的API密码: {test_api_password}")
-        log.debug(f"保存后立即读取的面板密码: {test_panel_password}")
+        updates = {k: v for k, v in new_config.items() if k not in env_locked_keys}
+        if updates:
+            await save_settings(database, updates)
+        else:
+            await database.reload_config_cache()
+        config.apply_config_snapshot(await database.get_all_config())
 
         # 构建响应消息
         response_data = {
             "message": "配置保存成功",
-            "saved_config": {k: v for k, v in new_config.items() if k not in env_locked_keys},
+            "saved_config": updates,
         }
 
         return JSONResponse(content=response_data)
@@ -325,8 +326,9 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"保存配置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Database exceptions may contain SQL parameters, including passwords.
+        log.error(f"保存配置失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="保存配置失败，请重试") from None
 
 
 @router.get("/cooldown499/status")

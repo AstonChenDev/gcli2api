@@ -25,6 +25,33 @@ class CustomAuditTests(unittest.IsolatedAsyncioTestCase):
             self.stack.enter_context(patch.object(api,name,AsyncMock(return_value=value)))
         self.saved=self.stack.enter_context(patch('src.usage_log.record_usage_log',AsyncMock()))
 
+    async def test_image_normalization_preserves_explicit_candidate_count(self):
+        model = "gemini-3.1-flash-image-16x9"
+        for config, expected in (({}, 1), ({"candidateCount": 2}, 2)):
+            result = await normalize_antigravity_request({"model": model, "generationConfig": config})
+            self.assertEqual(result["generationConfig"]["candidateCount"], expected)
+            self.assertEqual(result["generationConfig"]["imageConfig"]["aspectRatio"], "16:9")
+
+    async def test_generation_uses_default_project_for_legacy_credential(self):
+        body = {"model": "gemini-4-argon-medium", "request": {"contents": []}}
+        answer = {"candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}]}
+        projects = []
+        async def stream(**kwargs):
+            projects.append(kwargs["body"]["project"])
+            yield "data: " + json.dumps(answer)
+        for stored, expected in [("", "aicode-consumers"), ("existing-project", "existing-project")]:
+            credential = {"access_token": "synthetic", "project_id": stored}
+            with patch.object(api, "get_valid_credential", AsyncMock(return_value=("test@example.invalid", credential))), patch.object(
+                api, "post_async", AsyncMock(return_value=httpx.Response(200, json=answer))
+            ) as post, patch.object(api, "stream_post_async", stream):
+                response = await api.non_stream_request(body)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(post.await_args.kwargs["json"]["project"], expected)
+                chunks = [chunk async for chunk in api.stream_request(body)]
+                self.assertTrue(any(isinstance(chunk, str) and '"ok"' in chunk for chunk in chunks))
+                self.assertEqual(projects[-1], expected)
+                self.assertEqual(credential["project_id"], stored)
+
     async def test_other_snake_aliases_do_not_duplicate_or_ignore_thought_optout(self):
         request={'model':'gemini-4-argon-medium','contents':[{'role':'user','parts':[{'text':'test'}]}],
             'generation_config':{'temperature':.3,'thinking_config':{'include_thoughts':False},'response_json_schema':{'type':'object','properties':{'system_instruction':{'type':'string'}}}},

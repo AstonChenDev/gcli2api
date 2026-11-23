@@ -17,6 +17,7 @@ import config
 from log import log
 
 from src.storage.database import get_database
+from src.stream_metadata import token_counters
 from src.request_body_log import retain_request_body_log, release_request_body_log
 
 
@@ -159,12 +160,10 @@ def extract_usage_tokens(source: Any) -> Dict[str, int]:
     同时兼容 v1internal 新版 Interactions 格式（对齐 Antigravity-Manager CanonicalUsage::from_gemini）:
     - total_input_tokens / total_output_tokens / total_thought_tokens / total_cached_tokens
     """
-    prompt_tokens = completion_tokens = total_tokens = cached_tokens = 0
-
     if isinstance(source, (str, bytes)):
         # 流式 SSE 块：解析 JSON 提取 usageMetadata
         try:
-            text = source.decode("utf-8") if isinstance(source, bytes) else source
+            text = source.decode("utf-8-sig") if isinstance(source, bytes) else source
             if text.startswith("data:"):
                 text = text[len("data:"):].strip()
             if not text or text == "[DONE]":
@@ -185,47 +184,14 @@ def extract_usage_tokens(source: Any) -> Dict[str, int]:
     if not isinstance(metadata, dict):
         return {}
 
-    def _first_int(*keys: str) -> int:
-        for key in keys:
-            value = metadata.get(key)
-            if value is not None and not isinstance(value, bool):
-                try:
-                    return max(0, int(value))
-                except (TypeError, ValueError, OverflowError):
-                    continue
-        return 0
-
-    prompt_tokens = _first_int("promptTokenCount", "total_input_tokens", "input_tokens")
-    reasoning_tokens = _first_int("thoughtsTokenCount", "total_thought_tokens")
-    candidates_tokens = _first_int("candidatesTokenCount", "total_output_tokens")
-    completion_tokens = candidates_tokens + reasoning_tokens
-    total_tokens = _first_int("totalTokenCount", "total_tokens") or (prompt_tokens + completion_tokens)
-
-    # 缓存命中数：旧版 cachedContentTokenCount / 新版 total_cached_tokens，及 Anthropic 风格明细
-    cached_tokens = _first_int(
-        "cachedContentTokenCount",
-        "cached_content_token_count",
-        "total_cached_tokens",
-        "cached_tokens",
-        "cache_read_input_tokens",
-    )
-    if not cached_tokens:
-        for details_key in ("prompt_tokens_details", "input_tokens_details"):
-            details = metadata.get(details_key)
-            if isinstance(details, dict):
-                value = details.get("cached_tokens")
-                if value is not None and not isinstance(value, bool):
-                    try:
-                        cached_tokens = max(0, int(value))
-                    except (TypeError, ValueError, OverflowError):
-                        cached_tokens = 0
-                    break
-
+    counts = token_counters(metadata)
+    prompt = counts.get("promptTokenCount", 0)
+    completion = counts.get("candidatesTokenCount", 0) + counts.get("thoughtsTokenCount", 0)
     return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "cached_tokens": cached_tokens,
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": counts.get("totalTokenCount") or (prompt + completion),
+        "cached_tokens": counts.get("cachedContentTokenCount", 0),
     }
 
 

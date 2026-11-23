@@ -2,9 +2,10 @@ import asyncio
 import copy
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from src.api import antigravity as api
+from src.credential_cooldown import Lease
 from src.stream_events import inspect_line, PROMPT_REJECTION_NOTICE
 from src.router.stream_passthrough import build_streaming_response_or_error
 import test_custom_audit
@@ -57,6 +58,33 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 {'model':'gemini-4-argon-medium','request':{'contents':[]}}))
             await asyncio.wait_for(response({'type':'http','asgi':{'spec_version':version}}, receive or waiting, send), 2)
             return response
+
+    async def test_completed_stream_releases_slot_before_http_eof(self):
+        for with_done in (False, True):
+            store = AsyncMock()
+            lease = Lease(store, 'test@example.invalid', 'test-lease')
+            self.saved.reset_mock()
+
+            async def admit(candidate, *args):
+                return candidate, lease
+
+            async def send(message):
+                if message['type'] != 'http.response.body':
+                    return
+                if b'answer' in message.get('body', b''):
+                    store.finish.assert_not_awaited()
+                if not message.get('more_body'):
+                    store.finish.assert_awaited_once()
+                    self.assertTrue(store.finish.await_args.kwargs['success'])
+                    self.saved.assert_not_awaited()
+
+            chunks = [event('answer', 'STOP')]
+            if with_done:
+                chunks.append('data: [DONE]')
+            with patch.object(api, 'acquire_dispatch', admit):
+                await self.respond(chunks, send)
+            store.finish.assert_awaited_once()
+            self.assertEqual(self.saved.call_args.args[0]['status_code'], 200)
 
     async def test_stop_before_send_failure_is_not_success(self):
         for version in ('2.3', '2.4'):
@@ -125,10 +153,10 @@ class OutputLimitTests(unittest.IsolatedAsyncioTestCase):
         from src.converter.antigravity_fix import normalize_antigravity_request
         from fastapi import HTTPException
         result=await normalize_antigravity_request({'model':'gemini-4-argon-medium','contents':[]})
-        self.assertEqual(result['generationConfig']['maxOutputTokens'],64000)
+        self.assertEqual(result['generationConfig']['maxOutputTokens'],65536)
         capped=await normalize_antigravity_request({'model':'gemini-4-argon-medium','contents':[],
-            'generationConfig':{'maxOutputTokens':65536}})
-        self.assertEqual(capped['generationConfig']['maxOutputTokens'],64000)
+            'generationConfig':{'maxOutputTokens':99999}})
+        self.assertEqual(capped['generationConfig']['maxOutputTokens'],65536)
         for limit in (True,0,-1,1.5,'4096'):
             with self.assertRaises(HTTPException):
                 await normalize_antigravity_request({'model':'gemini-4-argon-medium','contents':[],
@@ -153,7 +181,11 @@ class RejectionRoutesTests(unittest.IsolatedAsyncioTestCase):
         for anti in (False,True):
             for url,body in cases:
                 self.saved.reset_mock()
-                async def upstream(**kw):yield 'data: '+json.dumps(notice())
+                async def upstream(**kw):
+                    if url in ('/v1/chat/completions', '/v1/messages'):
+                        yield ': first heartbeat'
+                        yield ': second heartbeat'
+                    yield 'data: ' + json.dumps(notice())
                 with ExitStack() as stack:
                     stack.enter_context(patch.object(api,'stream_post_async',upstream))
                     record_error=stack.enter_context(patch.object(api,'record_api_call_error',AsyncMock()))
