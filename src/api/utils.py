@@ -71,7 +71,7 @@ async def handle_error_with_retry(
     1. 429错误(速率限制)
     2. 503错误(服务不可用)
     3. 500错误(服务临时不可用)
-    4. 导致凭证封禁的错误(AUTO_BAN_ERROR_CODES配置)
+    4. 导致凭证封禁的错误(AUTO_BAN_ERROR_CODES配置)，403 除外
 
     Returns:
         bool: True表示需要继续重试，False表示不需要重试
@@ -80,8 +80,8 @@ async def handle_error_with_retry(
     if await check_should_auto_ban(status_code):
         await handle_auto_ban(status_code, email, expected_revision=expected_revision)
 
-        # 自动封禁后，仍然尝试重试（会在下次循环中自动获取新凭证）
-        if retry_enabled and attempt < max_retries:
+        # 403 仍可停用当前凭证，但本次请求不能换号重试。
+        if status_code != 403 and retry_enabled and attempt < max_retries:
             log.info(
                 f"[RETRY] Retrying with next credential after auto-ban "
                 f"(status {status_code}, attempt {attempt + 1}/{max_retries})"

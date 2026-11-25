@@ -876,5 +876,5 @@ async def get_thinking_model_routing_bases() -> list[str]:
         return [item.strip() for item in value.split(",") if item.strip()]
     return await get_config_value(
         "thinking_model_routing_bases",
-        ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen"],
+        ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-4-neon", "gemini-3.8-flash"],
     )

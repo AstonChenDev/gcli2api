@@ -15,6 +15,55 @@ from src.api import utils as api_utils
 class RetryTerminalErrorTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_custom_audit.CustomAuditTests.asyncSetUp
 
+    async def test_403_ends_request_without_prefetch_and_respects_auto_ban(self):
+        body = {"model": "gemini-flash", "request": {"contents": []}}
+        error = {"error": {"code": 403, "status": "PERMISSION_DENIED", "message": "forbidden"}}
+        for streaming in (False, True):
+            for embedded in (False, True):
+                for auto_ban in (False, True):
+                    with self.subTest(streaming=streaming, embedded=embedded, auto_ban=auto_ban), ExitStack() as stack:
+                        self.saved.reset_mock()
+                        credential = {"access_token": "synthetic", "project_id": "p", "credential_revision": "revision"}
+                        picker = stack.enter_context(patch.object(api, "get_valid_credential", AsyncMock(
+                            side_effect=[("first", credential), ("alternate", credential)])))
+                        stack.enter_context(patch.object(api, "get_retry_config", AsyncMock(return_value={
+                            "max_retries": 3, "retry_enabled": True, "retry_interval": 0,
+                        })))
+                        stack.enter_context(patch.object(api, "get_auto_ban_error_codes", AsyncMock(return_value=[403])))
+                        stack.enter_context(patch.object(api_utils, "check_should_auto_ban", AsyncMock(return_value=auto_ban)))
+                        disable = stack.enter_context(patch.object(api_utils, "set_cred_disabled", AsyncMock(return_value=True)))
+                        record = stack.enter_context(patch.object(api, "record_api_call_error", AsyncMock()))
+                        upstream = AsyncMock(return_value=httpx.Response(200 if embedded else 403, json=error))
+
+                        if streaming:
+                            async def stream(**kwargs):
+                                reply = await upstream(**kwargs)
+                                if embedded:
+                                    yield "data: " + reply.text
+                                else:
+                                    yield Response(status_code=reply.status_code, content=reply.content)
+
+                            stack.enter_context(patch.object(api, "stream_post_async", stream))
+                            responses = [chunk async for chunk in api.stream_request(body)]
+                            response, = responses
+                        else:
+                            stack.enter_context(patch.object(api, "post_async", upstream))
+                            response = await api.non_stream_request(body)
+
+                        self.assertEqual(response.status_code, 403)
+                        self.assertEqual(json.loads(response.body), error)
+                        upstream.assert_awaited_once()
+                        self.assertEqual(upstream.await_args.kwargs["credential_email"], "first")
+                        picker.assert_awaited_once()
+                        record.assert_awaited_once()
+                        self.assertEqual(record.await_args.args[:2], ("first", 403))
+                        self.saved.assert_awaited_once()
+                        self.assertEqual(self.saved.await_args.args[0]["status_code"], 403)
+                        if auto_ban:
+                            disable.assert_awaited_once_with("first", True, expected_revision="revision")
+                        else:
+                            disable.assert_not_awaited()
+
     async def test_transport_retry_releases_dispatch_before_wait(self):
         body = {"model": "gemini-flash", "request": {"contents": []}}
         answer = {"candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}]}

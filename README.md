@@ -409,7 +409,7 @@ Gemini 请求的 `system_instruction` 与 `systemInstruction` 会先统一为一
 
 ### 按思考等级匹配模型
 
-在后台「配置 → 思考等级模型匹配」开启开关并保存，立即对新请求生效。默认关闭；未配置过适用模型时，默认包含 `gemini-4-argon`、`gemini-4-carbon`、`gemini-4-hydrogen`。已有的后台名单和环境变量保持不变，升级后需要使用 Hydrogen 时，须在实际生效的名单中追加 `gemini-4-hydrogen`。可按行添加其他基础模型名，但应先确认上游提供对应的等级变体。
+在后台「配置 → 思考等级模型匹配」开启开关并保存，立即对新请求生效。默认关闭。默认名单包含 `gemini-4-argon`、`gemini-4-carbon`、`gemini-4-hydrogen`、`gemini-4-neon` 和 `gemini-3.8-flash`。使用自定义名单时，可在后台或对应环境变量中追加需要的基础模型名。
 
 OpenAI `/v1/chat/completions` 请求示例：
 
@@ -424,21 +424,21 @@ OpenAI `/v1/chat/completions` 请求示例：
 
 此请求选择 `gemini-4-argon-high`。将等级改为 `medium` 或 `low` 即选择对应变体。流式、非流式及 `抗截断-` 前缀均支持。
 
-Hydrogen 额外支持 `xhigh`：`"model": "gemini-4-hydrogen"` 配合 `"reasoning_effort": "xhigh"` 会选择 `gemini-4-hydrogen-xhigh`；配合 `medium` 则选择 `gemini-4-hydrogen-medium`。Argon、Carbon 和其他模型仍只接受原有三档。
+Neon 和 Hydrogen 额外支持 `xhigh`。`"model": "gemini-4-neon"` 配合 `"reasoning_effort": "xhigh"` 会选择 `gemini-4-neon-xhigh`。Flash 3.8 的 `gemini-3.8-flash-tiered` 可通过完整模型名调用。
 
 - OpenAI：`reasoning_effort`，也接受 `reasoning.effort`（仅聊天接口，不新增 Responses 接口）。
 - Gemini：路径模型名使用基础名称，请求体传 `generationConfig.thinkingConfig.thinkingLevel`，也接受对应 snake_case 字段。
 - Claude 格式 `/v1/messages`：基础模型名配合 `output_config.effort`。
-- Hydrogen 接受 low / medium / high / xhigh，其他模型接受 high / medium / low，不区分大小写；仅对已配置的基础名称生效。未传等级（或等级为 null）时统一默认选择 medium，例如 gemini-4-hydrogen 自动匹配 gemini-4-hydrogen-medium。非法或相互冲突的等级返回 HTTP 400。
+- Neon 和 Hydrogen 接受 low / medium / high / xhigh，其他模型接受 low / medium / high。等级不区分大小写，仅对已配置的基础名称生效。未传等级或等级为 null 时默认选择 medium。非法或相互冲突的等级返回 HTTP 400。
 - 已经带后缀的模型名优先，例如 `gemini-4-argon-low` 配 `high` 仍使用 low。其他模型保持原行为。
 - 匹配发生在模型名复写规则之前；已有复写规则仍可覆盖匹配结果。请求日志保留客户端原始模型名，上游请求使用匹配后的模型名。
-- 开关开启且模型列表包含该基础模型全部受支持的等级变体时（Hydrogen 四档，其他模型三档），模型列表额外显示基础名称，保留原有变体。
+- 开关开启且模型列表包含该基础模型的全部思考等级变体时，模型列表额外显示基础名称。Neon 和 Hydrogen 需要四档，其他模型需要三档。
 
 环境变量（优先于后台设置，按现有配置机制锁定对应后台项）：
 
 ```dotenv
 THINKING_MODEL_ROUTING_ENABLED=true
-THINKING_MODEL_ROUTING_BASES=gemini-4-argon,gemini-4-carbon,gemini-4-hydrogen
+THINKING_MODEL_ROUTING_BASES=gemini-4-argon,gemini-4-carbon,gemini-4-hydrogen,gemini-4-neon,gemini-3.8-flash
 ```
 
 多个基础模型用英文逗号分隔；空列表表示不匹配任何模型。此功能负责选择上游模型，不保证所有凭证都具有该模型权限。
