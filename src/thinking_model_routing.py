@@ -5,7 +5,10 @@ from fastapi import HTTPException
 from config import get_thinking_model_routing_bases, get_thinking_model_routing_enabled
 
 LEVELS = ("high", "medium", "low")
-MODEL_LEVELS = {"gemini-4-hydrogen": (*LEVELS, "xhigh")}
+MODEL_LEVELS = {
+    "gemini-4-hydrogen": (*LEVELS, "xhigh"),
+    "gemini-4-neon": (*LEVELS, "xhigh"),
+}
 
 
 def _read_path(payload: dict, *keys):

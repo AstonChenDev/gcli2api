@@ -1052,7 +1052,7 @@ async def stream_request(
                                 cooldown_until = await parse_and_log_cooldown(error_body, chunk.headers.get("retry-after"))
 
                             # 预热下一个凭证
-                            if (not content_delivered and retry_config["retry_enabled"]
+                            if (status_code != 403 and not content_delivered and retry_config["retry_enabled"]
                                     and next_cred_task is None and attempt < max_retries):
                                 next_cred_task = asyncio.create_task(
                                     select_credential(
@@ -1201,6 +1201,10 @@ async def stream_request(
                 error_status = 500
                 error_message = f"异常: {type(e).__name__}: {e}"
                 log.error(f"[ANTIGRAVITY STREAM] 流式请求异常: {type(e).__name__}: {e}, 凭证: {current_file}")
+                # Keep an upstream 403 terminal even if saving its state failed.
+                if last_error_response is not None and last_error_response.status_code == 403:
+                    yield last_error_response
+                    return
                 if not content_delivered and retry_config["retry_enabled"] and attempt < max_retries:
                     log.info(f"[ANTIGRAVITY STREAM] 异常后重试 (attempt {attempt + 2}/{max_retries + 1})...")
                     if isinstance(e, TransportError):
@@ -1534,7 +1538,8 @@ async def non_stream_request(
                             cooldown_until = await parse_and_log_cooldown(error_text, response.headers.get("retry-after"))
 
                         # 并行预热下一个凭证,不阻塞当前处理
-                        if retry_config["retry_enabled"] and next_cred_task is None and attempt < max_retries:
+                        if (status_code != 403 and retry_config["retry_enabled"]
+                                and next_cred_task is None and attempt < max_retries):
                             next_cred_task = asyncio.create_task(
                                     select_credential(
                                         model_name=model_name, session_key=session_key, exclude_emails={current_file}
@@ -1597,6 +1602,8 @@ async def non_stream_request(
                                 headers={"Retry-After": str(exc.retry_after)}, media_type="application/json")
             except Exception as e:
                 log.error(f"[ANTIGRAVITY] 非流式请求异常: {e}, 凭证: {current_file}")
+                if last_error_response is not None and last_error_response.status_code == 403:
+                    return last_error_response
                 if retry_config["retry_enabled"] and attempt < max_retries:
                     log.info(f"[ANTIGRAVITY] 异常后重试 (attempt {attempt + 2}/{max_retries + 1})...")
                     if isinstance(e, TransportError):

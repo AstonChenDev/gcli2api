@@ -61,20 +61,22 @@ async def test_existing_and_empty_model_lists_are_preserved():
 
 
 @pytest.mark.asyncio
-async def test_model_aliases():
-    models = ["gemini-4-argon-" + level for level in ("high", "medium", "low")]
-    assert await add_thinking_model_aliases(models) == models + ["gemini-4-argon"]
+@pytest.mark.parametrize("base", ["gemini-4-argon", "gemini-3.8-flash"])
+async def test_model_aliases(base):
+    models = [base + "-" + level for level in ("high", "medium", "low")]
+    assert await add_thinking_model_aliases(models) == models + [base]
     assert await add_thinking_model_aliases(models[:2]) == models[:2]
     config._config_cache["thinking_model_routing_enabled"] = False
     assert await add_thinking_model_aliases(models) == models
 
 
 @pytest.mark.asyncio
-async def test_hydrogen_alias_requires_all_four_variants():
-    models = ["gemini-4-hydrogen-" + level for level in ("low", "medium", "high", "xhigh")]
+@pytest.mark.parametrize("base", ["gemini-4-hydrogen", "gemini-4-neon"])
+async def test_four_level_alias_requires_all_variants(base):
+    models = [base + "-" + level for level in ("low", "medium", "high", "xhigh")]
     assert await add_thinking_model_aliases(models[:3]) == models[:3]
-    assert await add_thinking_model_aliases(models) == models + ["gemini-4-hydrogen"]
-    assert await add_thinking_model_aliases(models + ["gemini-4-hydrogen"]) == models + ["gemini-4-hydrogen"]
+    assert await add_thinking_model_aliases(models) == models + [base]
+    assert await add_thinking_model_aliases(models + [base]) == models + [base]
 
 
 @pytest.fixture
@@ -107,8 +109,9 @@ def client(monkeypatch):
 @pytest.mark.parametrize("prefix", ["", "抗截断-"])
 @pytest.mark.parametrize("base,level", [
     (base, level)
-    for base in ("gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen")
-    for level in (["high", "medium", "low", None, "omitted"] + (["xhigh"] if base == "gemini-4-hydrogen" else []))
+    for base in ("gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-4-neon", "gemini-3.8-flash")
+    for level in (["high", "medium", "low", None, "omitted"]
+                  + (["xhigh"] if base in ("gemini-4-hydrogen", "gemini-4-neon") else []))
 ])
 def test_actual_routes(client, protocol, stream, prefix, base, level):
     http, calls = client
@@ -229,19 +232,20 @@ def test_invalid_response_format_skips_dispatch(client, requested):
     assert not calls
 
 
-@pytest.mark.parametrize("model", ["gemini-4-argon", "gemini-4-carbon"])
-def test_xhigh_rejected_for_existing_families(client, model):
+@pytest.mark.parametrize("model", ["gemini-4-argon", "gemini-4-carbon", "gemini-3.8-flash"])
+def test_xhigh_rejected_for_three_level_families(client, model):
     http, calls = client
     response = http.post("/v1/chat/completions", json={"model": model, "reasoning_effort": "xhigh", "messages": [{"role": "user", "content": "Write a sentence."}]})
     assert response.status_code == 400
     assert not calls
 
 
-def test_explicit_hydrogen_suffix_takes_precedence(client):
+@pytest.mark.parametrize("model", ["gemini-4-hydrogen-xhigh", "gemini-4-neon-xhigh", "gemini-3.8-flash-tiered"])
+def test_explicit_suffix_takes_precedence(client, model):
     http, calls = client
-    response = http.post("/v1/chat/completions", json={"model": "gemini-4-hydrogen-xhigh", "reasoning_effort": "low", "messages": [{"role": "user", "content": "Write a sentence."}]})
+    response = http.post("/v1/chat/completions", json={"model": model, "reasoning_effort": "low", "messages": [{"role": "user", "content": "Write a sentence."}]})
     assert response.status_code == 200
-    assert calls[0]["body"]["model"] == "gemini-4-hydrogen-xhigh"
+    assert calls[0]["body"]["model"] == model
 
 
 @pytest.mark.parametrize("stream", [False, True])
