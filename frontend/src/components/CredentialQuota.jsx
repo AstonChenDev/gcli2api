@@ -18,7 +18,7 @@ export default function CredentialQuota({ email, cooling, disabled, data, loadin
         {visible && <button onClick={() => onRequest(email, true)} disabled={loading} className="text-xs text-purple-700 disabled:opacity-50">刷新额度</button>}
         {cooling && <button onClick={toggle} aria-expanded={visible} className="text-xs text-purple-700 flex items-center gap-1">
           {visible ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-          {visible ? "收起额度" : "CD 中 · 展开额度"}
+          {visible ? "收起额度" : "展开额度"}
         </button>}
       </div>
     </div>

@@ -19,6 +19,7 @@ import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
 import QuotaSummary, { quotaGroups } from "../components/QuotaSummary";
+import CredentialCooldowns from "../components/CredentialCooldowns";
 import CredentialQuota from "../components/CredentialQuota";
 import CredentialModels from "../components/CredentialModels";
 import CredentialProxy from "../components/CredentialProxy";
@@ -433,19 +434,6 @@ export default function Credentials() {
     return new Date(ts * 1000).toLocaleString();
   };
 
-  const getCooldownText = (cooldowns) => {
-    const active = Object.entries(cooldowns || {}).filter(
-      ([, until]) => until > now
-    );
-    if (!active.length) return null;
-    const longest = Math.max(...active.map(([, until]) => until));
-    const remain = longest - now;
-    const h = Math.floor(remain / 3600);
-    const m = Math.floor((remain % 3600) / 60);
-    const s = Math.floor(remain % 60);
-    return h > 0 ? `${h}h${m}m` : m > 0 ? `${m}m${s}s` : `${s}s`;
-  };
-
   const tierStyle = (tier) =>
     tier === "ultra" || tier === "ultra_lite"
       ? "bg-red-500/10 text-red-700 border-red-500/30"
@@ -661,7 +649,7 @@ export default function Credentials() {
       ) : (
         <div className="grid gap-3 sm:gap-4 grid-cols-1 md:grid-cols-2 xl:grid-cols-3">
           {items.map((cred) => {
-            const cooldownText = getCooldownText(cred.model_cooldowns);
+            const cooling = hasActiveCooldown(cred, now);
             const busy = busyFiles.has(cred.email);
             return (
               <div
@@ -709,16 +697,14 @@ export default function Credentials() {
                 <CredentialLimits credential={cred} onSaved={applyCredentialEdit} />
                 {/* 信息区 */}
                 <div className="space-y-1 text-xs">
+                  <CredentialCooldowns cooldowns={cred.model_cooldowns} now={now} />
                   <div className="flex items-center justify-between gap-2">
-                    {cooldownText ? (
-                      <span className="text-cyan-700 flex items-center gap-1">
-                        <Snowflake size={12} /> 配额CD {cooldownText}
+                    <div className="flex items-center gap-1 text-slate-500">
+                      <Clock size={12} className="flex-shrink-0" />
+                      <span className="truncate" title={formatTime(cred.last_success)}>
+                        {formatTime(cred.last_success)}
                       </span>
-                    ) : (
-                      <span className="text-slate-500 flex items-center gap-1">
-                        <Clock size={12} /> 无配额CD
-                      </span>
-                    )}
+                    </div>
                     {cred.error_codes?.length ? (
                       <button
                         onClick={() => openErrors(cred.email)}
@@ -733,16 +719,10 @@ export default function Credentials() {
                       </span>
                     )}
                   </div>
-                  <div className="flex items-center gap-1 text-slate-500">
-                    <Clock size={12} className="flex-shrink-0" />
-                    <span className="truncate" title={formatTime(cred.last_success)}>
-                      {formatTime(cred.last_success)}
-                    </span>
-                  </div>
                 </div>
 
-                <CredentialQuota key={`${cred.email}:${Boolean(cooldownText)}`}
-                  email={cred.email} cooling={Boolean(cooldownText)} disabled={cred.disabled}
+                <CredentialQuota key={`${cred.email}:${cooling}`}
+                  email={cred.email} cooling={cooling} disabled={cred.disabled}
                   data={quotaCache[cred.email]} loading={quotaLoading.has(cred.email)} onRequest={requestQuota} />
                 <button onClick={() => setModelsCredential(cred)} className="w-full text-xs px-3 py-2 rounded-lg border border-purple-200 text-purple-700 hover:bg-purple-50 text-left">
                   查看可用模型 →
